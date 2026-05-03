@@ -1,0 +1,37 @@
+[package]
+name = "termd"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "termd"
+path = "src/main.rs"
+
+[lib]
+name = "termd"
+path = "src/lib.rs"
+
+[dependencies]
+tonic = { version = "0.12", features = ["transport"] }
+prost = "0.13"
+prost-types = "0.13"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync", "net"] }
+tower = "0.4"
+clap = { version = "4", features = ["derive"] }
+nix = { version = "0.29", features = ["process", "signal", "term"] }
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+hostname = "0.4"
+futures = "0.3"
+libghostty-vt = { path = "examples/libghostty-rs/crates/libghostty-vt" }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = "3"

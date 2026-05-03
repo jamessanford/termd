@@ -1,0 +1,65 @@
+syntax = "proto3";
+import "google/protobuf/timestamp.proto";
+
+package terminal;
+
+service TerminalService {
+  rpc Stream(stream TerminalCommand) returns (stream TerminalResponse);
+}
+
+message TerminalCommand {
+  oneof command {
+    ListRequest        list        = 1;
+    CreateRequest      create      = 2;
+    DestroyRequest     destroy     = 3;
+    SubscribeRequest   subscribe   = 4;
+    UnsubscribeRequest unsubscribe = 5;
+    WriteRequest       write       = 6;
+    ResizeRequest      resize      = 7;
+    SetTitleRequest    set_title   = 8;
+    RefreshRequest     refresh     = 9;
+  }
+}
+
+message ListRequest        {}
+message CreateRequest      { uint32 cols = 1; uint32 rows = 2; optional string command = 3; }
+message DestroyRequest     { string pty_id = 1; }
+message SubscribeRequest   { string pty_id = 1; }
+message UnsubscribeRequest { string pty_id = 1; }
+message WriteRequest       { string pty_id = 1; bytes data = 2; }
+message ResizeRequest      { string pty_id = 1; uint32 cols = 2; uint32 rows = 3; }
+message SetTitleRequest    { string pty_id = 1; string title = 2; }
+message RefreshRequest     { string pty_id = 1; }
+
+message TerminalResponse {
+  oneof response {
+    ListResponse    list    = 1;
+    CreateResponse  create  = 2;
+    CommandResponse command = 3;
+    StreamData      stream  = 4;
+    RefreshResponse refresh = 5;
+  }
+}
+
+message PtyItem {
+  string                    pty_id     = 1;
+  string                    hostname   = 2;
+  string                    pts_name   = 3;
+  uint32                    cols       = 4;
+  uint32                    rows       = 5;
+  string                    title      = 6;
+  bool                      subscribed = 7;
+  google.protobuf.Timestamp created_at = 8;
+}
+
+message ListResponse    { repeated PtyItem items = 1; }
+message CreateResponse  { PtyItem item = 1; }
+message CommandResponse { string pty_id = 1; bool success = 2; optional string error = 3; }
+message StreamData      { string pty_id = 1; uint64 generation = 2; bytes data = 3; }
+message RefreshResponse {
+  string pty_id     = 1;
+  uint64 generation = 2;
+  bytes  data       = 3;
+  uint32 cursor_x   = 4;
+  uint32 cursor_y   = 5;
+}
