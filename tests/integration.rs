@@ -28,7 +28,7 @@ async fn test_write_produces_broadcast_output() {
 
     let chunk = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let chunk = rx.recv().await.unwrap();
+            let chunk = rx.recv().await.expect("broadcast recv failed");
             let text = String::from_utf8_lossy(&chunk.data);
             if text.contains("__termd_test__") {
                 return chunk;

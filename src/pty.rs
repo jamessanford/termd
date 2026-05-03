@@ -49,11 +49,11 @@ pub struct PtyHandle {
     cols: AtomicU32,
     rows: AtomicU32,
     title: Arc<Mutex<String>>,
-    generation: Arc<AtomicU64>,
     tx: broadcast::Sender<Arc<PtyChunk>>,
     writer: Mutex<File>,
     refresh_tx: std::sync::mpsc::SyncSender<oneshot::Sender<Result<RefreshData>>>,
     child_pid: u32,
+    child: Mutex<Option<std::process::Child>>,
 }
 
 impl PtyHandle {
@@ -92,7 +92,7 @@ impl PtyHandle {
         };
         let ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws as *const Winsize) };
         if ret < 0 {
-            return Err(anyhow!("TIOCSWINSZ failed"));
+            return Err(anyhow!("TIOCSWINSZ failed: {}", std::io::Error::last_os_error()));
         }
         self.cols.store(cols, Ordering::Relaxed);
         self.rows.store(rows, Ordering::Relaxed);
@@ -135,15 +135,18 @@ impl PtyRegistry {
         let master_fd = pty.master.into_raw_fd();
         let slave_fd = pty.slave.into_raw_fd();
 
-        // Get slave device name (/dev/pts/N)
+        // Get slave device name (/dev/pts/N) using thread-safe ptsname_r
         let pts_name = unsafe {
-            let name = libc::ptsname(master_fd);
-            if name.is_null() { String::from("unknown") }
-            else { std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned() }
-        };
+            let borrowed = std::os::unix::io::BorrowedFd::borrow_raw(master_fd);
+            let owned = borrowed.try_clone_to_owned().context("clone master fd for ptsname_r")?;
+            nix::pty::ptsname_r(&nix::pty::PtyMaster::from_owned_fd(owned))
+        }.unwrap_or_else(|_| String::from("unknown"));
 
         // Set close-on-exec on master fd so child doesn't inherit it
-        unsafe { libc::fcntl(master_fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        let rc = unsafe { libc::fcntl(master_fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error()).context("set FD_CLOEXEC on master fd");
+        }
 
         // Spawn child shell
         let shell = command.map(String::from).unwrap_or_else(|| {
@@ -156,6 +159,9 @@ impl PtyRegistry {
         // dup slave_fd so each Stdio owns its own fd; the child will have them as 0/1/2
         let slave_stdout = unsafe { libc::dup(slave_fd) };
         let slave_stderr = unsafe { libc::dup(slave_fd) };
+        if slave_stdout < 0 || slave_stderr < 0 {
+            return Err(std::io::Error::last_os_error()).context("dup slave fd");
+        }
         let mut cmd = Command::new(&shell);
         cmd.env("TERM", TERM_NAME)
            .env_remove("TERM_PROGRAM")
@@ -178,6 +184,13 @@ impl PtyRegistry {
                 Ok(())
             });
         }
+
+        // Dup master_fd for the reader thread before File::from_raw_fd takes ownership
+        let master_reader_fd = unsafe { libc::dup(master_fd) };
+        if master_reader_fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("dup master fd for reader");
+        }
+
         let child = cmd.spawn().context("spawn shell")?;
         // slave fds are owned by the Stdio objects passed to Command and closed after fork;
 
@@ -186,6 +199,7 @@ impl PtyRegistry {
             std::sync::mpsc::sync_channel::<oneshot::Sender<Result<RefreshData>>>(8);
         let generation = Arc::new(AtomicU64::new(0));
 
+        let child_pid = child.id();
         let handle = Arc::new(PtyHandle {
             id: id.clone(),
             pts_name,
@@ -194,15 +208,15 @@ impl PtyRegistry {
             cols: AtomicU32::new(cols),
             rows: AtomicU32::new(rows),
             title: title.clone(),
-            generation: generation.clone(),
             tx: tx.clone(),
             writer: Mutex::new(unsafe { File::from_raw_fd(master_fd) }),
             refresh_tx,
-            child_pid: child.id(),
+            child_pid,
+            child: Mutex::new(Some(child)),
         });
 
         // Spawn dedicated reader thread — owns all libghostty state (wired in Task 3)
-        let master_reader = unsafe { File::from_raw_fd(libc::dup(master_fd)) };
+        let master_reader = unsafe { File::from_raw_fd(master_reader_fd) };
         std::thread::Builder::new()
             .name(format!("pty-reader-{id}"))
             .spawn(move || reader_thread(master_reader, tx, generation, refresh_rx))
@@ -216,6 +230,9 @@ impl PtyRegistry {
         let handle = self.ptys.write().unwrap().remove(id)
             .ok_or_else(|| anyhow!("PTY {id} not found"))?;
         let _ = kill(Pid::from_raw(handle.child_pid as i32), Signal::SIGHUP);
+        if let Some(mut child) = handle.child.lock().unwrap().take() {
+            std::thread::spawn(move || { let _ = child.wait(); });
+        }
         Ok(())
     }
 
@@ -254,8 +271,26 @@ fn reader_thread(
         }
 
         let n = match master.read(&mut buf) {
-            Ok(0) | Err(_) => {
+            Ok(0) => {
                 // EOF — shell exited. Stay alive for refresh requests until refresh_rx closes.
+                loop {
+                    match refresh_rx.recv() {
+                        Ok(reply_tx) => {
+                            let gen = generation.load(Ordering::Relaxed);
+                            let _ = reply_tx.send(Ok(RefreshData {
+                                generation: gen,
+                                data: Bytes::new(),
+                                cursor_x: 0,
+                                cursor_y: 0,
+                            }));
+                        }
+                        Err(_) => return, // PtyHandle dropped (destroyed)
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("PTY reader EOF: {e}");
+                // EOF/error — shell exited. Stay alive for refresh requests until refresh_rx closes.
                 loop {
                     match refresh_rx.recv() {
                         Ok(reply_tx) => {
