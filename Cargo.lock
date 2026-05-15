@@ -1126,6 +1126,7 @@ dependencies = [
  "bytes",
  "clap",
  "hostname",
+ "hyper-util",
  "libc",
  "libghostty-vt",
  "libghostty-vt-sys",
