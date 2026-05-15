@@ -51,5 +51,8 @@ async fn test_refresh_returns_screen_data() {
 
     let data = handle.refresh().await.unwrap();
     assert!(data.generation > 0);
+    // Smoke test: verifies the refresh pipeline works end-to-end.
+    // We don't assert on specific content here because terminal
+    // rendering of the echo output may vary by shell startup timing.
     assert!(!data.data.is_empty(), "refresh data should not be empty");
 }

@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{Read, Write},
-    os::unix::io::{FromRawFd, IntoRawFd},
+    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
     sync::{Arc, Mutex, RwLock, atomic::{AtomicU32, AtomicU64, Ordering}},
     time::SystemTime,
 };
@@ -344,7 +344,7 @@ fn reader_thread(
         }
     };
 
-    use std::os::unix::io::AsRawFd;
+    // master_fd is only valid as long as master (the owning File) is alive
     let master_fd = master.as_raw_fd();
 
     let mut buf = [0u8; 4096];
@@ -381,6 +381,7 @@ fn reader_thread(
 
         // Data available (or HUP/ERR)
         let n = match master.read(&mut buf) {
+            // On Linux, PTY masters return EIO rather than Ok(0) when the child exits.
             Ok(0) => {
                 // EOF — shell exited. Stay alive for refresh requests until refresh_rx closes.
                 tracing::debug!("PTY reader: EOF on master fd");
@@ -396,7 +397,7 @@ fn reader_thread(
                 }
             }
             Err(e) => {
-                tracing::debug!("PTY reader EOF: {e}");
+                tracing::debug!("PTY reader error: {e}");
                 // EOF/error — shell exited. Stay alive for refresh requests until refresh_rx closes.
                 loop {
                     match refresh_rx.recv() {
