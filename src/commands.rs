@@ -67,8 +67,17 @@ pub fn handle_create(registry: &PtyRegistry, req: CreateRequest) -> TerminalResp
     }
 }
 
-pub fn handle_destroy(registry: &PtyRegistry, req: DestroyRequest) -> TerminalResponse {
+pub fn handle_destroy(
+    registry: &PtyRegistry,
+    req: DestroyRequest,
+    subscribed_ids: &mut HashSet<String>,
+    sub_tasks: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+) -> TerminalResponse {
     let id = req.pty_id.clone();
+    if let Some(task) = sub_tasks.remove(&id) {
+        task.abort();
+    }
+    subscribed_ids.remove(&id);
     match registry.destroy(&req.pty_id) {
         Ok(_) => ok_response(id),
         Err(e) => err_response(id, e.to_string()),
@@ -93,9 +102,16 @@ pub fn handle_subscribe(
                 let task = tokio::spawn(async move {
                     use tokio_stream::StreamExt;
                     let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
-                    while let Some(Ok(chunk)) = stream.next().await {
-                        if tx.send((pty_id.clone(), chunk)).await.is_err() {
-                            break;
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            Ok(chunk) => {
+                                if tx.send((pty_id.clone(), chunk)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                                tracing::warn!(pty_id = %pty_id, skipped = n, "broadcast lagged, skipping chunks");
+                            }
                         }
                     }
                 });

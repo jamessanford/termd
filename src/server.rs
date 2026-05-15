@@ -55,10 +55,18 @@ async fn dispatch_command(
     use crate::commands;
 
     match cmd.command {
-        None => proto::TerminalResponse { response: None },
+        None => proto::TerminalResponse {
+            response: Some(proto::terminal_response::Response::Command(
+                proto::CommandResponse {
+                    pty_id: String::new(),
+                    success: false,
+                    error: Some("empty command".into()),
+                }
+            )),
+        },
         Some(Command::List(_r))        => commands::handle_list(registry, subscribed_ids),
         Some(Command::Create(r))      => commands::handle_create(registry, r),
-        Some(Command::Destroy(r))     => commands::handle_destroy(registry, r),
+        Some(Command::Destroy(r))     => commands::handle_destroy(registry, r, subscribed_ids, sub_tasks),
         Some(Command::Subscribe(r))   => commands::handle_subscribe(registry, r, subscribed_ids, sub_tasks, sub_tx),
         Some(Command::Unsubscribe(r)) => commands::handle_unsubscribe(r, subscribed_ids, sub_tasks),
         Some(Command::Write(r))       => commands::handle_write(registry, r),

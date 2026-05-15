@@ -223,4 +223,12 @@ async fn test_destroy() {
         }
         other => panic!("unexpected: {other:?}"),
     }
+
+    let resp = send_recv(&mut client, terminal_command::Command::List(ListRequest {})).await;
+    match resp.response.unwrap() {
+        termd::proto::terminal_response::Response::List(l) => {
+            assert!(l.items.is_empty(), "expected empty list after destroy");
+        }
+        other => panic!("unexpected after destroy list: {other:?}"),
+    }
 }
