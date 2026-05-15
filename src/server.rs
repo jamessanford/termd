@@ -142,3 +142,36 @@ impl TerminalService for TerminalServiceImpl {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(resp_rx)))
     }
 }
+
+pub async fn serve(
+    registry: Arc<PtyRegistry>,
+    unix_path: &std::path::Path,
+    tcp_addr: std::net::SocketAddr,
+    log_grpc: bool,
+) -> anyhow::Result<()> {
+    use tokio::net::UnixListener;
+    use tonic::transport::Server;
+    use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
+
+    // Remove stale socket file if present
+    let _ = std::fs::remove_file(unix_path);
+
+    let unix_listener = UnixListener::bind(unix_path)?;
+    let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await?;
+
+    tracing::info!(unix = ?unix_path, tcp = %tcp_addr, "termd listening");
+
+    let svc_unix = make_service(registry.clone(), log_grpc);
+    let svc_tcp  = make_service(registry, log_grpc);
+
+    tokio::try_join!(
+        Server::builder()
+            .add_service(svc_unix)
+            .serve_with_incoming(UnixListenerStream::new(unix_listener)),
+        Server::builder()
+            .add_service(svc_tcp)
+            .serve_with_incoming(TcpListenerStream::new(tcp_listener)),
+    )?;
+
+    Ok(())
+}

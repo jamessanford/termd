@@ -232,3 +232,41 @@ async fn test_destroy() {
         other => panic!("unexpected after destroy list: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn test_tcp_transport_accepts_list() {
+    let registry = Arc::new(PtyRegistry::new());
+    let svc = termd::server::make_service(registry, false);
+
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let channel = Channel::from_shared(format!("http://127.0.0.1:{port}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = TerminalServiceClient::with_interceptor(channel, |mut req: Request<()>| {
+        req.metadata_mut().insert(
+            "x-auth-token",
+            termd::server::AUTH_TOKEN.parse().unwrap(),
+        );
+        Ok(req)
+    });
+
+    let resp = send_recv(&mut client, terminal_command::Command::List(ListRequest {})).await;
+    match resp.response.unwrap() {
+        termd::proto::terminal_response::Response::List(l) => assert!(l.items.is_empty()),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
