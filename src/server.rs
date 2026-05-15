@@ -157,7 +157,13 @@ pub async fn serve(
     let _ = std::fs::remove_file(unix_path);
 
     let unix_listener = UnixListener::bind(unix_path)?;
-    let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await?;
+    let tcp_listener = match tokio::net::TcpListener::bind(tcp_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = std::fs::remove_file(unix_path);
+            return Err(e.into());
+        }
+    };
 
     tracing::info!(unix = ?unix_path, tcp = %tcp_addr, "termd listening");
 

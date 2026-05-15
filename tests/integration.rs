@@ -249,13 +249,20 @@ async fn test_tcp_transport_accepts_list() {
             .await
             .unwrap();
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let channel = Channel::from_shared(format!("http://127.0.0.1:{port}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = {
+        let mut ch = None;
+        for _ in 0..10 {
+            match Channel::from_shared(format!("http://127.0.0.1:{port}"))
+                .unwrap()
+                .connect()
+                .await
+            {
+                Ok(c) => { ch = Some(c); break; }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        ch.expect("TCP server did not become ready in time")
+    };
     let mut client = TerminalServiceClient::with_interceptor(channel, |mut req: Request<()>| {
         req.metadata_mut().insert(
             "x-auth-token",
