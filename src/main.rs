@@ -7,7 +7,8 @@ use tonic::Request;
 use termd::{
     proto::{
         terminal_command::Command, terminal_response::Response,
-        CreateRequest, DestroyRequest, ListRequest, TerminalCommand,
+        CreateRequest, DestroyRequest, ListRequest, RefreshRequest,
+        ResizeRequest, SubscribeRequest, TerminalCommand, WriteRequest,
         terminal_service_client::TerminalServiceClient,
     },
     pty::PtyRegistry,
@@ -61,6 +62,163 @@ enum Cmd {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Attach to a running PTY, streaming output to stdout and forwarding stdin
+    Attach {
+        /// PTY ID to attach to (from `termd list`)
+        pty_id: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+}
+
+struct TerminalGuard {
+    original: nix::sys::termios::Termios,
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        use nix::sys::termios::{tcsetattr, SetArg};
+        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
+        let _ = tcsetattr(fd, SetArg::TCSAFLUSH, &self.original);
+    }
+}
+
+fn setup_raw_mode() -> Result<TerminalGuard> {
+    use nix::sys::termios::{tcgetattr, tcsetattr, SetArg, LocalFlags, InputFlags};
+
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(libc::STDIN_FILENO) };
+    let original = tcgetattr(fd)?;
+    let mut raw = original.clone();
+    raw.local_flags.remove(
+        LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ISIG | LocalFlags::IEXTEN,
+    );
+    raw.input_flags.remove(
+        InputFlags::IXON | InputFlags::ICRNL | InputFlags::BRKINT
+            | InputFlags::INPCK | InputFlags::ISTRIP,
+    );
+    raw.control_chars[libc::VMIN as usize] = 1;
+    raw.control_chars[libc::VTIME as usize] = 0;
+    tcsetattr(fd, SetArg::TCSAFLUSH, &raw)?;
+    Ok(TerminalGuard { original })
+}
+
+fn get_terminal_size() -> Result<(u32, u32)> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok((ws.ws_col as u32, ws.ws_row as u32))
+}
+
+#[derive(Clone, Copy)]
+enum EscapeState {
+    Normal,
+    AfterNewline,
+    AfterTilde,
+}
+
+async fn run_stdin(
+    cmd_tx: tokio::sync::mpsc::Sender<TerminalCommand>,
+    pty_id: String,
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+) {
+    use tokio::io::AsyncReadExt;
+
+    let mut stdin = tokio::io::stdin();
+    let mut state = EscapeState::AfterNewline;
+    let mut buf = [0u8; 256];
+    let mut shutdown_tx = Some(shutdown_tx);
+
+    'outer: loop {
+        let n = match stdin.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+
+        let mut to_send: Vec<u8> = Vec::new();
+
+        for &byte in &buf[..n] {
+            match state {
+                EscapeState::Normal => {
+                    to_send.push(byte);
+                    if byte == b'\n' {
+                        state = EscapeState::AfterNewline;
+                    }
+                }
+                EscapeState::AfterNewline => {
+                    if byte == b'~' {
+                        state = EscapeState::AfterTilde;
+                    } else if byte == b'\n' {
+                        to_send.push(byte);
+                    } else {
+                        to_send.push(byte);
+                        state = EscapeState::Normal;
+                    }
+                }
+                EscapeState::AfterTilde => {
+                    if byte == b'.' {
+                        if !to_send.is_empty() {
+                            let _ = cmd_tx.send(TerminalCommand {
+                                command: Some(Command::Write(WriteRequest {
+                                    pty_id: pty_id.clone(),
+                                    data: to_send,
+                                })),
+                            }).await;
+                        }
+                        if let Some(tx) = shutdown_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        break 'outer;
+                    } else if byte == b'\n' {
+                        to_send.push(b'~');
+                        to_send.push(byte);
+                        state = EscapeState::AfterNewline;
+                    } else {
+                        to_send.push(b'~');
+                        to_send.push(byte);
+                        state = EscapeState::Normal;
+                    }
+                }
+            }
+        }
+
+        if !to_send.is_empty() {
+            if cmd_tx.send(TerminalCommand {
+                command: Some(Command::Write(WriteRequest {
+                    pty_id: pty_id.clone(),
+                    data: to_send,
+                })),
+            }).await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+async fn run_sigwinch(
+    cmd_tx: tokio::sync::mpsc::Sender<TerminalCommand>,
+    pty_id: String,
+) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sig = match signal(SignalKind::window_change()) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    while sig.recv().await.is_some() {
+        if let Ok((cols, rows)) = get_terminal_size() {
+            if cmd_tx.send(TerminalCommand {
+                command: Some(Command::Resize(ResizeRequest {
+                    pty_id: pty_id.clone(),
+                    cols,
+                    rows,
+                })),
+            }).await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 fn auth_interceptor(mut req: Request<()>) -> Result<Request<()>, tonic::Status> {
@@ -153,6 +311,116 @@ async fn main() -> Result<()> {
                 }
                 other => eprintln!("unexpected response: {other:?}"),
             }
+        }
+
+        Cmd::Attach { pty_id, socket } => {
+            use tokio::io::AsyncWriteExt;
+            use tokio::sync::{mpsc, oneshot};
+            use tokio_stream::wrappers::ReceiverStream;
+
+            let mut client = connect_client(socket).await?;
+
+            // Open a long-lived bidi stream
+            let (cmd_tx, cmd_rx) = mpsc::channel::<TerminalCommand>(64);
+            let mut resp_rx = client
+                .stream(ReceiverStream::new(cmd_rx))
+                .await?
+                .into_inner();
+
+            // Subscribe
+            cmd_tx.send(TerminalCommand {
+                command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id.clone() })),
+            }).await?;
+
+            loop {
+                match resp_rx.message().await? {
+                    None => { eprintln!("server disconnected during subscribe"); return Ok(()); }
+                    Some(r) => match r.response {
+                        Some(Response::Command(c)) => {
+                            if !c.success {
+                                eprintln!("subscribe failed: {}", c.error.unwrap_or_default());
+                                return Ok(());
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Sync PTY size to local terminal
+            if let Ok((cols, rows)) = get_terminal_size() {
+                let _ = cmd_tx.send(TerminalCommand {
+                    command: Some(Command::Resize(ResizeRequest {
+                        pty_id: pty_id.clone(), cols, rows,
+                    })),
+                }).await;
+            }
+
+            // Request refresh
+            cmd_tx.send(TerminalCommand {
+                command: Some(Command::Refresh(RefreshRequest { pty_id: pty_id.clone() })),
+            }).await?;
+
+            // Buffer StreamData while waiting for RefreshResponse
+            let mut buffered: Vec<(u64, Vec<u8>)> = Vec::new();
+            let (refresh_gen, refresh_bytes) = loop {
+                match resp_rx.message().await? {
+                    None => { eprintln!("server disconnected during refresh"); return Ok(()); }
+                    Some(r) => match r.response {
+                        Some(Response::Refresh(rf)) => break (rf.generation, rf.data),
+                        Some(Response::Stream(s)) => buffered.push((s.generation, s.data)),
+                        _ => {}
+                    }
+                }
+            };
+
+            // Paint refresh and replay buffered chunks that post-date it
+            let mut stdout = tokio::io::stdout();
+            stdout.write_all(&refresh_bytes).await?;
+            for (gen, data) in buffered {
+                if gen > refresh_gen {
+                    stdout.write_all(&data).await?;
+                }
+            }
+            stdout.flush().await?;
+
+            // Enter raw mode — drop guard restores terminal on any exit path
+            let _guard = setup_raw_mode()?;
+
+            // Spawn concurrent actors
+            let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+            let stdin_task = tokio::spawn(run_stdin(
+                cmd_tx.clone(), pty_id.clone(), shutdown_tx,
+            ));
+            let sigwinch_task = tokio::spawn(run_sigwinch(
+                cmd_tx.clone(), pty_id.clone(),
+            ));
+            drop(cmd_tx);
+
+            // Main receive loop
+            loop {
+                tokio::select! {
+                    msg = resp_rx.message() => {
+                        match msg {
+                            Ok(Some(r)) => {
+                                if let Some(Response::Stream(s)) = r.response {
+                                    if s.generation > refresh_gen {
+                                        if stdout.write_all(&s.data).await.is_err() { break; }
+                                        let _ = stdout.flush().await;
+                                    }
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    _ = &mut shutdown_rx => break,
+                }
+            }
+
+            stdin_task.abort();
+            sigwinch_task.abort();
+            // _guard drops here, restoring terminal
         }
     }
 
