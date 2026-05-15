@@ -262,11 +262,15 @@ fn do_refresh(
 ) -> Result<RefreshData> {
     use std::io::Write as IoWrite;
 
-    let cursor_x = terminal.cursor_x().unwrap_or(0) as u32;
-    let cursor_y = terminal.cursor_y().unwrap_or(0) as u32;
-
     let snapshot = render_state.update(terminal)?;
     let cursor_visible = snapshot.cursor_visible().unwrap_or(true);
+    let (cursor_x, cursor_y) = match snapshot.cursor_viewport().ok().flatten() {
+        Some(cv) => (cv.x as u32, cv.y as u32),
+        None => (
+            terminal.cursor_x().unwrap_or(0) as u32,
+            terminal.cursor_y().unwrap_or(0) as u32,
+        ),
+    };
     let mut row_iter = row_iter_obj.update(&snapshot)?;
 
     let mut out: Vec<u8> = Vec::new();
@@ -283,7 +287,7 @@ fn do_refresh(
 
         let mut cell_iter = cell_iter_obj.update(row)?;
         while let Some(cell) = cell_iter.next() {
-            let style = cell.style().unwrap_or_default();
+            let style = cell.style()?;
             let fg = cell.fg_color().ok().flatten();
             let bg = cell.bg_color().ok().flatten();
             let graphemes = cell.graphemes()?;
