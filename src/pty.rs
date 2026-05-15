@@ -9,6 +9,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
+use libghostty_vt::{Terminal, TerminalOptions, RenderState};
+use libghostty_vt::render::{RowIterator, CellIterator};
 use nix::{
     pty::openpty,
     sys::signal::{Signal, kill},
@@ -215,11 +217,12 @@ impl PtyRegistry {
             child: Mutex::new(Some(child)),
         });
 
-        // Spawn dedicated reader thread — owns all libghostty state (wired in Task 3)
+        // Spawn dedicated reader thread — owns all libghostty state
         let master_reader = unsafe { File::from_raw_fd(master_reader_fd) };
+        let title_for_thread = title.clone();
         std::thread::Builder::new()
             .name(format!("pty-reader-{id}"))
-            .spawn(move || reader_thread(master_reader, tx, generation, refresh_rx))
+            .spawn(move || reader_thread(master_reader, tx, generation, refresh_rx, title_for_thread, cols, rows))
             .context("spawn reader thread")?;
 
         self.ptys.write().unwrap().insert(id, handle.clone());
@@ -249,40 +252,144 @@ impl Default for PtyRegistry {
     fn default() -> Self { Self::new() }
 }
 
-// Reader thread — owns libghostty Terminal (wired in Task 3).
-// For now: read raw bytes, broadcast, handle refresh requests (stub).
+fn do_refresh(
+    terminal: &mut Terminal<'static, 'static>,
+    render_state: &mut RenderState<'static>,
+    row_iter_obj: &mut RowIterator<'static>,
+    cell_iter_obj: &mut CellIterator<'static>,
+    generation: u64,
+) -> Result<RefreshData> {
+    let cursor_x = terminal.cursor_x().unwrap_or(0) as u32;
+    let cursor_y = terminal.cursor_y().unwrap_or(0) as u32;
+
+    let snapshot = render_state.update(terminal)?;
+    let mut row_iter = row_iter_obj.update(&snapshot)?;
+
+    let mut out = Vec::new();
+    let mut enc = [0u8; 4];
+    while let Some(row) = row_iter.next() {
+        let mut cell_iter = cell_iter_obj.update(row)?;
+        while let Some(cell) = cell_iter.next() {
+            let graphemes = cell.graphemes()?;
+            if graphemes.is_empty() {
+                out.push(b' ');
+                continue;
+            }
+            for ch in &graphemes {
+                out.extend_from_slice(ch.encode_utf8(&mut enc).as_bytes());
+            }
+        }
+        out.push(b'\n');
+    }
+
+    Ok(RefreshData {
+        generation,
+        data: Bytes::from(out),
+        cursor_x,
+        cursor_y,
+    })
+}
+
+// Reader thread — owns libghostty Terminal state (not Send + Sync).
 fn reader_thread(
     mut master: File,
     tx: broadcast::Sender<Arc<PtyChunk>>,
     generation: Arc<AtomicU64>,
     refresh_rx: std::sync::mpsc::Receiver<oneshot::Sender<Result<RefreshData>>>,
+    title: Arc<Mutex<String>>,
+    init_cols: u32,
+    init_rows: u32,
 ) {
+    let mut terminal = match Terminal::new(TerminalOptions {
+        cols: init_cols as u16,
+        rows: init_rows as u16,
+        max_scrollback: 10_000,
+    }) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!("PTY reader: failed to create terminal: {e}");
+            return;
+        }
+    };
+
+    let title_cb = title.clone();
+    if let Err(e) = terminal.on_title_changed(move |term| {
+        if let Ok(t) = term.title() {
+            *title_cb.lock().unwrap() = t.to_string();
+        }
+    }) {
+        tracing::debug!("PTY reader: failed to register title callback: {e}");
+        return;
+    }
+
+    let mut render_state = match RenderState::new() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("PTY reader: failed to create render state: {e}");
+            return;
+        }
+    };
+    let mut row_iter_obj = match RowIterator::new() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("PTY reader: failed to create row iterator: {e}");
+            return;
+        }
+    };
+    let mut cell_iter_obj = match CellIterator::new() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!("PTY reader: failed to create cell iterator: {e}");
+            return;
+        }
+    };
+
+    use std::os::unix::io::AsRawFd;
+    let master_fd = master.as_raw_fd();
+
     let mut buf = [0u8; 4096];
     loop {
-        // Drain any pending refresh requests with a stub response
+        // Drain any pending refresh requests before waiting for PTY data
         while let Ok(reply_tx) = refresh_rx.try_recv() {
             let gen = generation.load(Ordering::Relaxed);
-            let _ = reply_tx.send(Ok(RefreshData {
-                generation: gen,
-                data: Bytes::new(), // filled in Task 3
-                cursor_x: 0,
-                cursor_y: 0,
-            }));
+            let result = do_refresh(&mut terminal, &mut render_state, &mut row_iter_obj, &mut cell_iter_obj, gen);
+            let _ = reply_tx.send(result);
         }
 
+        // Use poll() with a 50ms timeout so we can service refresh requests
+        // even when the PTY is idle (no new output).
+        let mut pfd = libc::pollfd {
+            fd: master_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let poll_ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 50) };
+
+        if poll_ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue; // EINTR — retry
+            }
+            tracing::debug!("PTY reader poll error: {err}");
+            break;
+        }
+
+        if poll_ret == 0 {
+            // Timeout — no data yet; loop back to drain refresh requests
+            continue;
+        }
+
+        // Data available (or HUP/ERR)
         let n = match master.read(&mut buf) {
             Ok(0) => {
                 // EOF — shell exited. Stay alive for refresh requests until refresh_rx closes.
+                tracing::debug!("PTY reader: EOF on master fd");
                 loop {
                     match refresh_rx.recv() {
                         Ok(reply_tx) => {
                             let gen = generation.load(Ordering::Relaxed);
-                            let _ = reply_tx.send(Ok(RefreshData {
-                                generation: gen,
-                                data: Bytes::new(),
-                                cursor_x: 0,
-                                cursor_y: 0,
-                            }));
+                            let result = do_refresh(&mut terminal, &mut render_state, &mut row_iter_obj, &mut cell_iter_obj, gen);
+                            let _ = reply_tx.send(result);
                         }
                         Err(_) => return, // PtyHandle dropped (destroyed)
                     }
@@ -295,12 +402,8 @@ fn reader_thread(
                     match refresh_rx.recv() {
                         Ok(reply_tx) => {
                             let gen = generation.load(Ordering::Relaxed);
-                            let _ = reply_tx.send(Ok(RefreshData {
-                                generation: gen,
-                                data: Bytes::new(),
-                                cursor_x: 0,
-                                cursor_y: 0,
-                            }));
+                            let result = do_refresh(&mut terminal, &mut render_state, &mut row_iter_obj, &mut cell_iter_obj, gen);
+                            let _ = reply_tx.send(result);
                         }
                         Err(_) => return, // PtyHandle dropped (destroyed)
                     }
@@ -309,6 +412,7 @@ fn reader_thread(
             Ok(n) => n,
         };
 
+        terminal.vt_write(&buf[..n]);
         let gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
         let chunk = Arc::new(PtyChunk {
             generation: gen,

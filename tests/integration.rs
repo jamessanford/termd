@@ -40,3 +40,16 @@ async fn test_write_produces_broadcast_output() {
 
     assert!(chunk.generation > 0);
 }
+
+#[tokio::test]
+async fn test_refresh_returns_screen_data() {
+    let registry = PtyRegistry::new();
+    let handle = registry.create(80, 24, None).unwrap();
+    // Write something and wait for it to appear
+    handle.write(b"echo __refresh_test__\n").unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let data = handle.refresh().await.unwrap();
+    assert!(data.generation > 0);
+    assert!(!data.data.is_empty(), "refresh data should not be empty");
+}
