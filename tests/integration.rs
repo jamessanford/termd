@@ -1,5 +1,94 @@
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::UnixListener;
+use tokio_stream::wrappers::UnixListenerStream;
+use tonic::transport::{Channel, Endpoint, Server};
+use tonic::Request;
+use tower::service_fn;
+use hyper_util::rt::TokioIo;
 use termd::pty::PtyRegistry;
+use termd::server::make_service;
+use termd::proto::terminal_service_client::TerminalServiceClient;
+use termd::proto::{TerminalCommand, terminal_command};
+use termd::proto::ListRequest;
+
+#[allow(dead_code)]
+async fn test_server() -> (tempfile::TempDir, TerminalServiceClient<tonic::service::interceptor::InterceptedService<Channel, impl tonic::service::Interceptor>>) {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("termd.sock");
+    let registry = Arc::new(PtyRegistry::new());
+    let svc = make_service(registry, false);
+    let socket_path = socket.clone();
+    tokio::spawn(async move {
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(UnixListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let socket_path = socket.clone();
+    let channel = Endpoint::try_from("http://[::]:1").unwrap()
+        .connect_with_connector(service_fn(move |_| {
+            let path = socket_path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path).await.map(TokioIo::new)
+            }
+        }))
+        .await
+        .unwrap();
+
+    let client = TerminalServiceClient::with_interceptor(channel, |mut req: Request<()>| {
+        req.metadata_mut().insert(
+            "x-auth-token",
+            termd::server::AUTH_TOKEN.parse().unwrap(),
+        );
+        Ok(req)
+    });
+    (dir, client)
+}
+
+#[tokio::test]
+async fn test_auth_rejects_missing_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("termd.sock");
+    let registry = Arc::new(PtyRegistry::new());
+    let svc = make_service(registry, false);
+    let socket_path = socket.clone();
+    tokio::spawn(async move {
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(UnixListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let socket_path = socket.clone();
+    let channel = Endpoint::try_from("http://[::]:1").unwrap()
+        .connect_with_connector(service_fn(move |_| {
+            let path = socket_path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path).await.map(TokioIo::new)
+            }
+        }))
+        .await
+        .unwrap();
+
+    let mut client = TerminalServiceClient::new(channel);
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let _ = tx.send(TerminalCommand {
+        command: Some(terminal_command::Command::List(ListRequest {})),
+    }).await;
+    drop(tx);
+    let result = client.stream(tokio_stream::wrappers::ReceiverStream::new(rx)).await;
+    assert!(result.is_err());
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+}
 
 #[tokio::test]
 async fn test_create_lists_one_pty() {
