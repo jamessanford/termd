@@ -3,13 +3,10 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
 use tonic::service::interceptor::InterceptedService;
 
+use crate::proto;
 use crate::pty::PtyRegistry;
 
-pub mod proto {
-    tonic::include_proto!("terminal");
-}
-
-pub use proto::terminal_service_server::{TerminalService, TerminalServiceServer};
+pub use crate::proto::terminal_service_server::{TerminalService, TerminalServiceServer};
 
 pub const AUTH_TOKEN: &str = "termd-dev-secret";
 
@@ -22,8 +19,8 @@ pub fn auth_interceptor(req: Request<()>) -> Result<Request<()>, Status> {
 
 #[derive(Clone)]
 pub struct TerminalServiceImpl {
-    pub registry: Arc<PtyRegistry>,
-    pub log_grpc: bool,
+    pub(crate) registry: Arc<PtyRegistry>,
+    pub(crate) log_grpc: bool, // TODO Task 5: used in stream handler
 }
 
 impl TerminalServiceImpl {
@@ -32,13 +29,18 @@ impl TerminalServiceImpl {
     }
 }
 
+type AuthedTerminalService = InterceptedService<
+    TerminalServiceServer<TerminalServiceImpl>,
+    fn(Request<()>) -> Result<Request<()>, Status>,
+>;
+
 pub fn make_service(
     registry: Arc<PtyRegistry>,
     log_grpc: bool,
-) -> InterceptedService<TerminalServiceServer<TerminalServiceImpl>, fn(Request<()>) -> Result<Request<()>, Status>> {
+) -> AuthedTerminalService {
     TerminalServiceServer::with_interceptor(
         TerminalServiceImpl::new(registry, log_grpc),
-        auth_interceptor,
+        auth_interceptor as fn(Request<()>) -> Result<Request<()>, Status>,
     )
 }
 

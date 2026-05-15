@@ -12,6 +12,8 @@ use termd::proto::terminal_service_client::TerminalServiceClient;
 use termd::proto::{TerminalCommand, terminal_command};
 use termd::proto::ListRequest;
 
+// Returns (TempDir, client). Caller must hold TempDir for the test duration —
+// dropping it removes the socket file and kills the server.
 #[allow(dead_code)]
 async fn test_server() -> (tempfile::TempDir, TerminalServiceClient<tonic::service::interceptor::InterceptedService<Channel, impl tonic::service::Interceptor>>) {
     let dir = tempfile::tempdir().unwrap();
@@ -27,7 +29,7 @@ async fn test_server() -> (tempfile::TempDir, TerminalServiceClient<tonic::servi
             .await
             .unwrap();
     });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let socket_path = socket.clone();
     let channel = Endpoint::try_from("http://[::]:1").unwrap()
@@ -65,7 +67,7 @@ async fn test_auth_rejects_missing_token() {
             .await
             .unwrap();
     });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let socket_path = socket.clone();
     let channel = Endpoint::try_from("http://[::]:1").unwrap()
