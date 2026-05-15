@@ -10,7 +10,28 @@ use termd::pty::PtyRegistry;
 use termd::server::make_service;
 use termd::proto::terminal_service_client::TerminalServiceClient;
 use termd::proto::{TerminalCommand, terminal_command};
-use termd::proto::ListRequest;
+use termd::proto::{ListRequest, CreateRequest, DestroyRequest};
+
+async fn send_recv<T>(
+    client: &mut TerminalServiceClient<T>,
+    cmd: terminal_command::Command,
+) -> termd::proto::TerminalResponse
+where
+    T: tonic::client::GrpcService<tonic::body::BoxBody>,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+{
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(TerminalCommand { command: Some(cmd) }).await.unwrap();
+    drop(tx);
+
+    let mut stream = client.stream(ReceiverStream::new(rx)).await.unwrap().into_inner();
+    stream.message().await.unwrap().unwrap()
+}
 
 // Returns (TempDir, client). Caller must hold TempDir for the test duration —
 // dropping it removes the socket file and kills the server.
@@ -146,4 +167,60 @@ async fn test_refresh_returns_screen_data() {
     // We don't assert on specific content here because terminal
     // rendering of the echo output may vary by shell startup timing.
     assert!(!data.data.is_empty(), "refresh data should not be empty");
+}
+
+#[tokio::test]
+async fn test_list_empty() {
+    let (_dir, mut client) = test_server().await;
+    let resp = send_recv(&mut client, terminal_command::Command::List(ListRequest {})).await;
+    match resp.response.unwrap() {
+        termd::proto::terminal_response::Response::List(l) => assert!(l.items.is_empty()),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_create_and_list() {
+    let (_dir, mut client) = test_server().await;
+
+    let resp = send_recv(&mut client, terminal_command::Command::Create(CreateRequest {
+        cols: 80, rows: 24, command: None,
+    })).await;
+    let pty_id = match resp.response.unwrap() {
+        termd::proto::terminal_response::Response::Create(c) => c.item.unwrap().pty_id,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(!pty_id.is_empty());
+
+    let resp = send_recv(&mut client, terminal_command::Command::List(ListRequest {})).await;
+    match resp.response.unwrap() {
+        termd::proto::terminal_response::Response::List(l) => {
+            assert_eq!(l.items.len(), 1);
+            assert_eq!(l.items[0].pty_id, pty_id);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_destroy() {
+    let (_dir, mut client) = test_server().await;
+
+    let resp = send_recv(&mut client, terminal_command::Command::Create(CreateRequest {
+        cols: 80, rows: 24, command: None,
+    })).await;
+    let pty_id = match resp.response.unwrap() {
+        termd::proto::terminal_response::Response::Create(c) => c.item.unwrap().pty_id,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    let resp = send_recv(&mut client, terminal_command::Command::Destroy(
+        DestroyRequest { pty_id: pty_id.clone() },
+    )).await;
+    match resp.response.unwrap() {
+        termd::proto::terminal_response::Response::Command(c) => {
+            assert!(c.success, "destroy failed: {:?}", c.error);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
 }
