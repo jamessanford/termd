@@ -33,11 +33,12 @@ message RefreshRequest     { string pty_id = 1; }
 
 message TerminalResponse {
   oneof response {
-    ListResponse    list    = 1;
-    CreateResponse  create  = 2;
-    CommandResponse command = 3;
-    StreamData      stream  = 4;
-    RefreshResponse refresh = 5;
+    ListResponse    list     = 1;
+    CreateResponse  create   = 2;
+    CommandResponse command  = 3;
+    StreamData      stream   = 4;
+    RefreshResponse refresh  = 5;
+    StreamMetadata  metadata = 6;
   }
 }
 
@@ -62,4 +63,20 @@ message RefreshResponse {
   bytes  data       = 3;
   uint32 cursor_x   = 4;
   uint32 cursor_y   = 5;
+}
+
+enum StreamMetadataReason {
+  RESIZE              = 0;
+  CLOSED              = 1;
+  TITLE_CHANGED       = 2;
+  SUBSCRIBERS_CHANGED = 3;
+}
+
+// NOTE: item.subscribed is always true — recipient is by definition subscribed.
+// When PtyItem is split into PtyState + per-client fields, switch to PtyState.
+message StreamMetadata {
+  string               pty_id    = 1;
+  PtyItem              item      = 2;
+  StreamMetadataReason reason    = 3;
+  optional int32       exit_code = 4;
 }
