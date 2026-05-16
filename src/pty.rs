@@ -23,6 +23,7 @@ use tokio::sync::{broadcast, oneshot};
 const TERM_NAME: &str = "xterm-ghostty";
 // TODO: expose from libghostty_vt::build_info when available
 
+#[derive(Clone, Debug)]
 pub struct PtyInfo {
     pub id: String,
     pub hostname: String,
@@ -36,6 +37,26 @@ pub struct PtyInfo {
 pub struct PtyChunk {
     pub generation: u64,
     pub data: Bytes,
+}
+
+#[derive(Clone, Debug)]
+pub enum MetadataReason {
+    Resize,
+    Closed,
+    TitleChanged,
+    SubscribersChanged,
+}
+
+#[derive(Clone, Debug)]
+pub struct PtyMetadata {
+    pub reason: MetadataReason,
+    pub exit_code: Option<i32>,
+    pub info: PtyInfo,
+}
+
+pub enum PtyEvent {
+    Data(Arc<PtyChunk>),
+    Metadata(Arc<PtyMetadata>),
 }
 
 pub struct RefreshData {
@@ -57,6 +78,7 @@ pub struct PtyHandle {
     writer: Mutex<File>,
     refresh_tx: std::sync::mpsc::SyncSender<oneshot::Sender<Result<RefreshData>>>,
     resize_tx: std::sync::mpsc::SyncSender<(u32, u32)>,
+    meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
     child_pid: u32,
     wakeup_write: OwnedFd,
 }
@@ -76,6 +98,14 @@ impl PtyHandle {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<PtyChunk>> {
         self.tx.subscribe()
+    }
+
+    pub fn meta_subscribe(&self) -> broadcast::Receiver<Arc<PtyMetadata>> {
+        self.meta_tx.subscribe()
+    }
+
+    pub fn broadcast_metadata(&self, meta: Arc<PtyMetadata>) {
+        let _ = self.meta_tx.send(meta);
     }
 
     pub fn write(&self, data: &[u8]) -> Result<()> {
@@ -213,6 +243,7 @@ impl PtyRegistry {
         }
 
         let (tx, _) = broadcast::channel::<Arc<PtyChunk>>(512);
+        let (meta_tx, _) = broadcast::channel::<Arc<PtyMetadata>>(64);
         let (refresh_tx, refresh_rx) =
             std::sync::mpsc::sync_channel::<oneshot::Sender<Result<RefreshData>>>(8);
         let (resize_tx, resize_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(8);
@@ -246,6 +277,7 @@ impl PtyRegistry {
             writer: Mutex::new(unsafe { File::from_raw_fd(master_fd) }),
             refresh_tx,
             resize_tx,
+            meta_tx: meta_tx.clone(),
             child_pid,
             wakeup_write,
         });
