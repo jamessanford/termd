@@ -532,6 +532,26 @@ async fn resolve_pty_id(client: &mut AuthedClient, prefix: &str) -> Result<Strin
     }
 }
 
+async fn resolve_pty_item(client: &mut AuthedClient, prefix: &str) -> Result<PtyItem> {
+    use termd::proto::terminal_response::Response;
+
+    let resp = send_recv(client, Command::List(ListRequest {})).await?;
+    let items = match resp.response {
+        Some(Response::List(l)) => l.items,
+        other => return Err(anyhow::anyhow!("unexpected list response: {other:?}")),
+    };
+    let matches: Vec<_> = items.iter().filter(|i| i.pty_id.starts_with(prefix)).collect();
+    match matches.len() {
+        1 => Ok(matches[0].clone()),
+        0 => Err(anyhow::anyhow!("no PTY matches prefix {:?}", prefix)),
+        _ => Err(anyhow::anyhow!(
+            "ambiguous prefix {:?} matches: {}",
+            prefix,
+            matches.iter().map(|i| &i.pty_id[..8]).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
 async fn connect_client(socket: Option<PathBuf>) -> Result<AuthedClient> {
     use hyper_util::rt::TokioIo;
     use tonic::transport::Endpoint;
