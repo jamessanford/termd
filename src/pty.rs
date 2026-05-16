@@ -52,6 +52,7 @@ pub enum MetadataReason {
 pub struct PtyMetadata {
     pub reason: MetadataReason,
     pub exit_code: Option<i32>,
+    pub generation: u64,
     pub info: PtyInfo,
 }
 
@@ -81,6 +82,7 @@ pub struct PtyHandle {
     refresh_tx: std::sync::mpsc::SyncSender<oneshot::Sender<Result<RefreshData>>>,
     resize_tx: std::sync::mpsc::SyncSender<(u32, u32)>,
     meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
+    generation: Arc<AtomicU64>,
     child_pid: u32,
     wakeup_write: OwnedFd,
 }
@@ -142,6 +144,7 @@ impl PtyHandle {
         let _ = self.meta_tx.send(Arc::new(PtyMetadata {
             reason: MetadataReason::Resize,
             exit_code: None,
+            generation: self.generation.load(Ordering::Relaxed),
             info: self.info(),
         }));
         Ok(())
@@ -165,6 +168,10 @@ impl PtyHandle {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 }
 
@@ -291,6 +298,7 @@ impl PtyRegistry {
             refresh_tx,
             resize_tx,
             meta_tx: meta_tx.clone(),
+            generation: generation.clone(),
             child_pid,
             wakeup_write,
         });
@@ -590,6 +598,7 @@ fn reader_thread(
             let _ = meta_tx.send(Arc::new(PtyMetadata {
                 reason: MetadataReason::TitleChanged,
                 exit_code: None,
+                generation: generation.load(Ordering::Relaxed),
                 info: PtyInfo {
                     id: pty_id.clone(),
                     hostname: hostname.clone(),
@@ -633,6 +642,7 @@ fn reader_thread(
     let _ = meta_tx.send(Arc::new(PtyMetadata {
         reason: MetadataReason::Closed,
         exit_code,
+        generation: generation.load(Ordering::Relaxed),
         info: PtyInfo {
             id: pty_id.clone(),
             hostname: hostname.clone(),

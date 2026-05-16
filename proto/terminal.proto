@@ -75,8 +75,9 @@ enum StreamMetadataReason {
 // NOTE: item.subscribed is always true — recipient is by definition subscribed.
 // When PtyItem is split into PtyState + per-client fields, switch to PtyState.
 message StreamMetadata {
-  string               pty_id    = 1;
-  PtyItem              item      = 2;
-  StreamMetadataReason reason    = 3;
-  optional int32       exit_code = 4;
+  string               pty_id      = 1;
+  PtyItem              item        = 2;
+  StreamMetadataReason reason      = 3;
+  optional int32       exit_code   = 4;
+  uint64               generation  = 5;
 }
