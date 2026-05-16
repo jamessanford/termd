@@ -472,34 +472,13 @@ fn reader_thread(
 
         // Data available (or HUP/ERR) on PTY master.
         let n = match master.read(&mut buf) {
-            // On Linux, PTY masters return EIO rather than Ok(0) when the child exits.
             Ok(0) => {
-                // EOF — shell exited. Stay alive for refresh requests until refresh_rx closes.
                 tracing::debug!("PTY reader: EOF on master fd");
-                loop {
-                    match refresh_rx.recv() {
-                        Ok(reply_tx) => {
-                            let gen = generation.load(Ordering::Relaxed);
-                            let result = do_refresh(&mut terminal, &mut render_state, &mut row_iter_obj, &mut cell_iter_obj, gen);
-                            let _ = reply_tx.send(result);
-                        }
-                        Err(_) => return, // PtyHandle dropped (destroyed)
-                    }
-                }
+                break;
             }
             Err(e) => {
                 tracing::debug!("PTY reader error: {e}");
-                // EOF/error — shell exited. Stay alive for refresh requests until refresh_rx closes.
-                loop {
-                    match refresh_rx.recv() {
-                        Ok(reply_tx) => {
-                            let gen = generation.load(Ordering::Relaxed);
-                            let result = do_refresh(&mut terminal, &mut render_state, &mut row_iter_obj, &mut cell_iter_obj, gen);
-                            let _ = reply_tx.send(result);
-                        }
-                        Err(_) => return, // PtyHandle dropped (destroyed)
-                    }
-                }
+                break;
             }
             Ok(n) => n,
         };
@@ -512,4 +491,7 @@ fn reader_thread(
         });
         let _ = tx.send(chunk); // ignore SendError (no subscribers is fine)
     }
+
+    // Exit notification and child reaping added in Task 4
+    drop(wakeup_read);
 }
