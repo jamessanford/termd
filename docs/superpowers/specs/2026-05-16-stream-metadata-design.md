@@ -86,4 +86,7 @@ than `StreamData` and `RefreshResponse`. It should be updated to handle
 - Refactor `PtyItem` into a connection-agnostic `PtyState` plus per-client
   fields; switch `StreamMetadata.item` to `PtyState`.
 - `SUBSCRIBERS_CHANGED` currently carries the same `subscribed: bool` as the
-  list response. Once `PtyState` exists, add a subscriber count field.
+  list response. Once `PtyState` exists, replace this with per-subscriber
+  information (e.g. each subscriber's native terminal dimensions), since the
+  server will eventually need to track client-side cols/rows to make informed
+  decisions (e.g. choosing a common render size).
