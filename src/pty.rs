@@ -138,6 +138,12 @@ impl PtyHandle {
         let _ = self.resize_tx.try_send((cols, rows));
         let wfd = self.wakeup_write.as_raw_fd();
         let _ = unsafe { libc::write(wfd, [2u8].as_ptr() as *const libc::c_void, 1) };
+        // Broadcast updated state to all subscribers
+        let _ = self.meta_tx.send(Arc::new(PtyMetadata {
+            reason: MetadataReason::Resize,
+            exit_code: None,
+            info: self.info(),
+        }));
         Ok(())
     }
 
