@@ -372,7 +372,7 @@ fn reader_thread(
     generation: Arc<AtomicU64>,
     refresh_rx: std::sync::mpsc::Receiver<oneshot::Sender<Result<RefreshData>>>,
     wakeup_read: OwnedFd,
-    _child: std::process::Child,
+    mut child: std::process::Child,
     title: Arc<Mutex<String>>,
     init_cols: u32,
     init_rows: u32,
@@ -492,6 +492,36 @@ fn reader_thread(
         let _ = tx.send(chunk); // ignore SendError (no subscribers is fine)
     }
 
-    // Exit notification and child reaping added in Task 4
-    drop(wakeup_read);
+    // Reap child and broadcast exit notification
+    let status = child.try_wait().ok().flatten().or_else(|| child.wait().ok());
+    let exit_msg = {
+        let title = title.lock().unwrap().clone();
+        match status {
+            Some(s) => {
+                if let Some(code) = s.code() {
+                    format!("\r\n[Command {} exited with code {}]\r\n", title, code)
+                } else {
+                    format!("\r\n[Command {} was killed]\r\n", title)
+                }
+            }
+            None => format!("\r\n[Command {} terminated]\r\n", title),
+        }
+    };
+    let gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ = tx.send(Arc::new(PtyChunk {
+        generation: gen,
+        data: Bytes::from(exit_msg.into_bytes()),
+    }));
+
+    // Drain any refresh requests that arrived just before exit
+    while let Ok(reply_tx) = refresh_rx.try_recv() {
+        let gen = generation.load(Ordering::Relaxed);
+        let result = do_refresh(
+            &mut terminal, &mut render_state,
+            &mut row_iter_obj, &mut cell_iter_obj, gen,
+        );
+        let _ = reply_tx.send(result);
+    }
+
+    drop(wakeup_read); // closes read end; wakeup_write already closed (PtyHandle dropped)
 }
