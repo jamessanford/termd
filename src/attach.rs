@@ -181,6 +181,8 @@ fn setup_raw_mode() -> Result<TerminalGuard> {
     Ok(TerminalGuard { original })
 }
 
+/// Kept for future use when dynamic client-side terminal resizing is implemented.
+#[allow(dead_code)]
 fn get_terminal_size() -> Result<(u32, u32)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
@@ -384,8 +386,10 @@ async fn run_normal(client: &mut AuthedClient, item: PtyItem) -> Result<()> {
                         Some(Response::Metadata(m)) => {
                             if m.reason == StreamMetadataReason::Resize as i32 {
                                 if let Some(ref mi) = m.item {
-                                    lt.resize(mi.cols, mi.rows)?;
-                                    render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, false, &mut out)?;
+                                    if mi.cols > 0 && mi.rows > 0 {
+                                        lt.resize(mi.cols, mi.rows)?;
+                                        render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, false, &mut out)?;
+                                    }
                                 }
                             } else if m.reason == StreamMetadataReason::Closed as i32 {
                                 server_closed = true;
