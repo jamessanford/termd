@@ -416,15 +416,15 @@ async fn main() -> Result<()> {
                         match msg {
                             Ok(Some(r)) => {
                                 if let Some(Response::Stream(s)) = r.response {
-                                if s.generation > refresh_gen {
-                                    if debug {
-                                        eprintln!("[Stream gen={} len={}]", s.generation, s.data.len());
-                                    } else {
-                                        if stdout.write_all(&s.data).await.is_err() { break; }
-                                        let _ = stdout.flush().await;
+                                    if s.generation > refresh_gen {
+                                        if debug {
+                                            eprintln!("[Stream gen={} len={}]", s.generation, s.data.len());
+                                        } else {
+                                            if stdout.write_all(&s.data).await.is_err() { break; }
+                                            let _ = stdout.flush().await;
+                                        }
                                     }
                                 }
-                            }
                             }
                             _ => break,
                         }

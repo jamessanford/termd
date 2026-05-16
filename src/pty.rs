@@ -253,7 +253,9 @@ impl PtyRegistry {
         let handle = self.ptys.write().unwrap().remove(id)
             .ok_or_else(|| anyhow!("PTY {id} not found"))?;
         let _ = kill(Pid::from_raw(handle.child_pid as i32), Signal::SIGHUP);
-        // handle drops here: wakeup_write closes → reader sees POLLHUP and exits
+        // handle drops at end of scope: wakeup_write closes → reader sees POLLHUP and exits.
+        // If callers hold Arc<PtyHandle> clones (e.g. an in-flight refresh), wakeup_write
+        // stays open until the last clone drops — POLLHUP fires then, not immediately on return.
         Ok(())
     }
 
