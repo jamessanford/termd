@@ -200,6 +200,11 @@ impl PtyRegistry {
         if master_reader_fd < 0 {
             return Err(std::io::Error::last_os_error()).context("dup master fd for reader");
         }
+        // Set O_NONBLOCK so the reader can drain all available bytes in a loop
+        let flags = unsafe { libc::fcntl(master_reader_fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(master_reader_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("set O_NONBLOCK on master reader fd");
+        }
 
         let (tx, _) = broadcast::channel::<Arc<PtyChunk>>(512);
         let (refresh_tx, refresh_rx) =
@@ -428,7 +433,7 @@ fn reader_thread(
     let wakeup_fd = wakeup_read.as_raw_fd();
 
     let mut buf = [0u8; 4096];
-    loop {
+    'main: loop {
         // Drain any pending refresh requests and drain the wakeup pipe before
         // waiting for PTY data.
         let mut wake_byte = [0u8; 64];
@@ -472,24 +477,32 @@ fn reader_thread(
             continue;
         }
 
-        // Data available (or HUP/ERR) on PTY master.
-        let n = match master.read(&mut buf) {
-            Ok(0) => {
-                tracing::debug!("PTY reader: EOF on master fd");
-                break;
+        // Data available (or HUP/ERR) on PTY master — drain all buffered bytes.
+        let mut batch: Vec<u8> = Vec::new();
+        loop {
+            match master.read(&mut buf) {
+                Ok(0) => {
+                    tracing::debug!("PTY reader: EOF on master fd");
+                    break 'main;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    tracing::debug!("PTY reader error: {e}");
+                    break 'main;
+                }
+                Ok(n) => batch.extend_from_slice(&buf[..n]),
             }
-            Err(e) => {
-                tracing::debug!("PTY reader error: {e}");
-                break;
-            }
-            Ok(n) => n,
-        };
+        }
 
-        terminal.vt_write(&buf[..n]);
+        if batch.is_empty() {
+            continue;
+        }
+
+        terminal.vt_write(&batch);
         let gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
         let chunk = Arc::new(PtyChunk {
             generation: gen,
-            data: Bytes::copy_from_slice(&buf[..n]),
+            data: Bytes::from(batch),
         });
         let _ = tx.send(chunk); // ignore SendError (no subscribers is fine)
     }
