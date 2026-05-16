@@ -105,6 +105,8 @@ impl TerminalService for TerminalServiceImpl {
                         match cmd {
                             None => break,
                             Some(Err(e)) => {
+                                // NOTE: When clients disappear, e.code() == tonic::Code::Unknown happens,
+                                // check if this is expected or if we are missing something.
                                 tracing::warn!("stream read error: {e}");
                                 break;
                             }
