@@ -446,13 +446,6 @@ fn reader_thread(
         ];
         let poll_ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
 
-        // Check for POLLHUP on the wakeup pipe — means the write end was closed
-        // (PtyHandle dropped / destroy() called).  Exit the reader loop.
-        if pfds[1].revents & libc::POLLHUP != 0 {
-            tracing::debug!("PTY reader: wakeup pipe closed, exiting");
-            break;
-        }
-
         if poll_ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -462,9 +455,11 @@ fn reader_thread(
             break;
         }
 
-        if poll_ret == 0 {
-            // Timeout — no data yet; loop back to drain refresh requests
-            continue;
+        // Check for POLLHUP on the wakeup pipe — means the write end was closed
+        // (PtyHandle dropped / destroy() called).  Exit the reader loop.
+        if pfds[1].revents & libc::POLLHUP != 0 {
+            tracing::debug!("PTY reader: wakeup pipe closed, exiting");
+            break;
         }
 
         // Only read from PTY master if it actually has data ready.
