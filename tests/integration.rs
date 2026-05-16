@@ -492,3 +492,74 @@ async fn test_subscribe_receives_closed_metadata() {
 
     assert!(found, "subscribe stream should deliver Closed metadata after PTY exits");
 }
+
+#[tokio::test]
+async fn test_resize_via_grpc_delivers_metadata() {
+    use termd::proto::{
+        terminal_command::Command, terminal_response::Response,
+        TerminalCommand, SubscribeRequest, ResizeRequest, StreamMetadataReason,
+    };
+
+    let (_dir, mut client) = test_server().await;
+
+    // Create a PTY
+    let resp = send_recv(&mut client, Command::Create(CreateRequest {
+        cols: 80, rows: 24, command: None,
+    })).await;
+    let pty_id = match resp.response.unwrap() {
+        Response::Create(c) => c.item.unwrap().pty_id,
+        other => panic!("expected Create, got {other:?}"),
+    };
+
+    // Open a bidi stream and subscribe
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
+    let mut resp_stream = client
+        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx))
+        .await
+        .unwrap()
+        .into_inner();
+
+    cmd_tx.send(TerminalCommand {
+        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id.clone() })),
+    }).await.unwrap();
+
+    // Drain until subscribe ack
+    loop {
+        match resp_stream.message().await.unwrap().unwrap().response.unwrap() {
+            Response::Command(c) if c.success => break,
+            _ => {}
+        }
+    }
+
+    // Send resize
+    cmd_tx.send(TerminalCommand {
+        command: Some(Command::Resize(ResizeRequest {
+            pty_id: pty_id.clone(),
+            cols: 120,
+            rows: 40,
+        })),
+    }).await.unwrap();
+
+    // Expect StreamMetadata::Resize with updated dimensions
+    let found = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match resp_stream.message().await {
+                Ok(Some(resp)) => match resp.response.unwrap() {
+                    Response::Metadata(m)
+                        if m.reason == StreamMetadataReason::Resize as i32 => {
+                            let item = m.item.unwrap();
+                            assert_eq!(item.cols, 120);
+                            assert_eq!(item.rows, 40);
+                            return true;
+                        }
+                    _ => continue,
+                },
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(found, "resize command should deliver StreamMetadata::Resize to subscriber");
+}

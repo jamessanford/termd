@@ -7,7 +7,7 @@ use tonic::Request;
 use termd::{
     proto::{
         terminal_command::Command, terminal_response::Response,
-        CreateRequest, DestroyRequest, ListRequest, RefreshRequest,
+        CreateRequest, DestroyRequest, ListRequest, PtyItem, RefreshRequest,
         ResizeRequest, SubscribeRequest, TerminalCommand, WriteRequest,
         StreamMetadataReason,
         terminal_service_client::TerminalServiceClient,
@@ -38,12 +38,12 @@ enum Cmd {
         log_grpc: bool,
         #[arg(long, default_value = "127.0.0.1:7777")]
         tcp_addr: SocketAddr,
-        #[arg(long)]
+        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
         socket: Option<PathBuf>,
     },
     /// List active PTYs
     List {
-        #[arg(long)]
+        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
         socket: Option<PathBuf>,
     },
     /// Create a new PTY
@@ -54,27 +54,35 @@ enum Cmd {
         rows: u32,
         #[arg(long)]
         cmd: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
         socket: Option<PathBuf>,
     },
     /// Destroy a PTY
     Destroy {
         pty_id: String,
-        #[arg(long)]
+        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
         socket: Option<PathBuf>,
     },
     /// Write text to a PTY (appends newline)
     Send {
         pty_id: String,
         text: String,
-        #[arg(long)]
+        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
+        socket: Option<PathBuf>,
+    },
+    /// Resize a PTY's columns and rows on the server
+    Resize {
+        pty_id: String,
+        cols: u32,
+        rows: u32,
+        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
         socket: Option<PathBuf>,
     },
     /// Attach to a running PTY, streaming output to stdout and forwarding stdin
     Attach {
         /// PTY ID to attach to (from `termd list`)
         pty_id: String,
-        #[arg(long)]
+        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
         socket: Option<PathBuf>,
         /// Print message metadata to stderr instead of writing data to stdout
         #[arg(long)]
@@ -341,6 +349,26 @@ async fn main() -> Result<()> {
             }
         }
 
+        Cmd::Resize { pty_id, cols, rows, socket } => {
+            let mut client = connect_client(socket).await?;
+            let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
+            let resp = send_recv(
+                &mut client,
+                Command::Resize(ResizeRequest { pty_id: pty_id.clone(), cols, rows }),
+            ).await?;
+            match resp.response {
+                Some(Response::Command(c)) => {
+                    if c.success {
+                        println!("resized {} to {}x{}", pty_id, cols, rows);
+                    } else {
+                        eprintln!("error: {}", c.error.unwrap_or_default());
+                        std::process::exit(1);
+                    }
+                }
+                other => eprintln!("unexpected response: {other:?}"),
+            }
+        }
+
         Cmd::Attach { pty_id, socket, debug } => {
             use tokio::io::AsyncWriteExt;
             use tokio::sync::{mpsc, oneshot};
@@ -436,6 +464,7 @@ async fn main() -> Result<()> {
             drop(cmd_tx);
 
             // Main receive loop
+            let mut server_closed = false;
             loop {
                 tokio::select! {
                     msg = resp_rx.message() => {
@@ -457,13 +486,14 @@ async fn main() -> Result<()> {
                                             eprintln!("[Metadata reason={} gen={} pty_id={}]", m.reason, m.generation, m.pty_id);
                                         }
                                         if m.reason == StreamMetadataReason::Closed as i32 {
+                                            server_closed = true;
                                             break;
                                         }
                                     }
                                     _ => {}
                                 }
                             }
-                            _ => break,
+                            _ => { server_closed = true; break; }
                         }
                     }
                     _ = &mut shutdown_rx => break,
@@ -472,7 +502,10 @@ async fn main() -> Result<()> {
 
             stdin_task.abort();
             sigwinch_task.abort();
-            // _guard drops here, restoring terminal
+            drop(_guard); // restore terminal before printing
+            if server_closed {
+                eprintln!("[Connection closed]");
+            }
         }
     }
 
