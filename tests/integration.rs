@@ -132,6 +132,58 @@ async fn test_destroy_removes_pty() {
 }
 
 #[tokio::test]
+async fn test_destroy_closes_broadcast() {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let registry = PtyRegistry::new();
+    let handle = registry.create(80, 24, None).unwrap();
+    let id = handle.info().id.clone();
+    let mut rx = handle.subscribe();
+    drop(handle);
+
+    registry.destroy(&id).unwrap();
+
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Err(RecvError::Closed) => return true,
+                Err(RecvError::Lagged(_)) | Ok(_) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(closed, "broadcast should close within 5s of destroy");
+}
+
+#[tokio::test]
+async fn test_exit_notification_broadcast() {
+    let registry = PtyRegistry::new();
+    let handle = registry.create(80, 24, None).unwrap();
+    let mut rx = handle.subscribe();
+
+    handle.write(b"exit\n").unwrap();
+
+    let found = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(chunk) => {
+                    if chunk.data.windows(9).any(|w| w == b"[Command ") {
+                        return true;
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(found, "should receive exit notification after shell exits");
+}
+
+#[tokio::test]
 async fn test_write_produces_broadcast_output() {
     let registry = PtyRegistry::new();
     let handle = registry.create(80, 24, None).unwrap();
