@@ -306,6 +306,7 @@ async fn main() -> Result<()> {
 
         Cmd::Destroy { pty_id, socket } => {
             let mut client = connect_client(socket).await?;
+            let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             let resp = send_recv(
                 &mut client,
                 Command::Destroy(DestroyRequest { pty_id: pty_id.clone() }),
@@ -326,6 +327,7 @@ async fn main() -> Result<()> {
 
         Cmd::Send { pty_id, text, socket } => {
             let mut client = connect_client(socket).await?;
+            let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             let mut data = text.into_bytes();
             data.push(b'\n');
             let resp = send_recv(&mut client, Command::Write(WriteRequest { pty_id, data })).await?;
@@ -344,6 +346,7 @@ async fn main() -> Result<()> {
             use tokio_stream::wrappers::ReceiverStream;
 
             let mut client = connect_client(socket).await?;
+            let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
 
             // Open a long-lived bidi stream
             let (cmd_tx, cmd_rx) = mpsc::channel::<TerminalCommand>(64);
@@ -462,6 +465,26 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn resolve_pty_id(client: &mut AuthedClient, prefix: &str) -> Result<String> {
+    use termd::proto::terminal_response::Response;
+
+    let resp = send_recv(client, Command::List(ListRequest {})).await?;
+    let ids = match resp.response {
+        Some(Response::List(l)) => l.items.into_iter().map(|i| i.pty_id).collect::<Vec<_>>(),
+        other => return Err(anyhow::anyhow!("unexpected list response: {other:?}")),
+    };
+    let matches: Vec<_> = ids.iter().filter(|id| id.starts_with(prefix)).collect();
+    match matches.len() {
+        1 => Ok(matches[0].clone()),
+        0 => Err(anyhow::anyhow!("no PTY matches prefix {:?}", prefix)),
+        _ => Err(anyhow::anyhow!(
+            "ambiguous prefix {:?} matches: {}",
+            prefix,
+            matches.iter().map(|s| &s[..8]).collect::<Vec<_>>().join(", ")
+        )),
+    }
 }
 
 async fn connect_client(socket: Option<PathBuf>) -> Result<AuthedClient> {
