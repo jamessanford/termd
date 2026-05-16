@@ -62,6 +62,13 @@ enum Cmd {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Write text to a PTY (appends newline)
+    Send {
+        pty_id: String,
+        text: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Attach to a running PTY, streaming output to stdout and forwarding stdin
     Attach {
         /// PTY ID to attach to (from `termd list`)
@@ -313,6 +320,20 @@ async fn main() -> Result<()> {
                     }
                 }
                 other => eprintln!("unexpected response: {other:?}"),
+            }
+        }
+
+        Cmd::Send { pty_id, text, socket } => {
+            let mut client = connect_client(socket).await?;
+            let mut data = text.into_bytes();
+            data.push(b'\n');
+            let resp = send_recv(&mut client, Command::Write(WriteRequest { pty_id, data })).await?;
+            match resp.response {
+                Some(Response::Command(c)) if !c.success => {
+                    eprintln!("error: {}", c.error.unwrap_or_default());
+                    std::process::exit(1);
+                }
+                _ => {}
             }
         }
 
