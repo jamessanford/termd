@@ -136,12 +136,14 @@ async fn test_destroy_closes_broadcast() {
     use tokio::sync::broadcast::error::RecvError;
 
     let registry = PtyRegistry::new();
-    let handle = registry.create(80, 24, None).unwrap();
-    let id = handle.info().id.clone();
-    let mut rx = handle.subscribe();
-    drop(handle);
-
-    registry.destroy(&id).unwrap();
+    let mut rx = {
+        let handle = registry.create(80, 24, None).unwrap();
+        let id = handle.info().id.clone();
+        let rx = handle.subscribe();
+        registry.destroy(&id).unwrap();
+        // handle drops here; destroy has already removed it from the registry
+        rx
+    };
 
     let closed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -169,11 +171,14 @@ async fn test_exit_notification_broadcast() {
         loop {
             match rx.recv().await {
                 Ok(chunk) => {
+                    // Exit notification format: "\r\n[Command <title> exited with code <N>]\r\n"
+                    // Match the stable prefix regardless of title content or exit code.
                     if chunk.data.windows(9).any(|w| w == b"[Command ") {
                         return true;
                     }
                 }
-                Err(_) => return false,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             }
         }
     })
