@@ -526,6 +526,12 @@ fn reader_thread(
             current_rows = rows;
             if let Err(e) = terminal.resize(cols as u16, rows as u16, 0, 0) {
                 tracing::debug!("PTY reader: terminal resize failed: {e}");
+            } else {
+                let refresh_gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
+                match do_refresh(&mut terminal, &mut render_state, &mut row_iter_obj, &mut cell_iter_obj, refresh_gen) {
+                    Ok(data) => { let _ = tx.send(Arc::new(PtyChunk { generation: refresh_gen, data: data.data })); }
+                    Err(e) => tracing::debug!("PTY reader: resize refresh failed: {e}"),
+                }
             }
         }
         while let Ok(reply_tx) = refresh_rx.try_recv() {
