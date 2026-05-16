@@ -427,3 +427,68 @@ async fn test_closed_broadcasts_metadata() {
 
     assert!(found, "PTY exit should broadcast a Closed metadata event");
 }
+
+#[tokio::test]
+async fn test_subscribe_receives_closed_metadata() {
+    use termd::proto::{
+        terminal_command::Command, terminal_response::Response,
+        TerminalCommand, SubscribeRequest, WriteRequest, StreamMetadataReason,
+    };
+
+    let (_dir, mut client) = test_server().await;
+
+    // Create a PTY
+    let resp = send_recv(&mut client, Command::Create(CreateRequest {
+        cols: 80, rows: 24, command: None,
+    })).await;
+    let pty_id = match resp.response.unwrap() {
+        Response::Create(c) => c.item.unwrap().pty_id,
+        other => panic!("expected Create, got {other:?}"),
+    };
+
+    // Open a long-lived bidi stream and subscribe
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
+    let mut resp_stream = client
+        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx))
+        .await
+        .unwrap()
+        .into_inner();
+
+    cmd_tx.send(TerminalCommand {
+        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id.clone() })),
+    }).await.unwrap();
+
+    // Wait for subscribe ack
+    loop {
+        match resp_stream.message().await.unwrap().unwrap().response.unwrap() {
+            Response::Command(c) if c.success => break,
+            _ => {}
+        }
+    }
+
+    // Trigger PTY exit
+    cmd_tx.send(TerminalCommand {
+        command: Some(Command::Write(WriteRequest {
+            pty_id: pty_id.clone(),
+            data: b"exit\n".to_vec(),
+        })),
+    }).await.unwrap();
+
+    // Wait for CLOSED metadata
+    let found = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match resp_stream.message().await {
+                Ok(Some(resp)) => match resp.response.unwrap() {
+                    Response::Metadata(m)
+                        if m.reason == StreamMetadataReason::Closed as i32 => return true,
+                    _ => continue,
+                },
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(found, "subscribe stream should deliver Closed metadata after PTY exits");
+}

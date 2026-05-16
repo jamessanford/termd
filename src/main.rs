@@ -9,6 +9,7 @@ use termd::{
         terminal_command::Command, terminal_response::Response,
         CreateRequest, DestroyRequest, ListRequest, RefreshRequest,
         ResizeRequest, SubscribeRequest, TerminalCommand, WriteRequest,
+        StreamMetadataReason,
         terminal_service_client::TerminalServiceClient,
     },
     pty::PtyRegistry,
@@ -440,15 +441,26 @@ async fn main() -> Result<()> {
                     msg = resp_rx.message() => {
                         match msg {
                             Ok(Some(r)) => {
-                                if let Some(Response::Stream(s)) = r.response {
-                                    if s.generation > refresh_gen {
-                                        if debug {
-                                            eprintln!("[Stream gen={} len={}]", s.generation, s.data.len());
-                                        } else {
-                                            if stdout.write_all(&s.data).await.is_err() { break; }
-                                            let _ = stdout.flush().await;
+                                match r.response {
+                                    Some(Response::Stream(s)) => {
+                                        if s.generation > refresh_gen {
+                                            if debug {
+                                                eprintln!("[Stream gen={} len={}]", s.generation, s.data.len());
+                                            } else {
+                                                if stdout.write_all(&s.data).await.is_err() { break; }
+                                                let _ = stdout.flush().await;
+                                            }
                                         }
                                     }
+                                    Some(Response::Metadata(m)) => {
+                                        if debug {
+                                            eprintln!("[Metadata reason={} gen={} pty_id={}]", m.reason, m.generation, m.pty_id);
+                                        }
+                                        if m.reason == StreamMetadataReason::Closed as i32 {
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                             _ => break,
