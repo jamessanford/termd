@@ -402,7 +402,10 @@ async fn run_normal(client: &mut AuthedClient, item: PtyItem) -> Result<()> {
                                 if let Some(ref mi) = m.item {
                                     if mi.cols > 0 && mi.rows > 0 {
                                         lt.resize(mi.cols, mi.rows)?;
-                                        render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, false, &mut out)?;
+                                        // Clear the physical screen so stale content from the
+                                        // old dimensions doesn't persist. The server broadcasts
+                                        // a refresh immediately after resize, which will repaint.
+                                        out.extend_from_slice(b"\x1b[2J");
                                     }
                                 }
                             } else if m.reason == StreamMetadataReason::Closed as i32 {
