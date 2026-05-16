@@ -111,7 +111,11 @@ impl PtyHandle {
         let (tx, rx) = oneshot::channel();
         self.refresh_tx.send(tx).map_err(|_| anyhow!("PTY reader thread is dead"))?;
         // Wake the reader immediately instead of waiting up to 50 ms for the poll timeout
-        unsafe { libc::write(self.wakeup_write.as_raw_fd(), [1u8].as_ptr() as *const libc::c_void, 1) };
+        let wfd = self.wakeup_write.as_raw_fd();
+        let ret = unsafe { libc::write(wfd, [1u8].as_ptr() as *const libc::c_void, 1) };
+        if ret < 0 {
+            tracing::debug!("wakeup write failed: {}", std::io::Error::last_os_error());
+        }
         rx.await.map_err(|_| anyhow!("PTY reader thread dropped refresh response"))?
     }
 
@@ -197,23 +201,25 @@ impl PtyRegistry {
             return Err(std::io::Error::last_os_error()).context("dup master fd for reader");
         }
 
-        let child = cmd.spawn().context("spawn shell")?;
-        // slave fds are owned by the Stdio objects passed to Command and closed after fork;
-
         let (tx, _) = broadcast::channel::<Arc<PtyChunk>>(512);
         let (refresh_tx, refresh_rx) =
             std::sync::mpsc::sync_channel::<oneshot::Sender<Result<RefreshData>>>(8);
         let generation = Arc::new(AtomicU64::new(0));
 
-        // Create wakeup pipe: reader polls on read end; refresh() writes to write end.
-        // O_CLOEXEC ensures child processes don't inherit these fds.
+        // Create wakeup pipe before spawning the child so that a pipe2 failure doesn't
+        // leave a zombie process behind.  O_CLOEXEC ensures the child won't inherit these fds.
+        // O_NONBLOCK is required so that the unconditional drain-read at the top of the
+        // reader loop returns EAGAIN immediately when the pipe is empty.
         let mut pipe_fds = [0i32; 2];
-        let rc = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        let rc = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
         if rc < 0 {
             return Err(std::io::Error::last_os_error()).context("pipe2 for wakeup");
         }
         let wakeup_read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
         let wakeup_write = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+
+        let child = cmd.spawn().context("spawn shell")?;
+        // slave fds are owned by the Stdio objects passed to Command and closed after fork;
 
         let child_pid = child.id();
         let handle = Arc::new(PtyHandle {
@@ -365,6 +371,8 @@ fn reader_thread(
     tx: broadcast::Sender<Arc<PtyChunk>>,
     generation: Arc<AtomicU64>,
     refresh_rx: std::sync::mpsc::Receiver<oneshot::Sender<Result<RefreshData>>>,
+    wakeup_read: OwnedFd,
+    _child: std::process::Child,
     title: Arc<Mutex<String>>,
     init_cols: u32,
     init_rows: u32,
@@ -415,24 +423,35 @@ fn reader_thread(
 
     // master_fd is only valid as long as master (the owning File) is alive
     let master_fd = master.as_raw_fd();
+    let wakeup_fd = wakeup_read.as_raw_fd();
 
     let mut buf = [0u8; 4096];
     loop {
-        // Drain any pending refresh requests before waiting for PTY data
+        // Drain any pending refresh requests and drain the wakeup pipe before
+        // waiting for PTY data.
+        let mut wake_byte = [0u8; 64];
+        unsafe { libc::read(wakeup_fd, wake_byte.as_mut_ptr() as *mut libc::c_void, wake_byte.len()) };
         while let Ok(reply_tx) = refresh_rx.try_recv() {
             let gen = generation.load(Ordering::Relaxed);
             let result = do_refresh(&mut terminal, &mut render_state, &mut row_iter_obj, &mut cell_iter_obj, gen);
             let _ = reply_tx.send(result);
         }
 
-        // Use poll() with a 50ms timeout so we can service refresh requests
-        // even when the PTY is idle (no new output).
-        let mut pfd = libc::pollfd {
-            fd: master_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let poll_ret = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 50) };
+        // Poll both the PTY master and the wakeup pipe.  A refresh() call writes one
+        // byte to wakeup_write, which makes wakeup_fd readable and unblocks the poll
+        // immediately rather than waiting for the 50 ms timeout.
+        let mut pfds = [
+            libc::pollfd { fd: master_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: wakeup_fd, events: libc::POLLIN, revents: 0 },
+        ];
+        let poll_ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, -1) };
+
+        // Check for POLLHUP on the wakeup pipe — means the write end was closed
+        // (PtyHandle dropped / destroy() called).  Exit the reader loop.
+        if pfds[1].revents & libc::POLLHUP != 0 {
+            tracing::debug!("PTY reader: wakeup pipe closed, exiting");
+            break;
+        }
 
         if poll_ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -448,7 +467,15 @@ fn reader_thread(
             continue;
         }
 
-        // Data available (or HUP/ERR)
+        // Only read from PTY master if it actually has data ready.
+        // poll_ret > 0 may be due to the wakeup pipe alone; reading master
+        // when it is not ready would block indefinitely.
+        if pfds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+            // Only the wakeup pipe fired — loop back to handle refresh requests.
+            continue;
+        }
+
+        // Data available (or HUP/ERR) on PTY master.
         let n = match master.read(&mut buf) {
             // On Linux, PTY masters return EIO rather than Ok(0) when the child exits.
             Ok(0) => {
