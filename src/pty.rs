@@ -34,6 +34,7 @@ pub struct PtyInfo {
     pub created_at: SystemTime,
 }
 
+#[derive(Debug)]
 pub struct PtyChunk {
     pub generation: u64,
     pub data: Bytes,
@@ -54,6 +55,7 @@ pub struct PtyMetadata {
     pub info: PtyInfo,
 }
 
+#[derive(Debug)]
 pub enum PtyEvent {
     Data(Arc<PtyChunk>),
     Metadata(Arc<PtyMetadata>),
