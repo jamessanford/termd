@@ -130,9 +130,8 @@ struct LocalTerminal {
 }
 ```
 
-Created after the subscribe ack, using the cols/rows from the initial `PtyItem` returned in the
-subscribe `CommandResponse` (or from the `ListResponse` used for pty_id resolution). Updated when
-`StreamMetadata::Resize` arrives.
+Created after the subscribe ack, using the cols/rows from the `PtyItem` already retrieved during
+`resolve_pty_id()` (the `ListResponse`). Updated when `StreamMetadata::Resize` arrives.
 
 ## Error Handling
 
