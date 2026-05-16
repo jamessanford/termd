@@ -7,6 +7,7 @@ use tonic::Request;
 use tower::service_fn;
 use hyper_util::rt::TokioIo;
 use termd::pty::PtyRegistry;
+use termd::pty::{MetadataReason, PtyMetadata};
 use termd::server::make_service;
 use termd::proto::terminal_service_client::TerminalServiceClient;
 use termd::proto::{TerminalCommand, terminal_command};
@@ -337,4 +338,92 @@ async fn test_tcp_transport_accepts_list() {
         termd::proto::terminal_response::Response::List(l) => assert!(l.items.is_empty()),
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn test_resize_broadcasts_metadata() {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let registry = PtyRegistry::new();
+    let handle = registry.create(80, 24, None).unwrap();
+    let mut rx = handle.meta_subscribe();
+
+    handle.resize(120, 40).unwrap();
+
+    let found = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.recv().await {
+                Ok(meta) => {
+                    if matches!(meta.reason, MetadataReason::Resize) {
+                        return meta.info.cols == 120 && meta.info.rows == 40;
+                    }
+                }
+                Err(RecvError::Closed) => return false,
+                Err(RecvError::Lagged(_)) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(found, "resize should broadcast a Resize metadata event");
+}
+
+#[tokio::test]
+async fn test_title_change_broadcasts_metadata() {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let registry = PtyRegistry::new();
+    let handle = registry.create(80, 24, None).unwrap();
+    let mut rx = handle.meta_subscribe();
+
+    // OSC 0 sets window title; \x07 is BEL terminator
+    handle.write(b"printf '\\033]0;TestTitle\\007'\n").unwrap();
+
+    let found = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(meta) => {
+                    if matches!(meta.reason, MetadataReason::TitleChanged) {
+                        return meta.info.title == "TestTitle";
+                    }
+                }
+                Err(RecvError::Closed) => return false,
+                Err(RecvError::Lagged(_)) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(found, "title change should broadcast a TitleChanged metadata event with updated title");
+}
+
+#[tokio::test]
+async fn test_closed_broadcasts_metadata() {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let registry = PtyRegistry::new();
+    let handle = registry.create(80, 24, None).unwrap();
+    let mut rx = handle.meta_subscribe();
+
+    handle.write(b"exit\n").unwrap();
+
+    let found = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(meta) => {
+                    if matches!(meta.reason, MetadataReason::Closed) {
+                        return true;
+                    }
+                }
+                Err(RecvError::Closed) => return false,
+                Err(RecvError::Lagged(_)) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(found, "PTY exit should broadcast a Closed metadata event");
 }
