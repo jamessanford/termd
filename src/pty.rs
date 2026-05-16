@@ -56,6 +56,7 @@ pub struct PtyHandle {
     tx: broadcast::Sender<Arc<PtyChunk>>,
     writer: Mutex<File>,
     refresh_tx: std::sync::mpsc::SyncSender<oneshot::Sender<Result<RefreshData>>>,
+    resize_tx: std::sync::mpsc::SyncSender<(u32, u32)>,
     child_pid: u32,
     wakeup_write: OwnedFd,
 }
@@ -100,6 +101,11 @@ impl PtyHandle {
         }
         self.cols.store(cols, Ordering::Relaxed);
         self.rows.store(rows, Ordering::Relaxed);
+        // Notify reader thread so libghostty Terminal dimensions stay in sync.
+        // Best-effort: if the channel is full or the thread is gone, skip silently.
+        let _ = self.resize_tx.try_send((cols, rows));
+        let wfd = self.wakeup_write.as_raw_fd();
+        let _ = unsafe { libc::write(wfd, [2u8].as_ptr() as *const libc::c_void, 1) };
         Ok(())
     }
 
@@ -209,6 +215,7 @@ impl PtyRegistry {
         let (tx, _) = broadcast::channel::<Arc<PtyChunk>>(512);
         let (refresh_tx, refresh_rx) =
             std::sync::mpsc::sync_channel::<oneshot::Sender<Result<RefreshData>>>(8);
+        let (resize_tx, resize_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(8);
         let generation = Arc::new(AtomicU64::new(0));
 
         // Create wakeup pipe before spawning the child so that a pipe2 failure doesn't
@@ -238,6 +245,7 @@ impl PtyRegistry {
             tx: tx.clone(),
             writer: Mutex::new(unsafe { File::from_raw_fd(master_fd) }),
             refresh_tx,
+            resize_tx,
             child_pid,
             wakeup_write,
         });
@@ -247,7 +255,7 @@ impl PtyRegistry {
         let title_for_thread = title.clone();
         std::thread::Builder::new()
             .name(format!("pty-reader-{id}"))
-            .spawn(move || reader_thread(master_reader, tx, generation, refresh_rx, wakeup_read, child, title_for_thread, cols, rows))
+            .spawn(move || reader_thread(master_reader, tx, generation, refresh_rx, resize_rx, wakeup_read, child, title_for_thread, cols, rows))
             .context("spawn reader thread")?;
 
         self.ptys.write().unwrap().insert(id, handle.clone());
@@ -378,6 +386,7 @@ fn reader_thread(
     tx: broadcast::Sender<Arc<PtyChunk>>,
     generation: Arc<AtomicU64>,
     refresh_rx: std::sync::mpsc::Receiver<oneshot::Sender<Result<RefreshData>>>,
+    resize_rx: std::sync::mpsc::Receiver<(u32, u32)>,
     wakeup_read: OwnedFd,
     mut child: std::process::Child,
     title: Arc<Mutex<String>>,
@@ -434,10 +443,15 @@ fn reader_thread(
 
     let mut buf = [0u8; 4096];
     'main: loop {
-        // Drain any pending refresh requests and drain the wakeup pipe before
-        // waiting for PTY data.
+        // Drain the wakeup pipe, then handle any pending resize and refresh requests
+        // before waiting for PTY data.
         let mut wake_byte = [0u8; 64];
         unsafe { libc::read(wakeup_fd, wake_byte.as_mut_ptr() as *mut libc::c_void, wake_byte.len()) };
+        while let Ok((cols, rows)) = resize_rx.try_recv() {
+            if let Err(e) = terminal.resize(cols as u16, rows as u16, 0, 0) {
+                tracing::debug!("PTY reader: terminal resize failed: {e}");
+            }
+        }
         while let Ok(reply_tx) = refresh_rx.try_recv() {
             let gen = generation.load(Ordering::Relaxed);
             let result = do_refresh(&mut terminal, &mut render_state, &mut row_iter_obj, &mut cell_iter_obj, gen);

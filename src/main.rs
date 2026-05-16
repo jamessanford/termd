@@ -152,15 +152,16 @@ async fn run_stdin(
             match state {
                 EscapeState::Normal => {
                     to_send.push(byte);
-                    if byte == b'\n' {
+                    if byte == b'\r' || byte == b'\n' {
                         state = EscapeState::AfterNewline;
                     }
                 }
                 EscapeState::AfterNewline => {
                     if byte == b'~' {
                         state = EscapeState::AfterTilde;
-                    } else if byte == b'\n' {
+                    } else if byte == b'\r' || byte == b'\n' {
                         to_send.push(byte);
+                        // stay in AfterNewline
                     } else {
                         to_send.push(byte);
                         state = EscapeState::Normal;
@@ -180,7 +181,7 @@ async fn run_stdin(
                             let _ = tx.send(());
                         }
                         break 'outer;
-                    } else if byte == b'\n' {
+                    } else if byte == b'\r' || byte == b'\n' {
                         to_send.push(b'~');
                         to_send.push(byte);
                         state = EscapeState::AfterNewline;
