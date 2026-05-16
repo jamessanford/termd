@@ -4,10 +4,10 @@ use prost_types::Timestamp;
 
 use crate::{
     proto::{terminal_response::Response, *},
-    pty::{PtyInfo, PtyRegistry},
+    pty::{MetadataReason, PtyEvent, PtyInfo, PtyMetadata, PtyRegistry},
 };
 
-fn pty_info_to_item(info: PtyInfo, subscribed: bool) -> PtyItem {
+pub fn pty_info_to_item(info: PtyInfo, subscribed: bool) -> PtyItem {
     let created = info.created_at
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -89,34 +89,53 @@ pub fn handle_subscribe(
     req: SubscribeRequest,
     subscribed_ids: &mut HashSet<String>,
     sub_tasks: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
-    sub_tx: &tokio::sync::mpsc::Sender<(String, Arc<crate::pty::PtyChunk>)>,
+    sub_tx: &tokio::sync::mpsc::Sender<(String, PtyEvent)>,
 ) -> TerminalResponse {
     let id = req.pty_id.clone();
     match registry.get(&id) {
         None => err_response(id, "PTY not found".into()),
         Some(handle) => {
             if !subscribed_ids.contains(&id) {
-                let rx = handle.subscribe();
+                let data_rx = handle.subscribe();
+                let meta_rx = handle.meta_subscribe();
                 let tx = sub_tx.clone();
-                let pty_id = id.clone();
+                let pty_id_clone = id.clone();
                 let task = tokio::spawn(async move {
-                    use tokio_stream::StreamExt;
-                    let mut stream = tokio_stream::wrappers::BroadcastStream::new(rx);
-                    while let Some(item) = stream.next().await {
-                        match item {
-                            Ok(chunk) => {
-                                if tx.send((pty_id.clone(), chunk)).await.is_err() {
-                                    break;
+                    use tokio_stream::{StreamExt, wrappers::{BroadcastStream, errors::BroadcastStreamRecvError}};
+                    let mut data_stream = BroadcastStream::new(data_rx);
+                    let mut meta_stream = BroadcastStream::new(meta_rx);
+                    loop {
+                        tokio::select! {
+                            item = data_stream.next() => match item {
+                                Some(Ok(chunk)) => {
+                                    if tx.send((pty_id_clone.clone(), PtyEvent::Data(chunk))).await.is_err() { break; }
                                 }
-                            }
-                            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                                tracing::warn!(pty_id = %pty_id, skipped = n, "broadcast lagged, skipping chunks");
-                            }
+                                Some(Err(BroadcastStreamRecvError::Lagged(n))) => {
+                                    tracing::warn!(pty_id = %pty_id_clone, skipped = n, "data broadcast lagged");
+                                }
+                                None => break,
+                            },
+                            item = meta_stream.next() => match item {
+                                Some(Ok(meta)) => {
+                                    if tx.send((pty_id_clone.clone(), PtyEvent::Metadata(meta))).await.is_err() { break; }
+                                }
+                                Some(Err(BroadcastStreamRecvError::Lagged(n))) => {
+                                    tracing::warn!(pty_id = %pty_id_clone, skipped = n, "meta broadcast lagged");
+                                }
+                                None => break,
+                            },
                         }
                     }
                 });
                 sub_tasks.insert(id.clone(), task);
                 subscribed_ids.insert(id.clone());
+                // Notify all subscribers (including this new one) that subscriber count changed
+                handle.broadcast_metadata(Arc::new(PtyMetadata {
+                    reason: MetadataReason::SubscribersChanged,
+                    exit_code: None,
+                    generation: handle.current_generation(),
+                    info: handle.info(),
+                }));
             }
             ok_response(id)
         }
@@ -124,6 +143,7 @@ pub fn handle_subscribe(
 }
 
 pub fn handle_unsubscribe(
+    registry: &PtyRegistry,
     req: UnsubscribeRequest,
     subscribed_ids: &mut HashSet<String>,
     sub_tasks: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
@@ -133,6 +153,15 @@ pub fn handle_unsubscribe(
         task.abort();
     }
     subscribed_ids.remove(&id);
+    // Notify remaining subscribers that the count changed
+    if let Some(handle) = registry.get(&id) {
+        handle.broadcast_metadata(Arc::new(PtyMetadata {
+            reason: MetadataReason::SubscribersChanged,
+            exit_code: None,
+            generation: handle.current_generation(),
+            info: handle.info(),
+        }));
+    }
     ok_response(id)
 }
 

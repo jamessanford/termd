@@ -4,7 +4,8 @@ use tonic::{Request, Response, Status, Streaming};
 use tonic::service::interceptor::InterceptedService;
 
 use crate::proto;
-use crate::pty::{PtyChunk, PtyRegistry};
+use crate::pty::{MetadataReason, PtyEvent, PtyRegistry};
+use crate::commands;
 
 pub use crate::proto::terminal_service_server::{TerminalService, TerminalServiceServer};
 
@@ -49,10 +50,9 @@ async fn dispatch_command(
     registry: &Arc<PtyRegistry>,
     subscribed_ids: &mut std::collections::HashSet<String>,
     sub_tasks: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
-    sub_tx: &tokio::sync::mpsc::Sender<(String, Arc<PtyChunk>)>,
+    sub_tx: &tokio::sync::mpsc::Sender<(String, PtyEvent)>,
 ) -> proto::TerminalResponse {
     use proto::terminal_command::Command;
-    use crate::commands;
 
     match cmd.command {
         None => proto::TerminalResponse {
@@ -68,7 +68,7 @@ async fn dispatch_command(
         Some(Command::Create(r))      => commands::handle_create(registry, r),
         Some(Command::Destroy(r))     => commands::handle_destroy(registry, r, subscribed_ids, sub_tasks),
         Some(Command::Subscribe(r))   => commands::handle_subscribe(registry, r, subscribed_ids, sub_tasks, sub_tx),
-        Some(Command::Unsubscribe(r)) => commands::handle_unsubscribe(r, subscribed_ids, sub_tasks),
+        Some(Command::Unsubscribe(r)) => commands::handle_unsubscribe(registry, r, subscribed_ids, sub_tasks),
         Some(Command::Write(r))       => commands::handle_write(registry, r),
         Some(Command::Resize(r))      => commands::handle_resize(registry, r),
         Some(Command::SetTitle(r))    => commands::handle_set_title(registry, r),
@@ -93,7 +93,7 @@ impl TerminalService for TerminalServiceImpl {
         let mut inbound = request.into_inner();
 
         let (resp_tx, resp_rx) = mpsc::channel::<Result<proto::TerminalResponse, Status>>(256);
-        let (sub_tx, mut sub_rx) = mpsc::channel::<(String, Arc<PtyChunk>)>(1024);
+        let (sub_tx, mut sub_rx) = mpsc::channel::<(String, PtyEvent)>(1024);
 
         tokio::spawn(async move {
             let mut sub_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
@@ -122,15 +122,37 @@ impl TerminalService for TerminalServiceImpl {
                             }
                         }
                     }
-                    Some((pty_id, chunk)) = sub_rx.recv() => {
-                        let resp = proto::TerminalResponse {
-                            response: Some(proto::terminal_response::Response::Stream(
-                                proto::StreamData {
-                                    pty_id,
-                                    generation: chunk.generation,
-                                    data: chunk.data.to_vec(),
+                    Some((pty_id, event)) = sub_rx.recv() => {
+                        let resp = match event {
+                            PtyEvent::Data(chunk) => proto::TerminalResponse {
+                                response: Some(proto::terminal_response::Response::Stream(
+                                    proto::StreamData {
+                                        pty_id,
+                                        generation: chunk.generation,
+                                        data: chunk.data.to_vec(),
+                                    }
+                                )),
+                            },
+                            PtyEvent::Metadata(meta) => {
+                                use proto::StreamMetadataReason;
+                                let reason = match meta.reason {
+                                    MetadataReason::Resize             => StreamMetadataReason::Resize,
+                                    MetadataReason::Closed             => StreamMetadataReason::Closed,
+                                    MetadataReason::TitleChanged       => StreamMetadataReason::TitleChanged,
+                                    MetadataReason::SubscribersChanged => StreamMetadataReason::SubscribersChanged,
+                                };
+                                proto::TerminalResponse {
+                                    response: Some(proto::terminal_response::Response::Metadata(
+                                        proto::StreamMetadata {
+                                            pty_id,
+                                            item: Some(commands::pty_info_to_item(meta.info.clone(), true)),
+                                            reason: reason as i32,
+                                            exit_code: meta.exit_code,
+                                            generation: meta.generation,
+                                        }
+                                    )),
                                 }
-                            )),
+                            }
                         };
                         if resp_tx.send(Ok(resp)).await.is_err() { break; }
                     }
