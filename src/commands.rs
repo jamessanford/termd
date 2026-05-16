@@ -78,6 +78,9 @@ pub fn handle_destroy(
         task.abort();
     }
     subscribed_ids.remove(&id);
+    // No SUBSCRIBERS_CHANGED broadcast here — CLOSED (emitted by reader_thread on child exit)
+    // is the terminal event for subscribers. Broadcasting SUBSCRIBERS_CHANGED on destroy would
+    // race with the CLOSED event and add no useful information.
     match registry.destroy(&req.pty_id) {
         Ok(_) => ok_response(id),
         Err(e) => err_response(id, e.to_string()),

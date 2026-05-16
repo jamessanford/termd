@@ -593,12 +593,22 @@ fn reader_thread(
 
         terminal.vt_write(&batch);
         let current_title = title.lock().unwrap().clone();
-        if current_title != prev_title {
+        let title_changed = current_title != prev_title;
+        if title_changed {
             prev_title = current_title.clone();
+        }
+        let gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let chunk = Arc::new(PtyChunk {
+            generation: gen,
+            data: Bytes::from(batch),
+        });
+        let _ = tx.send(chunk); // ignore SendError (no subscribers is fine)
+        // Emit TitleChanged after fetch_add so generation matches the accompanying chunk.
+        if title_changed {
             let _ = meta_tx.send(Arc::new(PtyMetadata {
                 reason: MetadataReason::TitleChanged,
                 exit_code: None,
-                generation: generation.load(Ordering::Relaxed),
+                generation: gen,
                 info: PtyInfo {
                     id: pty_id.clone(),
                     hostname: hostname.clone(),
@@ -610,12 +620,6 @@ fn reader_thread(
                 },
             }));
         }
-        let gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let chunk = Arc::new(PtyChunk {
-            generation: gen,
-            data: Bytes::from(batch),
-        });
-        let _ = tx.send(chunk); // ignore SendError (no subscribers is fine)
     }
 
     // Reap child and broadcast exit notification
