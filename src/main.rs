@@ -68,6 +68,9 @@ enum Cmd {
         pty_id: String,
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Print message metadata to stderr instead of writing data to stdout
+        #[arg(long)]
+        debug: bool,
     },
 }
 
@@ -313,7 +316,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Attach { pty_id, socket } => {
+        Cmd::Attach { pty_id, socket, debug } => {
             use tokio::io::AsyncWriteExt;
             use tokio::sync::{mpsc, oneshot};
             use tokio_stream::wrappers::ReceiverStream;
@@ -377,10 +380,18 @@ async fn main() -> Result<()> {
 
             // Paint refresh and replay buffered chunks that post-date it
             let mut stdout = tokio::io::stdout();
-            stdout.write_all(&refresh_bytes).await?;
-            for (gen, data) in buffered {
-                if gen > refresh_gen {
-                    stdout.write_all(&data).await?;
+            if debug {
+                eprintln!("[Refresh gen={} len={}]", refresh_gen, refresh_bytes.len());
+            } else {
+                stdout.write_all(&refresh_bytes).await?;
+            }
+            for (gen, data) in &buffered {
+                if *gen > refresh_gen {
+                    if debug {
+                        eprintln!("[Buffered gen={} len={}]", *gen, data.len());
+                    } else {
+                        stdout.write_all(data).await?;
+                    }
                 }
             }
             stdout.flush().await?;
@@ -405,11 +416,15 @@ async fn main() -> Result<()> {
                         match msg {
                             Ok(Some(r)) => {
                                 if let Some(Response::Stream(s)) = r.response {
-                                    if s.generation > refresh_gen {
+                                if s.generation > refresh_gen {
+                                    if debug {
+                                        eprintln!("[Stream gen={} len={}]", s.generation, s.data.len());
+                                    } else {
                                         if stdout.write_all(&s.data).await.is_err() { break; }
                                         let _ = stdout.flush().await;
                                     }
                                 }
+                            }
                             }
                             _ => break,
                         }
