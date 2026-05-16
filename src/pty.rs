@@ -285,6 +285,14 @@ impl Default for PtyRegistry {
     fn default() -> Self { Self::new() }
 }
 
+// Known gap: when the terminal is on the alternate screen (e.g. inside `less` or `vim`),
+// this refresh only renders the alt screen.  A newly attached client will have a blank
+// primary screen, so switching back to primary after the full-screen app exits will show
+// stale or empty content until the next streaming chunk arrives.
+//
+// Fixing this properly requires either (a) rendering the primary screen before every
+// vt_write (expensive) or (b) a libghostty API that can render an inactive screen buffer.
+// Extend libghostty with the latter when the need becomes pressing.
 fn do_refresh(
     terminal: &mut Terminal<'static, 'static>,
     render_state: &mut RenderState<'static>,
