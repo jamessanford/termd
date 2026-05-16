@@ -1,7 +1,6 @@
 [env]
-# Point pkg-config to the pre-built libghostty-vt shared library.
-# The library was built with zig 0.15.x (ghostty commit 6590196661f769dd).
-# Zig 0.16.0 cannot rebuild it (API incompatibility in ghostty's build.zig),
-# so we pin to the pre-built artifact in the cargo build cache and disable
-# the vendored build in favour of pkg-config discovery.
-PKG_CONFIG_PATH = { value = "target/debug/build/libghostty-vt-sys-14e0fe1a1177c10c/out/ghostty-install/share/pkgconfig", relative = true }
+# Always build libghostty-vt with Zig ReleaseFast optimizations regardless of
+# whether the Rust build is debug or release. This disables the debug-mode
+# integrity checks (verifyIntegrity, debug.assert) that dominate CPU time when
+# processing terminal output.
+LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseFast"
