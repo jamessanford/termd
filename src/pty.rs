@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::{Read, Write},
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
+    os::fd::OwnedFd,
     sync::{Arc, Mutex, RwLock, atomic::{AtomicU32, AtomicU64, Ordering}},
     time::SystemTime,
 };
@@ -56,7 +57,7 @@ pub struct PtyHandle {
     writer: Mutex<File>,
     refresh_tx: std::sync::mpsc::SyncSender<oneshot::Sender<Result<RefreshData>>>,
     child_pid: u32,
-    child: Mutex<Option<std::process::Child>>,
+    wakeup_write: OwnedFd,
 }
 
 impl PtyHandle {
@@ -109,6 +110,8 @@ impl PtyHandle {
     pub async fn refresh(&self) -> Result<RefreshData> {
         let (tx, rx) = oneshot::channel();
         self.refresh_tx.send(tx).map_err(|_| anyhow!("PTY reader thread is dead"))?;
+        // Wake the reader immediately instead of waiting up to 50 ms for the poll timeout
+        unsafe { libc::write(self.wakeup_write.as_raw_fd(), [1u8].as_ptr() as *const libc::c_void, 1) };
         rx.await.map_err(|_| anyhow!("PTY reader thread dropped refresh response"))?
     }
 
@@ -202,6 +205,16 @@ impl PtyRegistry {
             std::sync::mpsc::sync_channel::<oneshot::Sender<Result<RefreshData>>>(8);
         let generation = Arc::new(AtomicU64::new(0));
 
+        // Create wakeup pipe: reader polls on read end; refresh() writes to write end.
+        // O_CLOEXEC ensures child processes don't inherit these fds.
+        let mut pipe_fds = [0i32; 2];
+        let rc = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error()).context("pipe2 for wakeup");
+        }
+        let wakeup_read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let wakeup_write = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+
         let child_pid = child.id();
         let handle = Arc::new(PtyHandle {
             id: id.clone(),
@@ -215,15 +228,15 @@ impl PtyRegistry {
             writer: Mutex::new(unsafe { File::from_raw_fd(master_fd) }),
             refresh_tx,
             child_pid,
-            child: Mutex::new(Some(child)),
+            wakeup_write,
         });
 
-        // Spawn dedicated reader thread — owns all libghostty state
+        // Spawn dedicated reader thread — owns libghostty state and child process
         let master_reader = unsafe { File::from_raw_fd(master_reader_fd) };
         let title_for_thread = title.clone();
         std::thread::Builder::new()
             .name(format!("pty-reader-{id}"))
-            .spawn(move || reader_thread(master_reader, tx, generation, refresh_rx, title_for_thread, cols, rows))
+            .spawn(move || reader_thread(master_reader, tx, generation, refresh_rx, wakeup_read, child, title_for_thread, cols, rows))
             .context("spawn reader thread")?;
 
         self.ptys.write().unwrap().insert(id, handle.clone());
@@ -234,9 +247,7 @@ impl PtyRegistry {
         let handle = self.ptys.write().unwrap().remove(id)
             .ok_or_else(|| anyhow!("PTY {id} not found"))?;
         let _ = kill(Pid::from_raw(handle.child_pid as i32), Signal::SIGHUP);
-        if let Some(mut child) = handle.child.lock().unwrap().take() {
-            std::thread::spawn(move || { let _ = child.wait(); });
-        }
+        // handle drops here: wakeup_write closes → reader sees POLLHUP and exits
         Ok(())
     }
 
