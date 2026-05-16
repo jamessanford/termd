@@ -30,7 +30,7 @@ The current `reader_thread` calls `poll([master_fd], 50ms)` so it can service `r
 - Call `nix::unistd::pipe()` → `(wakeup_read: OwnedFd, wakeup_write: OwnedFd)`.
 - Set `FD_CLOEXEC` on both ends via `fcntl`.
 - Store `wakeup_write` in `PtyHandle`.
-- Pass `wakeup_read`, the `Child` struct, and the command string directly to `reader_thread`.
+- Pass `wakeup_read` and the `Child` struct directly to `reader_thread`.
 
 **`PtyHandle`**
 
@@ -47,8 +47,9 @@ After `refresh_tx.send(tx)`, write one byte to `wakeup_write` via `libc::write`.
 ```
 wakeup_read: OwnedFd
 child: std::process::Child
-command: String   // shell path or --cmd value, for exit message
 ```
+
+(`title: Arc<Mutex<String>>` is already passed; the exit message reads it at close time.)
 
 **Reader poll loop**
 
