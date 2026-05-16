@@ -29,12 +29,19 @@ The attach implementation moves out of `main.rs` into `src/attach.rs`. As the lo
 significantly in complexity, it deserves its own module. `main.rs` becomes a thin CLI dispatcher
 that calls `attach::run(pty_id, socket, debug)`.
 
+Both `--debug` and normal mode live in `attach.rs`. `--debug` is a fast path that skips
+`LocalTerminal` creation entirely — it subscribes, streams events, and prints metadata to stderr
+exactly as the current stub does. Normal mode creates `LocalTerminal` and runs the full render
+pipeline. Keeping both in `attach.rs` avoids duplicating the subscribe/refresh setup and makes
+the two paths easy to compare.
+
 `attach.rs` owns:
 - `LocalTerminal` struct — libghostty `Terminal` + `RenderState` + reusable `RowIterator` /
   `CellIterator`, all at the server's resolution. These are `!Send` and live on a single thread.
-- The main receive loop (gRPC stream dispatch)
+  Only created in normal (non-debug) mode.
+- The main receive loop (gRPC stream dispatch), branching on `debug`
 - The stdin task (escape sequence handling, write forwarding)
-- The SIGWINCH task (local repaint trigger)
+- The SIGWINCH task (local repaint trigger, normal mode only)
 - `render_dirty()` — incremental render function (see Data Flow)
 
 ### New CLI subcommand: `termd resize <pty_id> <cols> <rows>`
