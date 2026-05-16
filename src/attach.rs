@@ -86,6 +86,7 @@ fn render_dirty(
     let mut row_iter_active = row_iter.update(&snapshot)?;
     let mut row_idx: u32 = 0;
     let mut char_enc = [0u8; 4];
+    let mut grapheme_buf: Vec<char> = Vec::new();
     let mut rendered_any = false;
 
     while let Some(row) = row_iter_active.next() {
@@ -101,7 +102,12 @@ fn render_dirty(
             let style = cell.style()?;
             let fg = cell.fg_color().ok().flatten();
             let bg = cell.bg_color().ok().flatten();
-            let graphemes = cell.graphemes()?;
+            let len = cell.graphemes_len()?;
+            if grapheme_buf.len() < len {
+                grapheme_buf.resize(len, '\0');
+            }
+            cell.graphemes_buf(&mut grapheme_buf[..len])?;
+            let graphemes = &grapheme_buf[..len];
 
             out.extend_from_slice(b"\x1b[0");
             if style.bold          { out.extend_from_slice(b";1"); }
@@ -128,7 +134,7 @@ fn render_dirty(
             if graphemes.is_empty() {
                 out.push(b' ');
             } else {
-                for ch in &graphemes {
+                for ch in graphemes {
                     out.extend_from_slice(ch.encode_utf8(&mut char_enc).as_bytes());
                 }
             }
@@ -368,8 +374,9 @@ async fn run_normal(client: &mut AuthedClient, item: PtyItem) -> Result<()> {
 
     // Main receive loop
     let mut server_closed = false;
+    let mut out = Vec::new();
     loop {
-        let mut out = Vec::new();
+        out.clear();
         tokio::select! {
             msg = resp_rx.message() => {
                 match msg {
