@@ -273,10 +273,15 @@ impl PtyRegistry {
         // slave fds are owned by the Stdio objects passed to Command and closed after fork;
 
         let child_pid = child.id();
+        let created_at = SystemTime::now();
+        let meta_tx_for_thread = meta_tx.clone();
+        let id_for_thread = id.clone();
+        let hostname_for_thread = hostname.clone();
+        let pts_name_for_thread = pts_name.clone();
         let handle = Arc::new(PtyHandle {
             id: id.clone(),
             pts_name,
-            created_at: SystemTime::now(),
+            created_at,
             hostname,
             cols: AtomicU32::new(cols),
             rows: AtomicU32::new(rows),
@@ -295,7 +300,12 @@ impl PtyRegistry {
         let title_for_thread = title.clone();
         std::thread::Builder::new()
             .name(format!("pty-reader-{id}"))
-            .spawn(move || reader_thread(master_reader, tx, generation, refresh_rx, resize_rx, wakeup_read, child, title_for_thread, cols, rows))
+            .spawn(move || reader_thread(
+                master_reader, tx, generation, refresh_rx, resize_rx, wakeup_read,
+                child, title_for_thread, cols, rows,
+                meta_tx_for_thread, id_for_thread, hostname_for_thread,
+                pts_name_for_thread, created_at,
+            ))
             .context("spawn reader thread")?;
 
         self.ptys.write().unwrap().insert(id, handle.clone());
@@ -440,6 +450,11 @@ fn reader_thread(
     title: Arc<Mutex<String>>,
     init_cols: u32,
     init_rows: u32,
+    meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
+    pty_id: String,
+    hostname: String,
+    pts_name: String,
+    created_at: SystemTime,
 ) {
     let mut terminal = match Terminal::new(TerminalOptions {
         cols: init_cols as u16,
@@ -485,6 +500,12 @@ fn reader_thread(
         }
     };
 
+    let mut current_cols = init_cols;
+    let mut current_rows = init_rows;
+    // Initialize prev_title to match the initial title mutex value (pts_name),
+    // so we don't emit a spurious TitleChanged before the shell sets any title.
+    let mut prev_title = pts_name.clone();
+
     // master_fd is only valid as long as master (the owning File) is alive
     let master_fd = master.as_raw_fd();
     let wakeup_fd = wakeup_read.as_raw_fd();
@@ -496,6 +517,8 @@ fn reader_thread(
         let mut wake_byte = [0u8; 64];
         unsafe { libc::read(wakeup_fd, wake_byte.as_mut_ptr() as *mut libc::c_void, wake_byte.len()) };
         while let Ok((cols, rows)) = resize_rx.try_recv() {
+            current_cols = cols;
+            current_rows = rows;
             if let Err(e) = terminal.resize(cols as u16, rows as u16, 0, 0) {
                 tracing::debug!("PTY reader: terminal resize failed: {e}");
             }
@@ -561,6 +584,23 @@ fn reader_thread(
         }
 
         terminal.vt_write(&batch);
+        let current_title = title.lock().unwrap().clone();
+        if current_title != prev_title {
+            prev_title = current_title.clone();
+            let _ = meta_tx.send(Arc::new(PtyMetadata {
+                reason: MetadataReason::TitleChanged,
+                exit_code: None,
+                info: PtyInfo {
+                    id: pty_id.clone(),
+                    hostname: hostname.clone(),
+                    pts_name: pts_name.clone(),
+                    cols: current_cols,
+                    rows: current_rows,
+                    title: current_title,
+                    created_at,
+                },
+            }));
+        }
         let gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
         let chunk = Arc::new(PtyChunk {
             generation: gen,
@@ -588,6 +628,20 @@ fn reader_thread(
     let _ = tx.send(Arc::new(PtyChunk {
         generation: gen,
         data: Bytes::from(exit_msg.into_bytes()),
+    }));
+    let exit_code = status.as_ref().and_then(|s| s.code());
+    let _ = meta_tx.send(Arc::new(PtyMetadata {
+        reason: MetadataReason::Closed,
+        exit_code,
+        info: PtyInfo {
+            id: pty_id.clone(),
+            hostname: hostname.clone(),
+            pts_name: pts_name.clone(),
+            cols: current_cols,
+            rows: current_rows,
+            title: title.lock().unwrap().clone(),
+            created_at,
+        },
     }));
 
     // Drain any refresh requests that arrived just before exit
