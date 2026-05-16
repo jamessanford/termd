@@ -12,6 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use libghostty_vt::{Terminal, TerminalOptions, RenderState};
 use libghostty_vt::render::{RowIterator, CellIterator};
+use libghostty_vt::screen::Screen;
 use libghostty_vt::style::Underline;
 use nix::{
     pty::openpty,
@@ -343,14 +344,9 @@ impl Default for PtyRegistry {
     fn default() -> Self { Self::new() }
 }
 
-// Known gap: when the terminal is on the alternate screen (e.g. inside `less` or `vim`),
-// this refresh only renders the alt screen.  A newly attached client will have a blank
-// primary screen, so switching back to primary after the full-screen app exits will show
-// stale or empty content until the next streaming chunk arrives.
-//
-// Fixing this properly requires either (a) rendering the primary screen before every
-// vt_write (expensive) or (b) a libghostty API that can render an inactive screen buffer.
-// Extend libghostty with the latter when the need becomes pressing.
+// Note: on-demand refresh only renders the active screen at call time.  The screen-switch
+// broadcast in reader_thread (screen_changed path) mitigates the primary↔alternate gap by
+// pushing a full render of the new screen to all subscribers immediately after the switch.
 fn do_refresh(
     terminal: &mut Terminal<'static, 'static>,
     render_state: &mut RenderState<'static>,
@@ -513,6 +509,7 @@ fn reader_thread(
     // Initialize prev_title to match the initial title mutex value (pts_name),
     // so we don't emit a spurious TitleChanged before the shell sets any title.
     let mut prev_title = pts_name.clone();
+    let mut prev_screen = Screen::Primary;
 
     // master_fd is only valid as long as master (the owning File) is alive
     let master_fd = master.as_raw_fd();
@@ -592,6 +589,11 @@ fn reader_thread(
         }
 
         terminal.vt_write(&batch);
+        let current_screen = terminal.active_screen().unwrap_or(Screen::Primary);
+        let screen_changed = current_screen != prev_screen;
+        if screen_changed {
+            prev_screen = current_screen;
+        }
         let current_title = title.lock().unwrap().clone();
         let title_changed = current_title != prev_title;
         if title_changed {
@@ -619,6 +621,15 @@ fn reader_thread(
                     created_at,
                 },
             }));
+        }
+        // On screen switch (primary ↔ alternate), broadcast a full render of the new screen
+        // so subscribers that hadn't seen it get the correct content immediately.
+        if screen_changed {
+            let refresh_gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
+            match do_refresh(&mut terminal, &mut render_state, &mut row_iter_obj, &mut cell_iter_obj, refresh_gen) {
+                Ok(data) => { let _ = tx.send(Arc::new(PtyChunk { generation: refresh_gen, data: data.data })); }
+                Err(e) => tracing::debug!("PTY reader: screen-switch refresh failed: {e}"),
+            }
         }
     }
 
