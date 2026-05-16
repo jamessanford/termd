@@ -99,41 +99,48 @@ fn render_dirty(
 
         let mut cell_iter_active = cell_iter.update(row)?;
         while let Some(cell) = cell_iter_active.next() {
-            let style = cell.style()?;
-            let fg = cell.fg_color().ok().flatten();
-            let bg = cell.bg_color().ok().flatten();
             let len = cell.graphemes_len()?;
-            if grapheme_buf.len() < len {
-                grapheme_buf.resize(len, '\0');
-            }
-            cell.graphemes_buf(&mut grapheme_buf[..len])?;
-            let graphemes = &grapheme_buf[..len];
 
-            out.extend_from_slice(b"\x1b[0");
-            if style.bold          { out.extend_from_slice(b";1"); }
-            if style.faint         { out.extend_from_slice(b";2"); }
-            if style.italic        { out.extend_from_slice(b";3"); }
-            match style.underline {
-                Underline::None   => {}
-                Underline::Double => out.extend_from_slice(b";21"),
-                _                 => out.extend_from_slice(b";4"),
-            }
-            if style.blink         { out.extend_from_slice(b";5"); }
-            if style.inverse       { out.extend_from_slice(b";7"); }
-            if style.invisible     { out.extend_from_slice(b";8"); }
-            if style.strikethrough { out.extend_from_slice(b";9"); }
-            if style.overline      { out.extend_from_slice(b";53"); }
-            if let Some(c) = fg {
-                write!(out, ";38;2;{};{};{}", c.r, c.g, c.b).ok();
-            }
-            if let Some(c) = bg {
-                write!(out, ";48;2;{};{};{}", c.r, c.g, c.b).ok();
-            }
-            out.push(b'm');
-
-            if graphemes.is_empty() {
-                out.push(b' ');
+            if len == 0 {
+                // Empty cell — only fetch bg; style/fg are irrelevant without text.
+                let bg = cell.bg_color().ok().flatten();
+                out.extend_from_slice(b"\x1b[0");
+                if let Some(c) = bg {
+                    write!(out, ";48;2;{};{};{}", c.r, c.g, c.b).ok();
+                }
+                out.extend_from_slice(b"m ");
             } else {
+                if grapheme_buf.len() < len {
+                    grapheme_buf.resize(len, '\0');
+                }
+                cell.graphemes_buf(&mut grapheme_buf[..len])?;
+                let graphemes = &grapheme_buf[..len];
+                let style = cell.style()?;
+                let fg = cell.fg_color().ok().flatten();
+                let bg = cell.bg_color().ok().flatten();
+
+                out.extend_from_slice(b"\x1b[0");
+                if style.bold          { out.extend_from_slice(b";1"); }
+                if style.faint         { out.extend_from_slice(b";2"); }
+                if style.italic        { out.extend_from_slice(b";3"); }
+                match style.underline {
+                    Underline::None   => {}
+                    Underline::Double => out.extend_from_slice(b";21"),
+                    _                 => out.extend_from_slice(b";4"),
+                }
+                if style.blink         { out.extend_from_slice(b";5"); }
+                if style.inverse       { out.extend_from_slice(b";7"); }
+                if style.invisible     { out.extend_from_slice(b";8"); }
+                if style.strikethrough { out.extend_from_slice(b";9"); }
+                if style.overline      { out.extend_from_slice(b";53"); }
+                if let Some(c) = fg {
+                    write!(out, ";38;2;{};{};{}", c.r, c.g, c.b).ok();
+                }
+                if let Some(c) = bg {
+                    write!(out, ";48;2;{};{};{}", c.r, c.g, c.b).ok();
+                }
+                out.push(b'm');
+
                 for ch in graphemes {
                     out.extend_from_slice(ch.encode_utf8(&mut char_enc).as_bytes());
                 }
