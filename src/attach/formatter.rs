@@ -118,6 +118,7 @@ fn render_dirty(
             trim: false,
             unwrap: false,
             selection: None,
+            extra: Default::default(),
         })?;
         out.extend_from_slice(b"\x1b[2J\x1b[H");
         let vt = fmt.format_alloc(None)?;

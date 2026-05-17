@@ -10,10 +10,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use libghostty_vt::{Terminal, TerminalOptions, RenderState};
-use libghostty_vt::render::{RowIterator, CellIterator};
-use libghostty_vt::screen::Screen;
-use libghostty_vt::style::Underline;
+use libghostty_vt::{Terminal, TerminalOptions, ffi};
+use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
+use libghostty_vt::screen::{Screen, Selection};
+use libghostty_vt::terminal::{Point, PointCoordinate};
 use nix::{
     pty::openpty,
     sys::signal::{Signal, kill},
@@ -348,91 +348,57 @@ impl Default for PtyRegistry {
 // broadcast in reader_thread (screen_changed path) mitigates the primary↔alternate gap by
 // pushing a full render of the new screen to all subscribers immediately after the switch.
 fn do_refresh(
-    terminal: &mut Terminal<'static, 'static>,
-    render_state: &mut RenderState<'static>,
-    row_iter_obj: &mut RowIterator<'static>,
-    cell_iter_obj: &mut CellIterator<'static>,
+    terminal: &Terminal<'static, 'static>,
+    cols: u32,
+    rows: u32,
     generation: u64,
 ) -> Result<RefreshData> {
-    use std::io::Write as IoWrite;
+    let cursor_x = terminal.cursor_x().unwrap_or(0) as u32;
+    let cursor_y = terminal.cursor_y().unwrap_or(0) as u32;
 
-    let snapshot = render_state.update(terminal)?;
-    let cursor_visible = snapshot.cursor_visible().unwrap_or(true);
-    let (cursor_x, cursor_y) = match snapshot.cursor_viewport().ok().flatten() {
-        Some(cv) => (cv.x as u32, cv.y as u32),
-        None => (
-            terminal.cursor_x().unwrap_or(0) as u32,
-            terminal.cursor_y().unwrap_or(0) as u32,
-        ),
+    // Restrict to the active screen — the server terminal has scrollback and we don't want it.
+    // Point::Active resolves within the visible grid only, ignoring history rows.
+    let top_left = terminal.grid_ref(Point::Active(PointCoordinate { x: 0, y: 0 }))?;
+    let bottom_right = terminal.grid_ref(Point::Active(PointCoordinate {
+        x: cols.saturating_sub(1) as u16,
+        y: rows.saturating_sub(1),
+    }))?;
+    let selection = Selection { start: top_left, end: bottom_right, rectangle: false };
+
+    let extra = ffi::FormatterTerminalExtra {
+        size: std::mem::size_of::<ffi::FormatterTerminalExtra>(),
+        scrolling_region: true, // restore server app's DECSTBM/DECSLRM state
+        modes: true,            // restore terminal modes (mouse tracking, cursor visibility, etc.)
+        palette: false,         // don't override the host terminal's color palette
+        tabstops: false,        // tabstop restoration moves cursor, corrupting final position
+        pwd: false,
+        keyboard: false,
+        screen: ffi::FormatterScreenExtra {
+            size: std::mem::size_of::<ffi::FormatterScreenExtra>(),
+            cursor: true, // emit final cursor position at end of output
+            style: false,
+            hyperlink: false,
+            protection: false,
+            kitty_keyboard: false,
+            charsets: false,
+        },
     };
-    let mut row_iter = row_iter_obj.update(&snapshot)?;
+
+    let mut fmt = Formatter::new(terminal, FormatterOptions {
+        format: Format::Vt,
+        trim: false,
+        unwrap: false,
+        selection: Some(selection),
+        extra,
+    })?;
 
     let mut out: Vec<u8> = Vec::new();
-
-    // Soft reset (DECSTR), clear screen, cursor home, hide cursor during paint
+    // Soft reset (DECSTR), clear screen, cursor home, hide cursor during paint.
+    // DECSTR resets modes to defaults; the formatter then re-emits non-default ones.
     out.extend_from_slice(b"\x1b[!p\x1b[2J\x1b[H\x1b[?25l");
-
-    let mut row_idx: u32 = 0;
-    let mut char_enc = [0u8; 4];
-
-    while let Some(row) = row_iter.next() {
-        // Move cursor to column 1 of this row (ANSI rows are 1-indexed)
-        write!(out, "\x1b[{};1H", row_idx + 1).ok();
-
-        let mut cell_iter = cell_iter_obj.update(row)?;
-        while let Some(cell) = cell_iter.next() {
-            let style = cell.style()?;
-            let fg = cell.fg_color().ok().flatten();
-            let bg = cell.bg_color().ok().flatten();
-            let graphemes = cell.graphemes()?;
-
-            // Always emit combined reset+SGR to avoid state leakage between cells.
-            // Starts with ESC[0 (reset), then appends additional params separated
-            // by semicolons before the closing 'm'.
-            out.extend_from_slice(b"\x1b[0");
-            if style.bold          { out.extend_from_slice(b";1"); }
-            if style.faint         { out.extend_from_slice(b";2"); }
-            if style.italic        { out.extend_from_slice(b";3"); }
-            match style.underline {
-                Underline::None   => {}
-                Underline::Double => out.extend_from_slice(b";21"),
-                _                 => out.extend_from_slice(b";4"),
-            }
-            if style.blink         { out.extend_from_slice(b";5"); }
-            if style.inverse       { out.extend_from_slice(b";7"); }
-            if style.invisible     { out.extend_from_slice(b";8"); }
-            if style.strikethrough { out.extend_from_slice(b";9"); }
-            if style.overline      { out.extend_from_slice(b";53"); }
-            if let Some(c) = fg {
-                write!(out, ";38;2;{};{};{}", c.r, c.g, c.b).ok();
-            }
-            if let Some(c) = bg {
-                write!(out, ";48;2;{};{};{}", c.r, c.g, c.b).ok();
-            }
-            out.push(b'm'); // close the CSI sequence
-
-            if graphemes.is_empty() {
-                out.push(b' ');
-            } else {
-                for ch in &graphemes {
-                    out.extend_from_slice(ch.encode_utf8(&mut char_enc).as_bytes());
-                }
-            }
-        }
-
-        row_idx += 1;
-    }
-
-    // Reset SGR and restore cursor visibility
-    out.extend_from_slice(b"\x1b[0m");
-    if cursor_visible {
-        out.extend_from_slice(b"\x1b[?25h");
-    } else {
-        out.extend_from_slice(b"\x1b[?25l");
-    }
-
-    // Place cursor at its actual position (ANSI is 1-indexed: row then col)
-    write!(out, "\x1b[{};{}H", cursor_y + 1, cursor_x + 1).ok();
+    let vt = fmt.format_alloc(None)?;
+    out.extend_from_slice(&vt);
+    out.extend_from_slice(b"\x1b[0m"); // trailing SGR reset
 
     Ok(RefreshData {
         generation,
@@ -482,28 +448,6 @@ fn reader_thread(
         return;
     }
 
-    let mut render_state = match RenderState::new() {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("PTY reader: failed to create render state: {e}");
-            return;
-        }
-    };
-    let mut row_iter_obj = match RowIterator::new() {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("PTY reader: failed to create row iterator: {e}");
-            return;
-        }
-    };
-    let mut cell_iter_obj = match CellIterator::new() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::debug!("PTY reader: failed to create cell iterator: {e}");
-            return;
-        }
-    };
-
     let mut current_cols = init_cols;
     let mut current_rows = init_rows;
     // Initialize prev_title to match the initial title mutex value (pts_name),
@@ -528,7 +472,7 @@ fn reader_thread(
                 tracing::debug!("PTY reader: terminal resize failed: {e}");
             } else {
                 let refresh_gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
-                match do_refresh(&mut terminal, &mut render_state, &mut row_iter_obj, &mut cell_iter_obj, refresh_gen) {
+                match do_refresh(&terminal, current_cols, current_rows, refresh_gen) {
                     Ok(data) => { let _ = tx.send(Arc::new(PtyChunk { generation: refresh_gen, data: data.data })); }
                     Err(e) => tracing::debug!("PTY reader: resize refresh failed: {e}"),
                 }
@@ -536,7 +480,7 @@ fn reader_thread(
         }
         while let Ok(reply_tx) = refresh_rx.try_recv() {
             let gen = generation.load(Ordering::Relaxed);
-            let result = do_refresh(&mut terminal, &mut render_state, &mut row_iter_obj, &mut cell_iter_obj, gen);
+            let result = do_refresh(&terminal, current_cols, current_rows, gen);
             let _ = reply_tx.send(result);
         }
 
@@ -632,7 +576,7 @@ fn reader_thread(
         // so subscribers that hadn't seen it get the correct content immediately.
         if screen_changed {
             let refresh_gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
-            match do_refresh(&mut terminal, &mut render_state, &mut row_iter_obj, &mut cell_iter_obj, refresh_gen) {
+            match do_refresh(&terminal, current_cols, current_rows, refresh_gen) {
                 Ok(data) => { let _ = tx.send(Arc::new(PtyChunk { generation: refresh_gen, data: data.data })); }
                 Err(e) => tracing::debug!("PTY reader: screen-switch refresh failed: {e}"),
             }
@@ -678,10 +622,7 @@ fn reader_thread(
     // Drain any refresh requests that arrived just before exit
     while let Ok(reply_tx) = refresh_rx.try_recv() {
         let gen = generation.load(Ordering::Relaxed);
-        let result = do_refresh(
-            &mut terminal, &mut render_state,
-            &mut row_iter_obj, &mut cell_iter_obj, gen,
-        );
+        let result = do_refresh(&terminal, current_cols, current_rows, gen);
         let _ = reply_tx.send(result);
     }
 
