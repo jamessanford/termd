@@ -155,9 +155,21 @@ impl VtFilter {
     }
 
     fn dispatch_csi(&mut self, mode: CsiMode, final_byte: u8, out: &mut Vec<u8>) {
-        // Stub: pass everything through — rewrite rules added in Tasks 3 and 4
-        let _ = (mode, final_byte);
-        out.extend_from_slice(&self.buf);
+        match (mode, final_byte) {
+            (CsiMode::Normal, b'r') => {
+                // DECSTBM: rewrite scroll region, clamping bottom to server_rows
+                let params = self.parse_csi_params();
+                let top = params.first().copied().filter(|&p| p != 0).unwrap_or(1);
+                let bottom = params.get(1).copied().unwrap_or(0);
+                let effective_bottom = if bottom == 0 || bottom > self.effective_rows() {
+                    self.effective_rows()
+                } else {
+                    bottom
+                };
+                write!(out, "\x1b[{};{}r", top, effective_bottom).ok();
+            }
+            _ => out.extend_from_slice(&self.buf),
+        }
     }
 
     fn parse_csi_params(&self) -> Vec<u32> {
@@ -260,5 +272,36 @@ mod tests {
         let mut f = VtFilter::new(24, 80, 40, 120);
         // ESC [ ? 25 h = show cursor — private CSI not in our rewrite table, passes through
         assert_eq!(filter_all(&mut f, b"\x1b[?25h"), b"\x1b[?25h");
+    }
+
+    #[test]
+    fn decstbm_bare_reset_rewritten() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        // ESC [ r with no params = full-screen reset → rewritten to server bounds
+        assert_eq!(filter_all(&mut f, b"\x1b[r"), b"\x1b[1;24r");
+    }
+
+    #[test]
+    fn decstbm_bottom_clamped_to_server_rows() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        // Bottom margin (30) exceeds server_rows (24) → clamped
+        assert_eq!(filter_all(&mut f, b"\x1b[1;30r"), b"\x1b[1;24r");
+    }
+
+    #[test]
+    fn decstbm_within_bounds_unchanged() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        // Both margins within server bounds → rewritten to same values
+        assert_eq!(filter_all(&mut f, b"\x1b[5;20r"), b"\x1b[5;20r");
+    }
+
+    #[test]
+    fn decstbm_cross_buffer() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        // Sequence split across two filter() calls — state must be preserved
+        f.filter(b"\x1b[1;30", &mut out);
+        f.filter(b"r", &mut out);
+        assert_eq!(out, b"\x1b[1;24r");
     }
 }
