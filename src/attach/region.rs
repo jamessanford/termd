@@ -157,7 +157,7 @@ impl VtFilter {
     fn dispatch_csi(&mut self, mode: CsiMode, final_byte: u8, out: &mut Vec<u8>) {
         match (mode, final_byte) {
             (CsiMode::Normal, b'r') => {
-                // DECSTBM: rewrite scroll region, clamping bottom to server_rows
+                // DECSTBM: clamp bottom margin to server_rows
                 let params = self.parse_csi_params();
                 let top = params.first().copied().filter(|&p| p != 0).unwrap_or(1);
                 let bottom = params.get(1).copied().unwrap_or(0);
@@ -168,6 +168,48 @@ impl VtFilter {
                 };
                 let effective_top = if top >= effective_bottom { 1 } else { top };
                 write!(out, "\x1b[{};{}r", effective_top, effective_bottom).ok();
+            }
+            (CsiMode::Normal, b's') if self.declrmm_active => {
+                // DECSLRM: clamp right margin to server_cols
+                // Only intercept when we've enabled DECLRMM; otherwise ESC[s = cursor save
+                let params = self.parse_csi_params();
+                let left = params.first().copied().filter(|&p| p != 0).unwrap_or(1);
+                let right = params.get(1).copied().unwrap_or(0);
+                let effective_right = if right == 0 || right > self.effective_cols() {
+                    self.effective_cols()
+                } else {
+                    right
+                };
+                write!(out, "\x1b[{};{}s", left, effective_right).ok();
+            }
+            (CsiMode::Private, b'h') => {
+                let params = self.parse_csi_params();
+                match params.first().copied() {
+                    Some(69) => {
+                        // DECLRMM enable: suppress — we manage this ourselves
+                    }
+                    Some(1049) => {
+                        // Alt-screen enter: pass through
+                        out.extend_from_slice(&self.buf);
+                        self.in_alt_screen = true;
+                    }
+                    _ => out.extend_from_slice(&self.buf),
+                }
+            }
+            (CsiMode::Private, b'l') => {
+                let params = self.parse_csi_params();
+                match params.first().copied() {
+                    Some(69) => {
+                        // DECLRMM disable: suppress
+                    }
+                    Some(1049) => {
+                        // Alt-screen exit: pass through, then re-emit region setup
+                        out.extend_from_slice(&self.buf);
+                        self.in_alt_screen = false;
+                        self.emit_region_setup(out);
+                    }
+                    _ => out.extend_from_slice(&self.buf),
+                }
             }
             _ => out.extend_from_slice(&self.buf),
         }
@@ -311,5 +353,56 @@ mod tests {
         f.filter(b"\x1b[1;30", &mut out);
         f.filter(b"r", &mut out);
         assert_eq!(out, b"\x1b[1;24r");
+    }
+
+    #[test]
+    fn decslrm_right_clamped_to_server_cols() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        // client_cols (120) > server_cols (80) → emit_region_setup sets declrmm_active
+        let mut out = Vec::new();
+        f.emit_region_setup(&mut out);
+        out.clear();
+        // Right margin (100) exceeds server_cols (80) → clamped
+        f.filter(b"\x1b[1;100s", &mut out);
+        assert_eq!(out, b"\x1b[1;80s");
+    }
+
+    #[test]
+    fn declrmm_enable_suppressed() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        // Server app tries to enable DECLRMM — we own this mode, suppress it
+        assert_eq!(filter_all(&mut f, b"\x1b[?69h"), b"");
+    }
+
+    #[test]
+    fn declrmm_disable_suppressed() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        assert_eq!(filter_all(&mut f, b"\x1b[?69l"), b"");
+    }
+
+    #[test]
+    fn alt_screen_enter_passes_through() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        let out = filter_all(&mut f, b"\x1b[?1049h");
+        assert_eq!(out, b"\x1b[?1049h");
+        assert!(f.in_alt_screen);
+    }
+
+    #[test]
+    fn alt_screen_exit_reemits_region() {
+        let mut f = VtFilter::new(24, 80, 40, 80);
+        filter_all(&mut f, b"\x1b[?1049h"); // enter alt screen first
+        let out = filter_all(&mut f, b"\x1b[?1049l");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("\x1b[?1049l"), "alt-screen exit byte must pass through");
+        assert!(s.contains("\x1b[1;24r"), "region setup must be re-emitted after exit");
+        assert!(!f.in_alt_screen);
+    }
+
+    #[test]
+    fn other_private_mode_passes_through() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        // ESC [ ? 25 h = show cursor — not intercepted
+        assert_eq!(filter_all(&mut f, b"\x1b[?25h"), b"\x1b[?25h");
     }
 }
