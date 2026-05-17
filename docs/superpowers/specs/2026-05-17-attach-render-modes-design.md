@@ -89,6 +89,24 @@ render_mode: RenderMode,
 - `run_stdin` (the `~.` escape sequence handler)
 - `LocalTerminal` struct + `impl` (used by cell and formatter; not raw)
 
+### `RunContext` struct
+
+Bundles the arguments passed to each mode's `run` function, avoiding a long
+argument list at the dispatch site and in each mode file:
+
+```rust
+pub(super) struct RunContext {
+    pub resp_rx: Streaming<TerminalResponse>,
+    pub cmd_tx:  mpsc::Sender<TerminalCommand>,
+    pub pty_id:  String,
+    pub item:    PtyItem,     // server PTY metadata; raw ignores cols/rows
+    pub refresh_gen:   u64,
+    pub refresh_bytes: Vec<u8>,
+    pub buffered:      Vec<(u64, Vec<u8>)>,
+    pub debug:         bool,
+}
+```
+
 ### `pub async fn run` — preamble then dispatch
 
 ```
@@ -98,10 +116,10 @@ render_mode: RenderMode,
 4. Await Refresh response, buffering any Stream chunks that arrive first
 5. Enter raw terminal mode (TerminalGuard)
 6. Spawn stdin task
-7. Dispatch:
-     Raw       → raw::run(resp_rx, cmd_tx, pty_id, refresh_gen, refresh_bytes, buffered, debug)
-     Cell      → cell::run(resp_rx, cmd_tx, pty_id, item, refresh_gen, refresh_bytes, buffered, debug)
-     Formatter → formatter::run(resp_rx, cmd_tx, pty_id, item, refresh_gen, refresh_bytes, buffered, debug)
+7. Build RunContext; dispatch:
+     Raw       → raw::run(ctx).await
+     Cell      → cell::run(ctx).await
+     Formatter → formatter::run(ctx).await
 8. Abort stdin task, drop TerminalGuard, print close message if server closed
 ```
 
@@ -113,8 +131,10 @@ Steps 1–6 and 8 are identical for all three modes.
 
 No libghostty imports. Manages no local terminal state.
 
-**Startup:** Write `refresh_bytes` directly to stdout. Replay any buffered stream
-chunks that post-date `refresh_gen` directly to stdout.
+Signature: `pub(super) async fn run(ctx: RunContext) -> Result<()>`
+
+**Startup:** Write `ctx.refresh_bytes` directly to stdout. Replay any buffered
+stream chunks that post-date `ctx.refresh_gen` directly to stdout.
 
 **Select loop:**
 
@@ -140,7 +160,9 @@ stream chunks are filtered correctly.
 
 Uses libghostty-vt render state API. Cell-by-cell rendering for all dirty states.
 
-**Startup:** Create `LocalTerminal::new(item.cols, item.rows)`. Feed `refresh_bytes`
+Signature: `pub(super) async fn run(ctx: RunContext) -> Result<()>`
+
+**Startup:** Create `LocalTerminal::new(ctx.item.cols, ctx.item.rows)`. Feed `ctx.refresh_bytes`
 into the terminal; call `render_dirty(force_full=true)` to paint. Replay buffered
 chunks: feed each into the terminal and call `render_dirty`.
 
@@ -162,7 +184,8 @@ per-cell SGR + graphemes. (Current `attach.rs` implementation, unchanged.)
 
 ## `attach/formatter.rs`
 
-Identical structure to `cell.rs`. The only difference is in `render_dirty`.
+Identical structure to `cell.rs`. Signature: `pub(super) async fn run(ctx: RunContext) -> Result<()>`.
+The only difference from `cell.rs` is in `render_dirty`.
 
 **`render_dirty`** in this file:
 - `Dirty::Partial` → cell-by-cell loop (same as cell.rs)
