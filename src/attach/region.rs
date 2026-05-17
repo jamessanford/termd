@@ -110,6 +110,19 @@ impl VtFilter {
                     }
                 }
                 FilterState::InCsi(mode) => {
+                    if self.buf.len() > 32 {
+                        // Safety: too many bytes accumulated — give up on this sequence
+                        out.extend_from_slice(&self.buf);
+                        self.buf.clear();
+                        self.state = FilterState::Normal;
+                        if byte == 0x1b {
+                            self.buf.push(byte);
+                            self.state = FilterState::AfterEsc;
+                        } else {
+                            out.push(byte);
+                        }
+                        continue;
+                    }
                     if byte == 0x1b {
                         // Nested ESC: flush incomplete sequence, start new escape
                         out.extend_from_slice(&self.buf);
@@ -129,12 +142,6 @@ impl VtFilter {
                             self.state = FilterState::InCsi(CsiMode::Private);
                         }
                         self.buf.push(byte);
-                        if self.buf.len() > 30 {
-                            // Safety: too many bytes accumulated — give up on this sequence
-                            out.extend_from_slice(&self.buf);
-                            self.buf.clear();
-                            self.state = FilterState::Normal;
-                        }
                     } else {
                         // Unexpected byte: flush and pass through
                         out.extend_from_slice(&self.buf);
@@ -232,8 +239,9 @@ mod tests {
     #[test]
     fn csi_safety_limit_flushes() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // A CSI sequence longer than 32 bytes must be flushed as-is, not buffered forever
-        let long: Vec<u8> = b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13".to_vec();
+        // A CSI sequence longer than 32 bytes must be flushed as-is, not buffered forever.
+        // Input is 34 bytes: buf reaches 33 before the final byte, triggering the > 32 limit.
+        let long: Vec<u8> = b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14".to_vec();
         let out = filter_all(&mut f, &long);
         assert!(out.starts_with(b"\x1b["), "safety flush must emit the accumulated bytes");
     }
