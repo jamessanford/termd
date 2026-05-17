@@ -402,9 +402,11 @@ fn do_refresh(
     })?;
 
     let mut out: Vec<u8> = Vec::new();
-    // Soft reset (DECSTR), clear screen, cursor home, hide cursor during paint.
-    // DECSTR resets modes to defaults; the formatter then re-emits non-default ones.
-    out.extend_from_slice(b"\x1b[!p\x1b[2J\x1b[H\x1b[?25l");
+    // Soft reset (DECSTR) + clear screen + cursor home.
+    // DECSTR resets cursor visibility to the default (visible); modes:true in the formatter
+    // then re-emits ?25l if the server app has the cursor hidden.  No need to hide here —
+    // the formatter output is sent as one blob so there is no per-character cursor flicker.
+    out.extend_from_slice(b"\x1b[!p\x1b[2J\x1b[H");
     let vt = fmt.format_alloc(None)?;
     out.extend_from_slice(&vt);
     out.extend_from_slice(b"\x1b[0m"); // trailing SGR reset
