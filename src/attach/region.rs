@@ -65,6 +65,9 @@ impl VtFilter {
             out.extend_from_slice(b"\x1b[?69h");
             write!(out, "\x1b[1;{}s", self.effective_cols()).ok();
             self.declrmm_active = true;
+        } else if self.declrmm_active {
+            out.extend_from_slice(b"\x1b[?69l");
+            self.declrmm_active = false;
         }
     }
 
@@ -514,5 +517,21 @@ mod tests {
         // left (90) > effective_right (80) → collapse to full region
         f.filter(b"\x1b[90;100s", &mut out);
         assert_eq!(out, b"\x1b[1;80s");
+    }
+
+    #[test]
+    fn emit_region_setup_disables_declrmm_when_client_shrinks() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        // Initial setup: client_cols (120) > server_cols (80) → DECLRMM enabled
+        let mut out = Vec::new();
+        f.emit_region_setup(&mut out);
+        assert!(f.declrmm_active);
+        out.clear();
+        // Client shrinks to match server width → DECLRMM must be disabled
+        f.update_client_size(40, 80);
+        f.emit_region_setup(&mut out);
+        assert!(!f.declrmm_active);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("\x1b[?69l"), "DECLRMM disable sequence must be emitted");
     }
 }
