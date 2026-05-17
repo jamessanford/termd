@@ -187,6 +187,8 @@ impl VtFilter {
                 write!(out, "\x1b[{};{}s", effective_left, effective_right).ok();
             }
             (CsiMode::Private, b'h') => {
+                // Only the first param is inspected; combined sequences (e.g. ?1049;2004h)
+                // drop the non-intercepted params. Multi-param private sequences are rare in practice.
                 let params = self.parse_csi_params();
                 match params.first().copied() {
                     Some(69) => {
@@ -201,6 +203,7 @@ impl VtFilter {
                 }
             }
             (CsiMode::Private, b'l') => {
+                // Only the first param is inspected; combined sequences drop non-intercepted params.
                 let params = self.parse_csi_params();
                 match params.first().copied() {
                     Some(69) => {
@@ -290,10 +293,8 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
             msg = resp_rx.message() => {
                 match msg {
                     Ok(Some(r)) => match r.response {
-                        Some(Response::Stream(s)) => {
-                            if s.generation > current_refresh_gen {
-                                filter.filter(&s.data, &mut out);
-                            }
+                        Some(Response::Stream(s)) if s.generation > current_refresh_gen => {
+                            filter.filter(&s.data, &mut out);
                         }
                         Some(Response::Refresh(rf)) => {
                             current_refresh_gen = rf.generation;
@@ -335,7 +336,10 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
     }
 
     // Cleanup: restore client terminal margins
-    let _ = stdout.write_all(b"\x1b[r\x1b[?69l").await;
+    let _ = stdout.write_all(b"\x1b[r").await;
+    if filter.declrmm_active {
+        let _ = stdout.write_all(b"\x1b[?69l").await;
+    }
     let _ = stdout.flush().await;
 
     Ok(server_closed)
