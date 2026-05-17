@@ -104,11 +104,13 @@ fn render_dirty(
             if len == 0 {
                 // Empty cell — only fetch bg; style/fg are irrelevant without text.
                 let bg = cell.bg_color().ok().flatten();
-                out.extend_from_slice(b"\x1b[0");
                 if let Some(c) = bg {
+                    out.extend_from_slice(b"\x1b[0");
                     write!(out, ";48;2;{};{};{}", c.r, c.g, c.b).ok();
+                    out.extend_from_slice(b"m ");
+                } else {
+                    out.push(b' ');
                 }
-                out.extend_from_slice(b"m ");
             } else {
                 if grapheme_buf.len() < len {
                     grapheme_buf.resize(len, '\0');
