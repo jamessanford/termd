@@ -100,16 +100,6 @@ fn setup_raw_mode() -> Result<TerminalGuard> {
     Ok(TerminalGuard { original })
 }
 
-/// Kept for future use when dynamic client-side terminal resizing is implemented.
-#[allow(dead_code)]
-fn get_terminal_size() -> Result<(u32, u32)> {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok((ws.ws_col as u32, ws.ws_row as u32))
-}
 
 #[derive(Clone, Copy)]
 enum EscapeState {
