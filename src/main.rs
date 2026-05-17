@@ -88,6 +88,9 @@ enum Cmd {
         /// Print message metadata to stderr instead of writing data to stdout
         #[arg(long)]
         debug: bool,
+        /// Rendering strategy for terminal output
+        #[arg(long, value_enum, default_value_t = attach::RenderMode::Cell)]
+        render_mode: attach::RenderMode,
     },
 }
 
@@ -219,10 +222,10 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Attach { pty_id, socket, debug } => {
+        Cmd::Attach { pty_id, socket, debug, render_mode } => {
             let mut client = connect_client(socket).await?;
             let item = resolve_pty_item(&mut client, &pty_id).await?;
-            attach::run(&mut client, item, debug).await?;
+            attach::run(&mut client, item, debug, render_mode).await?;
         }
     }
 
