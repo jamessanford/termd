@@ -166,7 +166,8 @@ impl VtFilter {
                 } else {
                     bottom
                 };
-                write!(out, "\x1b[{};{}r", top, effective_bottom).ok();
+                let effective_top = if top >= effective_bottom { 1 } else { top };
+                write!(out, "\x1b[{};{}r", effective_top, effective_bottom).ok();
             }
             _ => out.extend_from_slice(&self.buf),
         }
@@ -293,6 +294,13 @@ mod tests {
         let mut f = VtFilter::new(24, 80, 40, 120);
         // Both margins within server bounds → rewritten to same values
         assert_eq!(filter_all(&mut f, b"\x1b[5;20r"), b"\x1b[5;20r");
+    }
+
+    #[test]
+    fn decstbm_top_exceeds_server_rows_collapses() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        // top (25) > server_rows (24) → collapse to full region
+        assert_eq!(filter_all(&mut f, b"\x1b[25;30r"), b"\x1b[1;24r");
     }
 
     #[test]
