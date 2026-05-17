@@ -159,6 +159,12 @@ impl VtFilter {
 
     fn dispatch_csi(&mut self, mode: CsiMode, final_byte: u8, out: &mut Vec<u8>) {
         match (mode, final_byte) {
+            (CsiMode::Normal, b'p') if self.buf.get(2) == Some(&b'!') => {
+                // DECSTR (Soft Terminal Reset, ESC [ ! p): pass through, then re-establish
+                // our margins — DECSTR disables DECLRMM and resets DECSLRM to full width.
+                out.extend_from_slice(&self.buf);
+                self.emit_region_setup(out);
+            }
             (CsiMode::Normal, b'r') => {
                 // DECSTBM: clamp bottom margin to server_rows
                 let params = self.parse_csi_params();
@@ -171,6 +177,10 @@ impl VtFilter {
                 };
                 let effective_top = if top >= effective_bottom { 1 } else { top };
                 write!(out, "\x1b[{};{}r", effective_top, effective_bottom).ok();
+                // Re-establish horizontal margins: DECSTBM resets them on some terminals.
+                if self.declrmm_active {
+                    write!(out, "\x1b[1;{}s", self.effective_cols()).ok();
+                }
             }
             (CsiMode::Normal, b's') if self.declrmm_active => {
                 // DECSLRM: clamp right margin to server_cols
@@ -537,5 +547,31 @@ mod tests {
         assert!(!f.declrmm_active);
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("\x1b[?69l"), "DECLRMM disable sequence must be emitted");
+    }
+
+    #[test]
+    fn decstr_re_emits_region_setup() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        f.emit_region_setup(&mut out);
+        out.clear();
+        // DECSTR resets DECLRMM/DECSLRM — filter must re-establish them afterward
+        f.filter(b"\x1b[!p", &mut out);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("\x1b[!p"), "DECSTR must pass through first");
+        assert!(s.contains("\x1b[?69h"), "DECLRMM must be re-enabled after DECSTR");
+        assert!(s.contains("\x1b[1;80s"), "DECSLRM must be re-established after DECSTR");
+    }
+
+    #[test]
+    fn decstbm_rewrite_re_emits_decslrm() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        f.emit_region_setup(&mut out);
+        out.clear();
+        // Server sends DECSTBM; some terminals reset horizontal margins on DECSTBM —
+        // filter must re-emit DECSLRM immediately after the rewritten DECSTBM.
+        f.filter(b"\x1b[r", &mut out);
+        assert_eq!(out, b"\x1b[1;24r\x1b[1;80s");
     }
 }
