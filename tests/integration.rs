@@ -7,7 +7,7 @@ use tonic::Request;
 use tower::service_fn;
 use hyper_util::rt::TokioIo;
 use termd::pty::PtyRegistry;
-use termd::pty::{MetadataReason, PtyMetadata};
+use termd::pty::MetadataReason;
 use termd::server::make_service;
 use termd::proto::terminal_service_client::TerminalServiceClient;
 use termd::proto::{TerminalCommand, terminal_command};

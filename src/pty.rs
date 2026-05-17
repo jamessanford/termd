@@ -233,6 +233,15 @@ impl PtyRegistry {
         if slave_stdout < 0 || slave_stderr < 0 {
             return Err(std::io::Error::last_os_error()).context("dup slave fd");
         }
+        // Set FD_CLOEXEC on all slave fds so concurrent forks (e.g., tests spawning
+        // other PTYs) don't inherit them.  Rust's spawn dup2s them to 0/1/2 in the
+        // child before exec, so the shell still gets them correctly.
+        for &fd in &[slave_fd, slave_stdout, slave_stderr] {
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error()).context("set FD_CLOEXEC on slave fd");
+            }
+        }
         let mut cmd = Command::new(&shell);
         cmd.env("TERM", TERM_NAME)
            .env_remove("TERM_PROGRAM")
