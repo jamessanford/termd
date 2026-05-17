@@ -92,8 +92,8 @@ impl VtFilter {
                             self.buf.clear();
                             self.state = FilterState::Normal;
                         }
-                        // String-sequence openers (OSC/DCS/APC/PM/SOS/ST):
-                        // content can be kilobytes — flush ESC + byte immediately
+                        // Two-char sequences with large content (OSC/DCS/APC/PM/SOS)
+                        // or no content (ST = ESC \): flush ESC + byte immediately
                         b']' | b'P' | b'_' | b'^' | b'X' | b'\\' => {
                             out.extend_from_slice(&self.buf);
                             out.push(byte);
