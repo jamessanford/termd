@@ -180,7 +180,8 @@ impl VtFilter {
                 } else {
                     right
                 };
-                write!(out, "\x1b[{};{}s", left, effective_right).ok();
+                let effective_left = if left >= effective_right { 1 } else { left };
+                write!(out, "\x1b[{};{}s", effective_left, effective_right).ok();
             }
             (CsiMode::Private, b'h') => {
                 let params = self.parse_csi_params();
@@ -402,7 +403,18 @@ mod tests {
     #[test]
     fn other_private_mode_passes_through() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // ESC [ ? 25 h = show cursor — not intercepted
-        assert_eq!(filter_all(&mut f, b"\x1b[?25h"), b"\x1b[?25h");
+        // ESC [ ? 2004 h = bracketed-paste mode — not intercepted
+        assert_eq!(filter_all(&mut f, b"\x1b[?2004h"), b"\x1b[?2004h");
+    }
+
+    #[test]
+    fn decslrm_left_exceeds_server_cols_collapses() {
+        let mut f = VtFilter::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        f.emit_region_setup(&mut out);
+        out.clear();
+        // left (90) > effective_right (80) → collapse to full region
+        f.filter(b"\x1b[90;100s", &mut out);
+        assert_eq!(out, b"\x1b[1;80s");
     }
 }
