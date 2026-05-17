@@ -201,8 +201,15 @@ impl PtyRegistry {
             .to_string_lossy()
             .into_owned();
 
-        // Allocate PTY
-        let pty = openpty(None, None).context("openpty")?;
+        // Allocate PTY with the requested dimensions so the kernel PTY has the
+        // correct window size before the child shell starts and calls TIOCGWINSZ.
+        let init_winsize = nix::pty::Winsize {
+            ws_col: cols as u16,
+            ws_row: rows as u16,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let pty = openpty(Some(&init_winsize), None).context("openpty")?;
         let master_fd = pty.master.into_raw_fd();
         let slave_fd = pty.slave.into_raw_fd();
 
