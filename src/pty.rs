@@ -35,10 +35,19 @@ pub struct PtyInfo {
     pub created_at: SystemTime,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtyChunkKind {
+    /// Raw bytes from the PTY master — incremental update.
+    Stream,
+    /// Full screen repaint (formatter output) — treat as a refresh snapshot.
+    Repaint,
+}
+
 #[derive(Debug)]
 pub struct PtyChunk {
     pub generation: u64,
     pub data: Bytes,
+    pub kind: PtyChunkKind,
 }
 
 #[derive(Clone, Debug)]
@@ -473,7 +482,7 @@ fn reader_thread(
             } else {
                 let refresh_gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
                 match do_refresh(&terminal, current_cols, current_rows, refresh_gen) {
-                    Ok(data) => { let _ = tx.send(Arc::new(PtyChunk { generation: refresh_gen, data: data.data })); }
+                    Ok(data) => { let _ = tx.send(Arc::new(PtyChunk { generation: refresh_gen, data: data.data, kind: PtyChunkKind::Repaint })); }
                     Err(e) => tracing::debug!("PTY reader: resize refresh failed: {e}"),
                 }
             }
@@ -553,6 +562,7 @@ fn reader_thread(
         let chunk = Arc::new(PtyChunk {
             generation: gen,
             data: Bytes::from(batch),
+            kind: PtyChunkKind::Stream,
         });
         let _ = tx.send(chunk); // ignore SendError (no subscribers is fine)
         // Emit TitleChanged after fetch_add so generation matches the accompanying chunk.
@@ -577,7 +587,7 @@ fn reader_thread(
         if screen_changed {
             let refresh_gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
             match do_refresh(&terminal, current_cols, current_rows, refresh_gen) {
-                Ok(data) => { let _ = tx.send(Arc::new(PtyChunk { generation: refresh_gen, data: data.data })); }
+                Ok(data) => { let _ = tx.send(Arc::new(PtyChunk { generation: refresh_gen, data: data.data, kind: PtyChunkKind::Repaint })); }
                 Err(e) => tracing::debug!("PTY reader: screen-switch refresh failed: {e}"),
             }
         }
@@ -602,6 +612,7 @@ fn reader_thread(
     let _ = tx.send(Arc::new(PtyChunk {
         generation: gen,
         data: Bytes::from(exit_msg.into_bytes()),
+        kind: PtyChunkKind::Stream,
     }));
     let exit_code = status.as_ref().and_then(|s| s.code());
     let _ = meta_tx.send(Arc::new(PtyMetadata {
