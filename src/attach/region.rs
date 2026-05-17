@@ -234,10 +234,108 @@ impl VtFilter {
     }
 }
 
-// ── run() placeholder — implemented in Task 5 ─────────────────────────────────
+// ── run() ────────────────────────────────────────────────────────────────────
 
-pub(super) async fn run(_ctx: super::RunContext) -> Result<bool> {
-    todo!("region::run")
+fn get_terminal_size() -> (u32, u32) {
+    let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws); }
+    (ws.ws_col as u32, ws.ws_row as u32)
+}
+
+pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
+    let (client_cols, client_rows) = get_terminal_size();
+    let server_rows = ctx.item.rows;
+    let server_cols = ctx.item.cols;
+
+    if client_rows < server_rows || client_cols < server_cols {
+        eprintln!(
+            "[region: client ({client_cols}x{client_rows}) smaller than \
+             server ({server_cols}x{server_rows}), falling back to cell mode]"
+        );
+        return super::cell::run(ctx).await;
+    }
+
+    let super::RunContext {
+        mut resp_rx, refresh_gen,
+        refresh_bytes, buffered, mut shutdown_rx, ..
+    } = ctx;
+
+    let mut filter = VtFilter::new(server_rows, server_cols, client_rows, client_cols);
+    let mut stdout = tokio::io::stdout();
+    let mut out = Vec::new();
+    let mut current_refresh_gen = refresh_gen;
+
+    filter.emit_region_setup(&mut out);
+    filter.filter(&refresh_bytes, &mut out);
+    stdout.write_all(&out).await?;
+
+    for (gen, data) in &buffered {
+        if *gen > current_refresh_gen {
+            out.clear();
+            filter.filter(data, &mut out);
+            stdout.write_all(&out).await?;
+        }
+    }
+    stdout.flush().await?;
+
+    let mut sigwinch = signal(SignalKind::window_change())?;
+    let mut server_closed = false;
+
+    loop {
+        out.clear();
+        tokio::select! {
+            msg = resp_rx.message() => {
+                match msg {
+                    Ok(Some(r)) => match r.response {
+                        Some(Response::Stream(s)) => {
+                            if s.generation > current_refresh_gen {
+                                filter.filter(&s.data, &mut out);
+                            }
+                        }
+                        Some(Response::Refresh(rf)) => {
+                            current_refresh_gen = rf.generation;
+                            filter.filter(&rf.data, &mut out);
+                        }
+                        Some(Response::Metadata(m)) => {
+                            if m.reason == StreamMetadataReason::Resize as i32 {
+                                if let Some(ref mi) = m.item {
+                                    if mi.cols > 0 && mi.rows > 0 {
+                                        filter.update_region(mi.rows, mi.cols);
+                                        out.extend_from_slice(b"\x1b[2J");
+                                        filter.emit_region_setup(&mut out);
+                                    }
+                                }
+                            } else if m.reason == StreamMetadataReason::Closed as i32 {
+                                server_closed = true;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => { server_closed = true; break; }
+                }
+            }
+            _ = &mut shutdown_rx => break,
+            _ = sigwinch.recv() => {
+                let (new_cols, new_rows) = get_terminal_size();
+                if new_rows < filter.server_rows || new_cols < filter.server_cols {
+                    eprintln!("[region: client shrank below server PTY size, display may be incomplete]");
+                }
+                filter.update_client_size(new_rows, new_cols);
+                filter.emit_region_setup(&mut out);
+            }
+        }
+        if !out.is_empty() {
+            if stdout.write_all(&out).await.is_err() { break; }
+            let _ = stdout.flush().await;
+        }
+    }
+
+    // Cleanup: restore client terminal margins
+    let _ = stdout.write_all(b"\x1b[r\x1b[?69l").await;
+    let _ = stdout.flush().await;
+
+    Ok(server_closed)
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────

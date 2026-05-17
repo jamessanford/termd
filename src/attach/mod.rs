@@ -11,8 +11,10 @@ pub enum RenderMode {
     Cell,
     /// VT formatter for full repaints, cell-by-cell for partial repaints
     Formatter,
-    /// Raw PTY byte passthrough — no libghostty on the render path
+    /// Raw PTY byte passthrough — no libghostty on the client render path
     Raw,
+    /// Raw passthrough within a DECSTBM scroll region; rewrites conflicting sequences
+    Region,
 }
 
 pub(crate) struct RunContext {
@@ -259,6 +261,7 @@ pub async fn run(
         RenderMode::Cell      => cell::run(ctx).await?,
         RenderMode::Formatter => formatter::run(ctx).await?,
         RenderMode::Raw       => raw::run(ctx).await?,
+        RenderMode::Region    => region::run(ctx).await?,
     };
 
     stdin_task.abort();
