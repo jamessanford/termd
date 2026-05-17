@@ -10,7 +10,7 @@ use termd::proto::{
 };
 
 pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
-    let super::RunContext { mut resp_rx, cmd_tx, pty_id, refresh_gen: mut refresh_gen, refresh_bytes, buffered, mut shutdown_rx, .. } = ctx;
+    let super::RunContext { mut resp_rx, cmd_tx, pty_id, mut refresh_gen, refresh_bytes, buffered, mut shutdown_rx, .. } = ctx;
 
     let mut stdout = tokio::io::stdout();
 

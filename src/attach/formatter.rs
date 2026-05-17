@@ -1,7 +1,7 @@
 use std::io::Write as IoWrite;
 
 use anyhow::Result;
-use libghostty_vt::{Terminal, TerminalOptions, RenderState};
+use libghostty_vt::{Terminal, RenderState};
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
 use libghostty_vt::render::{Dirty, RowIterator, CellIterator};
 use libghostty_vt::style::Underline;
@@ -9,8 +9,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::signal::unix::{signal, SignalKind};
 
 use termd::proto::{
-    terminal_command::Command, terminal_response::Response,
-    RefreshRequest, StreamMetadataReason, TerminalCommand,
+    terminal_response::Response,
+    StreamMetadataReason,
 };
 
 pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
