@@ -306,6 +306,7 @@ impl PtyRegistry {
         // slave fds are owned by the Stdio objects passed to Command and closed after fork;
 
         let child_pid = Pid::from_raw(child.id() as i32);
+        crate::utmp::add_record(master_reader_fd, &hostname);
         let created_at = SystemTime::now();
         let meta_tx_for_thread = meta_tx.clone();
         let id_for_thread = id.clone();
@@ -612,6 +613,7 @@ fn reader_thread(
 
     // Reap child and broadcast exit notification
     let status = child.try_wait().ok().flatten().or_else(|| child.wait().ok());
+    crate::utmp::remove_record(master.as_raw_fd());
     let exit_msg = {
         let title = title.lock().unwrap().clone();
         match status {
