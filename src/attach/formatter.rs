@@ -13,7 +13,7 @@ use termd::proto::{
     StreamMetadataReason,
 };
 
-pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
+pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
     let super::RunContext { mut resp_rx, item, refresh_gen, refresh_bytes, buffered, mut shutdown_rx, .. } = ctx;
 
     let mut lt = super::LocalTerminal::new(item.cols, item.rows)?;
@@ -79,7 +79,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
         }
     }
 
-    Ok(server_closed)
+    Ok(if server_closed { super::RunOutcome::ServerClosed } else { super::RunOutcome::ClientDisconnected })
 }
 
 fn render_dirty(

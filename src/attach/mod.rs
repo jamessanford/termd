@@ -28,6 +28,19 @@ pub(crate) struct RunContext {
     pub shutdown_rx:   tokio::sync::oneshot::Receiver<()>,
 }
 
+/// Outcome returned by every render-mode runner.
+pub(super) enum RunOutcome {
+    /// The server PTY exited or closed.
+    ServerClosed,
+    /// The client disconnected (stdin EOF or `~.` escape).
+    ClientDisconnected,
+    /// Region mode detected it can no longer handle current dimensions.
+    /// `refresh_bytes` is empty — this relies on the server sending a
+    /// refresh following a resize event. That holds for resize-triggered
+    /// fallbacks but would not hold for arbitrary render-mode changes.
+    FallbackToCell(RunContext),
+}
+
 use termd::proto::{
     terminal_command::Command, terminal_response::Response,
     PtyItem, RefreshRequest, SubscribeRequest, TerminalCommand, WriteRequest,
@@ -257,16 +270,27 @@ pub async fn run(
         shutdown_rx,
     };
 
-    let server_closed = match mode {
-        RenderMode::Cell      => cell::run(ctx).await?,
-        RenderMode::Formatter => formatter::run(ctx).await?,
-        RenderMode::Raw       => raw::run(ctx).await?,
-        RenderMode::Region    => region::run(ctx).await?,
+    let mut dispatch_mode = mode;
+    let mut dispatch_ctx = ctx;
+    let outcome = loop {
+        let result = match dispatch_mode {
+            RenderMode::Cell      => cell::run(dispatch_ctx).await?,
+            RenderMode::Formatter => formatter::run(dispatch_ctx).await?,
+            RenderMode::Raw       => raw::run(dispatch_ctx).await?,
+            RenderMode::Region    => region::run(dispatch_ctx).await?,
+        };
+        match result {
+            RunOutcome::FallbackToCell(fallback_ctx) => {
+                dispatch_mode = RenderMode::Cell;
+                dispatch_ctx = fallback_ctx;
+            }
+            other => break other,
+        }
     };
 
     stdin_task.abort();
     drop(_guard);
-    if server_closed {
+    if matches!(outcome, RunOutcome::ServerClosed) {
         eprintln!("[Connection closed]");
     }
     Ok(())

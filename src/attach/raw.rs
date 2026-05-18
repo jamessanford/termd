@@ -9,7 +9,7 @@ use termd::proto::{
     RefreshRequest, StreamMetadataReason, TerminalCommand,
 };
 
-pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
+pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
     let super::RunContext { mut resp_rx, cmd_tx, pty_id, mut refresh_gen, refresh_bytes, buffered, mut shutdown_rx, .. } = ctx;
 
     let mut stdout = tokio::io::stdout();
@@ -68,5 +68,5 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
         }
     }
 
-    Ok(server_closed)
+    Ok(if server_closed { super::RunOutcome::ServerClosed } else { super::RunOutcome::ClientDisconnected })
 }
