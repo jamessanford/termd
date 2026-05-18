@@ -25,6 +25,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(&["proto/terminal.proto"], &["proto"])?;
 
+    println!("cargo::rustc-check-cfg=cfg(has_utempter)");
+
     if has_utempter() {
         println!("cargo:rustc-cfg=has_utempter");
     }
