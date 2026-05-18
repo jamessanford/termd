@@ -357,6 +357,13 @@ impl PtyRegistry {
         Ok(())
     }
 
+    pub fn destroy_all(&self) {
+        let ids: Vec<String> = self.ptys.read().unwrap().keys().cloned().collect();
+        for id in ids {
+            let _ = self.destroy(&id);
+        }
+    }
+
     pub fn get(&self, id: &str) -> Option<Arc<PtyHandle>> {
         self.ptys.read().unwrap().get(id).cloned()
     }

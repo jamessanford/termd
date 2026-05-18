@@ -563,3 +563,13 @@ async fn test_resize_via_grpc_delivers_metadata() {
 
     assert!(found, "resize command should deliver StreamMetadata::Resize to subscriber");
 }
+
+#[test]
+fn test_destroy_all_empties_registry() {
+    let registry = termd::pty::PtyRegistry::new();
+    registry.create(80, 24, None).unwrap();
+    registry.create(80, 24, None).unwrap();
+    assert_eq!(registry.list().len(), 2);
+    registry.destroy_all();
+    assert_eq!(registry.list().len(), 0);
+}
