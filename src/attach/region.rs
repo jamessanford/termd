@@ -21,6 +21,16 @@ enum FilterState {
     InCsi(CsiMode),
 }
 
+/// Streaming VT escape-sequence filter for region mode.
+///
+/// Region mode forwards raw server PTY bytes to the client terminal, confined to
+/// a DECSTBM scroll region sized to the server PTY dimensions. The problem is that
+/// programs running on the server (vim, less, htop, tmux) emit their own DECSTBM
+/// and DECLRMM/DECSLRM sequences, which would clobber the client-side region setup.
+/// `VtFilter` sits between the gRPC byte stream and stdout, intercepting those
+/// sequences byte-by-byte and rewriting or suppressing them so they stay within the
+/// server's bounds. The state machine carries partial-sequence state across `filter()`
+/// calls, handling escape sequences that span buffer boundaries.
 struct VtFilter {
     state:          FilterState,
     buf:            Vec<u8>,
