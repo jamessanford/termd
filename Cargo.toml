@@ -33,6 +33,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 
 [build-dependencies]
 tonic-build = "0.12"
+pkg-config = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
