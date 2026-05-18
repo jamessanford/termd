@@ -1131,6 +1131,7 @@ dependencies = [
  "libghostty-vt",
  "libghostty-vt-sys",
  "nix",
+ "pkg-config",
  "prost",
  "prost-types",
  "tempfile",
