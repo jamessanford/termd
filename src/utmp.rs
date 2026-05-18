@@ -4,6 +4,7 @@ use std::os::unix::io::RawFd;
 extern "C" {
     fn utempter_add_record(master_fd: libc::c_int, host: *const libc::c_char) -> libc::c_int;
     fn utempter_remove_record(master_fd: libc::c_int) -> libc::c_int;
+    fn utempter_remove_added_record() -> libc::c_int;
 }
 
 /// Write a USER_PROCESS utmp entry for the PTY identified by `master_fd`.
@@ -30,6 +31,14 @@ pub fn remove_record(master_fd: RawFd) {
     { let _ = master_fd; }
 }
 
+/// Remove all utmp entries added by this process.
+/// Called at graceful shutdown as a belt-and-suspenders cleanup.
+/// No-op if termd was built without libutempter.
+pub fn remove_all_records() {
+    #[cfg(has_utempter)]
+    unsafe { utempter_remove_added_record(); }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,5 +49,10 @@ mod tests {
         // but the wrapper must not panic regardless.
         add_record(0, "localhost");
         remove_record(0);
+    }
+
+    #[test]
+    fn remove_all_records_does_not_panic() {
+        remove_all_records();
     }
 }
