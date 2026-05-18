@@ -176,6 +176,8 @@ pub async fn serve(
     use tokio::net::UnixListener;
     use tonic::transport::Server;
     use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
+    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::sync::broadcast;
 
     // Remove stale socket file if present
     let _ = std::fs::remove_file(unix_path);
@@ -191,17 +193,47 @@ pub async fn serve(
 
     tracing::info!(unix = ?unix_path, tcp = %tcp_addr, "termd listening");
 
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
+    let mut shutdown_rx1 = shutdown_tx.subscribe();
+    let mut shutdown_rx2 = shutdown_tx.subscribe();
+
+    let registry_for_shutdown = registry.clone();
+    tokio::spawn(async move {
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let mut sigint  = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
+            _ = sigint.recv()  => tracing::info!("SIGINT received, shutting down"),
+        }
+        registry_for_shutdown.destroy_all();
+        let _ = shutdown_tx.send(());
+    });
+
     let svc_unix = make_service(registry.clone(), log_grpc);
     let svc_tcp  = make_service(registry, log_grpc);
 
-    tokio::try_join!(
-        Server::builder()
-            .add_service(svc_unix)
-            .serve_with_incoming(UnixListenerStream::new(unix_listener)),
-        Server::builder()
-            .add_service(svc_tcp)
-            .serve_with_incoming(TcpListenerStream::new(tcp_listener)),
-    )?;
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        async move {
+            tokio::try_join!(
+                Server::builder()
+                    .add_service(svc_unix)
+                    .serve_with_incoming_shutdown(
+                        UnixListenerStream::new(unix_listener),
+                        async move { let _ = shutdown_rx1.recv().await; },
+                    ),
+                Server::builder()
+                    .add_service(svc_tcp)
+                    .serve_with_incoming_shutdown(
+                        TcpListenerStream::new(tcp_listener),
+                        async move { let _ = shutdown_rx2.recv().await; },
+                    ),
+            )
+        },
+    ).await.is_err() {
+        tracing::warn!("shutdown drain timed out after 5s, forcing exit");
+    }
 
+    crate::utmp::remove_all_records();
     Ok(())
 }
