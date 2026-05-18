@@ -258,7 +258,7 @@ fn get_terminal_size() -> (u32, u32) {
     (ws.ws_col as u32, ws.ws_row as u32)
 }
 
-pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
+pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
     let (client_cols, client_rows) = get_terminal_size();
     let server_rows = ctx.item.rows;
     let server_cols = ctx.item.cols;
@@ -266,14 +266,14 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
     if client_rows < server_rows || client_cols < server_cols {
         eprintln!(
             "[region: client ({client_cols}x{client_rows}) smaller than \
-             server ({server_cols}x{server_rows}), falling back to cell mode]"
+             server ({server_cols}x{server_rows}); switching to cell mode]"
         );
         return super::cell::run(ctx).await;
     }
 
     let super::RunContext {
-        mut resp_rx, refresh_gen,
-        refresh_bytes, buffered, mut shutdown_rx, ..
+        mut resp_rx, cmd_tx, pty_id, mut item,
+        refresh_gen, refresh_bytes, buffered, mut shutdown_rx,
     } = ctx;
 
     let mut filter = VtFilter::new(server_rows, server_cols, client_rows, client_cols);
@@ -296,6 +296,8 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
 
     let mut sigwinch = signal(SignalKind::window_change())?;
     let mut server_closed = false;
+    // Set to Some when region mode needs to hand off to cell mode.
+    let mut fallback_ctx: Option<super::RunContext> = None;
 
     loop {
         out.clear();
@@ -314,7 +316,26 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
                             if m.reason == StreamMetadataReason::Resize as i32 {
                                 if let Some(ref mi) = m.item {
                                     if mi.cols > 0 && mi.rows > 0 {
+                                        // Keep item in sync so a subsequent fallback
+                                        // hands cell mode the current server dimensions.
+                                        item.cols = mi.cols;
+                                        item.rows = mi.rows;
                                         filter.update_region(mi.rows, mi.cols);
+                                        if mi.cols > client_cols || mi.rows > client_rows {
+                                            eprintln!(
+                                                "[region: server resized to ({}x{}), larger than \
+                                                 client ({}x{}); switching to cell mode]",
+                                                mi.cols, mi.rows, client_cols, client_rows
+                                            );
+                                            fallback_ctx = Some(super::RunContext {
+                                                resp_rx, cmd_tx, pty_id, item,
+                                                refresh_gen: 0, // zero so cell mode accepts the server's next Refresh
+                                                refresh_bytes: vec![],
+                                                buffered: vec![],
+                                                shutdown_rx,
+                                            });
+                                            break;
+                                        }
                                         out.extend_from_slice(b"\x1b[2J");
                                         filter.emit_region_setup(&mut out);
                                     }
@@ -333,7 +354,19 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
             _ = sigwinch.recv() => {
                 let (new_cols, new_rows) = get_terminal_size();
                 if new_rows < filter.server_rows || new_cols < filter.server_cols {
-                    eprintln!("[region: client shrank below server PTY size, display may be incomplete]");
+                    eprintln!(
+                        "[region: client shrank to ({}x{}), smaller than server ({}x{}); \
+                         switching to cell mode]",
+                        new_cols, new_rows, filter.server_cols, filter.server_rows
+                    );
+                    fallback_ctx = Some(super::RunContext {
+                        resp_rx, cmd_tx, pty_id, item,
+                        refresh_gen: 0, // zero so cell mode accepts the server's next Refresh
+                        refresh_bytes: vec![],
+                        buffered: vec![],
+                        shutdown_rx,
+                    });
+                    break;
                 }
                 filter.update_client_size(new_rows, new_cols);
                 filter.emit_region_setup(&mut out);
@@ -352,7 +385,10 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<bool> {
     }
     let _ = stdout.flush().await;
 
-    Ok(server_closed)
+    if let Some(ctx) = fallback_ctx {
+        return Ok(super::RunOutcome::FallbackToCell(ctx));
+    }
+    Ok(if server_closed { super::RunOutcome::ServerClosed } else { super::RunOutcome::ClientDisconnected })
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
