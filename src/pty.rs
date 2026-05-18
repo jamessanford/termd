@@ -93,7 +93,7 @@ pub struct PtyHandle {
     resize_tx: std::sync::mpsc::SyncSender<(u32, u32)>,
     meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
     generation: Arc<AtomicU64>,
-    child_pid: u32,
+    child_pid: Pid,
     wakeup_write: OwnedFd,
 }
 
@@ -167,7 +167,7 @@ impl PtyHandle {
     pub async fn refresh(&self) -> Result<RefreshData> {
         let (tx, rx) = oneshot::channel();
         self.refresh_tx.send(tx).map_err(|_| anyhow!("PTY reader thread is dead"))?;
-        // Wake the reader immediately instead of waiting up to 50 ms for the poll timeout
+        // Wake the reader immediately so it handles the refresh before the next PTY event.
         let wfd = self.wakeup_write.as_raw_fd();
         let ret = unsafe { libc::write(wfd, [1u8].as_ptr() as *const libc::c_void, 1) };
         if ret < 0 {
@@ -305,7 +305,7 @@ impl PtyRegistry {
         let child = cmd.spawn().context("spawn shell")?;
         // slave fds are owned by the Stdio objects passed to Command and closed after fork;
 
-        let child_pid = child.id();
+        let child_pid = Pid::from_raw(child.id() as i32);
         let created_at = SystemTime::now();
         let meta_tx_for_thread = meta_tx.clone();
         let id_for_thread = id.clone();
@@ -349,7 +349,7 @@ impl PtyRegistry {
     pub fn destroy(&self, id: &str) -> Result<()> {
         let handle = self.ptys.write().unwrap().remove(id)
             .ok_or_else(|| anyhow!("PTY {id} not found"))?;
-        let _ = kill(Pid::from_raw(handle.child_pid as i32), Signal::SIGHUP);
+        let _ = kill(handle.child_pid, Signal::SIGHUP);
         // handle drops at end of scope: wakeup_write closes → reader sees POLLHUP and exits.
         // If callers hold Arc<PtyHandle> clones (e.g. an in-flight refresh), wakeup_write
         // stays open until the last clone drops — POLLHUP fires then, not immediately on return.
@@ -511,9 +511,8 @@ fn reader_thread(
             let _ = reply_tx.send(result);
         }
 
-        // Poll both the PTY master and the wakeup pipe.  A refresh() call writes one
-        // byte to wakeup_write, which makes wakeup_fd readable and unblocks the poll
-        // immediately rather than waiting for the 50 ms timeout.
+        // Poll both the PTY master and the wakeup pipe.  Writes to wakeup_write
+        // (refresh or resize) unblock the poll so requests are handled promptly.
         let mut pfds = [
             libc::pollfd { fd: master_fd, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: wakeup_fd, events: libc::POLLIN, revents: 0 },
