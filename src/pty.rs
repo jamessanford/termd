@@ -79,6 +79,12 @@ pub struct RefreshData {
     pub cursor_y: u32,
 }
 
+pub struct ScrollbackData {
+    pub generation: u64,
+    pub data: Bytes,
+    pub total_scrollback_rows: u32,
+}
+
 pub struct PtyHandle {
     id: String,
     pts_name: String,

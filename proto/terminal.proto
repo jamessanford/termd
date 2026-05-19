@@ -18,6 +18,7 @@ message TerminalCommand {
     ResizeRequest      resize      = 7;
     SetTitleRequest    set_title   = 8;
     RefreshRequest     refresh     = 9;
+    ScrollbackRequest  scrollback  = 10;
   }
 }
 
@@ -30,15 +31,24 @@ message WriteRequest       { string pty_id = 1; bytes data = 2; }
 message ResizeRequest      { string pty_id = 1; uint32 cols = 2; uint32 rows = 3; }
 message SetTitleRequest    { string pty_id = 1; string title = 2; }
 message RefreshRequest     { string pty_id = 1; }
+message ScrollbackRequest {
+  string pty_id     = 1;
+  // Distance from the active-screen edge, in rows.
+  // 0 = the row immediately above the active screen (most recent history).
+  uint32 row_offset = 2;
+  // Maximum number of scrollback rows to return.
+  uint32 row_count  = 3;
+}
 
 message TerminalResponse {
   oneof response {
-    ListResponse    list     = 1;
-    CreateResponse  create   = 2;
-    CommandResponse command  = 3;
-    StreamData      stream   = 4;
-    RefreshResponse refresh  = 5;
-    StreamMetadata  metadata = 6;
+    ListResponse    list       = 1;
+    CreateResponse  create     = 2;
+    CommandResponse command    = 3;
+    StreamData      stream     = 4;
+    RefreshResponse refresh    = 5;
+    StreamMetadata  metadata   = 6;
+    ScrollbackResponse scrollback = 7;
   }
 }
 
@@ -63,6 +73,13 @@ message RefreshResponse {
   bytes  data       = 3;
   uint32 cursor_x   = 4;
   uint32 cursor_y   = 5;
+}
+
+message ScrollbackResponse {
+  string pty_id                = 1;
+  uint64 generation            = 2;
+  bytes  data                  = 3;
+  uint32 total_scrollback_rows = 4;
 }
 
 enum StreamMetadataReason {
