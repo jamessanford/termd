@@ -203,6 +203,100 @@ fn next_pty<'a>(list: &'a [PtyItem], current_id: &str) -> Option<&'a PtyItem> {
     Some(&list[(pos + 1) % list.len()])
 }
 
+fn draw_list(items: &[PtyItem], selected: usize) {
+    use std::io::Write;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"\x1b[2J\x1b[H");
+    for (i, item) in items.iter().enumerate() {
+        if i == selected { out.extend_from_slice(b"\x1b[7m"); }
+        let title = if item.title.is_empty() { &item.pts_name } else { &item.title };
+        let line = format!(
+            " {:<16}  {:<32}  {}x{}\r\n",
+            &item.pty_id[..item.pty_id.len().min(16)],
+            &title[..title.len().min(32)],
+            item.cols, item.rows,
+        );
+        out.extend_from_slice(line.as_bytes());
+        if i == selected { out.extend_from_slice(b"\x1b[0m"); }
+    }
+    let _ = std::io::stdout().write_all(&out);
+    let _ = std::io::stdout().flush();
+}
+
+async fn show_list(
+    cmd_tx:          &mpsc::Sender<TerminalCommand>,
+    resp_rx:         &mut tonic::Streaming<termd::proto::TerminalResponse>,
+    pty_list:        &mut Vec<PtyItem>,
+    current_pty_id:  &str,
+) -> anyhow::Result<Option<String>> {
+    // Returns Some(new_pty_id) on selection, None on cancel.
+    use tokio::io::AsyncReadExt;
+
+    fetch_list(cmd_tx, resp_rx, pty_list).await?;
+    if pty_list.is_empty() {
+        return Ok(None);
+    }
+
+    let mut selected = pty_list
+        .iter()
+        .position(|p| p.pty_id == current_pty_id)
+        .unwrap_or(0);
+
+    draw_list(pty_list, selected);
+
+    let mut stdin = tokio::io::stdin();
+    let mut buf = [0u8; 8];
+
+    loop {
+        let n = match stdin.read(&mut buf).await {
+            Ok(0) | Err(_) => return Ok(None),
+            Ok(n) => n,
+        };
+
+        match &buf[..n] {
+            // Enter — select
+            [b'\r'] | [b'\n'] => {
+                return Ok(Some(pty_list[selected].pty_id.clone()));
+            }
+            // Arrow keys arrive as 3-byte ESC sequences; match the whole read
+            [0x1b, b'[', b'A', ..] => {
+                if selected > 0 { selected -= 1; }
+                draw_list(pty_list, selected);
+            }
+            [0x1b, b'[', b'B', ..] => {
+                if selected + 1 < pty_list.len() { selected += 1; }
+                draw_list(pty_list, selected);
+            }
+            // Bare ESC: try to read 2 more bytes within 50 ms to rule out
+            // a split arrow-key sequence. Timeout means it really was bare ESC.
+            [0x1b] => {
+                let mut rest = [0u8; 2];
+                let is_arrow = tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    stdin.read(&mut rest),
+                ).await
+                .ok()
+                .and_then(|r| r.ok())
+                .map(|n2| &rest[..n2] == b"[A" || &rest[..n2] == b"[B")
+                .unwrap_or(false);
+
+                if is_arrow {
+                    if rest[1] == b'A' {
+                        if selected > 0 { selected -= 1; }
+                    } else {
+                        if selected + 1 < pty_list.len() { selected += 1; }
+                    }
+                    draw_list(pty_list, selected);
+                } else {
+                    // Bare escape — cancel
+                    return Ok(None);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub async fn run(
     client: &mut AuthedClient,
     item: PtyItem,
@@ -352,8 +446,24 @@ pub async fn run(
                     }
 
                     InputAction::ShowList => {
-                        // Implemented in Task 4. For now: no-op, stay on current PTY.
-                        should_subscribe = false;
+                        match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id).await? {
+                            Some(new_id) if new_id != current_pty_id => {
+                                let _ = cmd_tx.send(TerminalCommand {
+                                    command: Some(Command::Unsubscribe(
+                                        UnsubscribeRequest { pty_id: current_pty_id.clone() }
+                                    )),
+                                }).await;
+                                // Look up item from list so current_item has correct cols/rows.
+                                if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
+                                    current_item = target;
+                                }
+                                current_pty_id = new_id;
+                            }
+                            _ => {
+                                // Cancel or selected same PTY — skip resubscribe, just refresh.
+                                should_subscribe = false;
+                            }
+                        }
                     }
                 }
             }
