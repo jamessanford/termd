@@ -25,6 +25,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
 
     let mut sigwinch = signal(SignalKind::window_change())?;
 
+    let mut pty_closed = false;
     loop {
         tokio::select! {
             msg = resp_rx.message() => {
@@ -48,7 +49,10 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                                 let _ = stdout.write_all(b"\x1b[2J").await;
                                 let _ = stdout.flush().await;
                             } else if m.reason == StreamMetadataReason::Closed as i32 {
-                                break;
+                                if !pty_closed {
+                                    pty_closed = true;
+                                    eprint!("\r\n[PTY closed]\r\n");
+                                }
                             }
                         }
                         _ => {}
