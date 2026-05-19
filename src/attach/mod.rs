@@ -5,6 +5,16 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
+mod input;
+
+pub(super) enum InputAction {
+    Detach,
+    Create,
+    SwitchNext,
+    SwitchIndex(u8),
+    ShowList,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum RenderMode {
     /// Cell-by-cell render state for all dirty states (default)
@@ -117,93 +127,12 @@ fn setup_raw_mode() -> Result<TerminalGuard> {
 }
 
 
-#[derive(Clone, Copy)]
-enum EscapeState {
-    Normal,
-    AfterNewline,
-    AfterTilde,
-}
-
-async fn run_stdin(
-    cmd_tx: mpsc::Sender<TerminalCommand>,
-    pty_id: String,
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
-) {
-    use tokio::io::AsyncReadExt;
-    let mut stdin = tokio::io::stdin();
-    let mut state = EscapeState::AfterNewline;
-    let mut buf = [0u8; 256];
-    let mut shutdown_tx = Some(shutdown_tx);
-
-    'outer: loop {
-        let n = match stdin.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        let mut to_send: Vec<u8> = Vec::new();
-        for &byte in &buf[..n] {
-            match state {
-                EscapeState::Normal => {
-                    to_send.push(byte);
-                    if byte == b'\r' || byte == b'\n' {
-                        state = EscapeState::AfterNewline;
-                    }
-                }
-                EscapeState::AfterNewline => {
-                    if byte == b'~' {
-                        state = EscapeState::AfterTilde;
-                    } else if byte == b'\r' || byte == b'\n' {
-                        to_send.push(byte);
-                    } else {
-                        to_send.push(byte);
-                        state = EscapeState::Normal;
-                    }
-                }
-                EscapeState::AfterTilde => {
-                    if byte == b'.' {
-                        if !to_send.is_empty() {
-                            let _ = cmd_tx.send(TerminalCommand {
-                                command: Some(Command::Write(WriteRequest {
-                                    pty_id: pty_id.clone(),
-                                    data: to_send,
-                                })),
-                            }).await;
-                        }
-                        if let Some(tx) = shutdown_tx.take() { let _ = tx.send(()); }
-                        break 'outer;
-                    } else if byte == b'\r' || byte == b'\n' {
-                        to_send.push(b'~');
-                        to_send.push(byte);
-                        state = EscapeState::AfterNewline;
-                    } else {
-                        to_send.push(b'~');
-                        to_send.push(byte);
-                        state = EscapeState::Normal;
-                    }
-                }
-            }
-        }
-        if !to_send.is_empty() {
-            if cmd_tx.send(TerminalCommand {
-                command: Some(Command::Write(WriteRequest {
-                    pty_id: pty_id.clone(),
-                    data: to_send,
-                })),
-            }).await.is_err() {
-                break;
-            }
-        }
-    }
-}
-
 pub async fn run(
     client: &mut AuthedClient,
     item: PtyItem,
     debug: bool,
     mode: RenderMode,
 ) -> Result<()> {
-    use tokio::sync::oneshot;
-
     if debug {
         return run_debug(client, item.pty_id).await;
     }
@@ -255,9 +184,11 @@ pub async fn run(
     // Enter raw terminal mode; guard restores settings on any exit path
     let _guard = setup_raw_mode()?;
 
-    // Spawn stdin forwarder; shutdown_rx fires on ~. escape
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let stdin_task = tokio::spawn(run_stdin(cmd_tx.clone(), pty_id.clone(), shutdown_tx));
+    // Spawn stdin forwarder; action_rx receives InputAction when an escape sequence fires
+    let (action_tx, _action_rx) = mpsc::channel::<InputAction>(4);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let _ = shutdown_tx; // will be removed in Task 2
+    let stdin_task = tokio::spawn(input::run_stdin(cmd_tx.clone(), action_tx, pty_id.clone()));
 
     let ctx = RunContext {
         resp_rx,
