@@ -466,13 +466,101 @@ fn do_refresh(
     })
 }
 
+fn do_scrollback(
+    terminal:   &Terminal<'static, 'static>,
+    row_offset: u32,
+    row_count:  u32,
+    generation: u64,
+    cols:       u32,
+) -> Result<ScrollbackData> {
+    let total = terminal.scrollback_rows()? as u32;
+
+    if total == 0 || row_count == 0 {
+        return Ok(ScrollbackData { generation, data: Bytes::new(), total_scrollback_rows: total });
+    }
+    if row_offset >= total {
+        return Ok(ScrollbackData { generation, data: Bytes::new(), total_scrollback_rows: total });
+    }
+
+    // Helper closure: FormatterTerminalExtra with all flags false.
+    // Both FormatterTerminalExtra and FormatterScreenExtra use the sized-struct ABI —
+    // the `size` field must be set explicitly; Default::default() would leave size=0.
+    let make_extra = || ffi::FormatterTerminalExtra {
+        size: std::mem::size_of::<ffi::FormatterTerminalExtra>(),
+        scrolling_region: false,
+        modes: false,
+        palette: false,
+        tabstops: false,
+        pwd: false,
+        keyboard: false,
+        screen: ffi::FormatterScreenExtra {
+            size: std::mem::size_of::<ffi::FormatterScreenExtra>(),
+            cursor: false,
+            style: false,
+            hyperlink: false,
+            protection: false,
+            kitty_keyboard: false,
+            charsets: false,
+        },
+    };
+
+    // Optimization: full-buffer dump avoids the expensive grid_ref page-list traversal.
+    // NOTE: grid_ref(Point::History(...)) traverses the internal scrollback page list to
+    // locate the target row, which is O(scrollback_depth). For partial ranges this is
+    // required; for the full-buffer case we skip it by passing selection: None to the
+    // Formatter. If scrollback requests become a latency concern (do_scrollback runs on
+    // the reader thread, blocking live PTY I/O), consider offloading to a background thread.
+    if row_offset == 0 && row_count >= total {
+        let mut fmt = Formatter::new(terminal, FormatterOptions {
+            format: Format::Vt,
+            trim: false,
+            unwrap: false,
+            selection: None,
+            extra: make_extra(),
+        })?;
+        let vt = fmt.format_alloc(None)?;
+        return Ok(ScrollbackData {
+            generation,
+            data: Bytes::from(vt.to_vec()),
+            total_scrollback_rows: total,
+        });
+    }
+
+    // Partial range: convert row_offset (distance from bottom) to Point::History y-coords.
+    // History: y=0 = oldest row, y=total-1 = most recent row (just above active screen).
+    let end_y   = total - 1 - row_offset;
+    let rows    = row_count.min(end_y + 1);
+    let start_y = end_y + 1 - rows;
+
+    let top_left = terminal.grid_ref(Point::History(PointCoordinate { x: 0, y: start_y }))?;
+    let bot_right = terminal.grid_ref(Point::History(PointCoordinate {
+        x: cols.saturating_sub(1) as u16,
+        y: end_y,
+    }))?;
+    let selection = Selection { start: top_left, end: bot_right, rectangle: false };
+
+    let mut fmt = Formatter::new(terminal, FormatterOptions {
+        format: Format::Vt,
+        trim: false,
+        unwrap: false,
+        selection: Some(selection),
+        extra: make_extra(),
+    })?;
+    let vt = fmt.format_alloc(None)?;
+    Ok(ScrollbackData {
+        generation,
+        data: Bytes::from(vt.to_vec()),
+        total_scrollback_rows: total,
+    })
+}
+
 // Reader thread — owns libghostty Terminal state (not Send + Sync).
 fn reader_thread(
     mut master: File,
     tx: broadcast::Sender<Arc<PtyChunk>>,
     generation: Arc<AtomicU64>,
     refresh_rx: std::sync::mpsc::Receiver<oneshot::Sender<Result<RefreshData>>>,
-    _scrollback_rx: std::sync::mpsc::Receiver<(u32, u32, oneshot::Sender<Result<ScrollbackData>>)>,
+    scrollback_rx: std::sync::mpsc::Receiver<(u32, u32, oneshot::Sender<Result<ScrollbackData>>)>,
     resize_rx: std::sync::mpsc::Receiver<(u32, u32)>,
     wakeup_read: OwnedFd,
     mut child: std::process::Child,
@@ -540,6 +628,11 @@ fn reader_thread(
         while let Ok(reply_tx) = refresh_rx.try_recv() {
             let gen = generation.load(Ordering::Relaxed);
             let result = do_refresh(&terminal, current_cols, current_rows, gen);
+            let _ = reply_tx.send(result);
+        }
+        while let Ok((row_offset, row_count, reply_tx)) = scrollback_rx.try_recv() {
+            let gen = generation.load(Ordering::Relaxed);
+            let result = do_scrollback(&terminal, row_offset, row_count, gen, current_cols);
             let _ = reply_tx.send(result);
         }
 
@@ -686,6 +779,44 @@ fn reader_thread(
         let result = do_refresh(&terminal, current_cols, current_rows, gen);
         let _ = reply_tx.send(result);
     }
+    while let Ok((row_offset, row_count, reply_tx)) = scrollback_rx.try_recv() {
+        let gen = generation.load(Ordering::Relaxed);
+        let result = do_scrollback(&terminal, row_offset, row_count, gen, current_cols);
+        let _ = reply_tx.send(result);
+    }
 
     drop(wakeup_read); // closes read end; wakeup_write already closed (PtyHandle dropped)
+}
+
+#[cfg(test)]
+mod scrollback_tests {
+    use super::*;
+
+    fn make_terminal(cols: u16, rows: u16, scrollback: usize) -> Terminal<'static, 'static> {
+        Terminal::new(TerminalOptions { cols, rows, max_scrollback: scrollback }).unwrap()
+    }
+
+    #[test]
+    fn do_scrollback_empty_when_no_history() {
+        let terminal = make_terminal(80, 24, 1000);
+        // No data written — scrollback_rows() == 0
+        let result = do_scrollback(&terminal, 0, 100, 42, 80).unwrap();
+        assert_eq!(result.generation, 42);
+        assert!(result.data.is_empty());
+        assert_eq!(result.total_scrollback_rows, 0);
+    }
+
+    #[test]
+    fn do_scrollback_offset_beyond_total_returns_empty() {
+        let mut terminal = make_terminal(80, 5, 1000);
+        // Push 10 rows of scrollback by writing 15 lines (5-row screen scrolls 10 into history)
+        for i in 0..15u8 {
+            terminal.vt_write(format!("line{}\n", i).as_bytes());
+        }
+        let total = terminal.scrollback_rows().unwrap() as u32;
+        assert!(total > 0, "expected some scrollback");
+        let result = do_scrollback(&terminal, total, 10, 7, 80).unwrap();
+        assert!(result.data.is_empty());
+        assert_eq!(result.total_scrollback_rows, total);
+    }
 }
