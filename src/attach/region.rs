@@ -262,14 +262,8 @@ impl VtFilter {
 
 // ── run() ────────────────────────────────────────────────────────────────────
 
-fn get_terminal_size() -> (u32, u32) {
-    let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
-    unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws); }
-    (ws.ws_col as u32, ws.ws_row as u32)
-}
-
 pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
-    let (client_cols, client_rows) = get_terminal_size();
+    let (client_cols, client_rows) = super::get_terminal_size();
     let server_rows = ctx.item.rows;
     let server_cols = ctx.item.cols;
 
@@ -376,7 +370,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                 }));
             }
             _ = sigwinch.recv() => {
-                let (new_cols, new_rows) = get_terminal_size();
+                let (new_cols, new_rows) = super::get_terminal_size();
                 if new_rows < filter.server_rows || new_cols < filter.server_cols {
                     eprintln!(
                         "[region: client shrank to ({}x{}), smaller than server ({}x{}); \
