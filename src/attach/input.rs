@@ -46,6 +46,7 @@ pub(super) fn process_byte(
             0x01     => { to_send.push(0x01); *state = EscapeState::Normal; None }
             b'c'     => Some(InputAction::Create),
             b'"'     => Some(InputAction::ShowList),
+            b's'     => Some(InputAction::ShowScrollback),
             b' '     => Some(InputAction::SwitchNext),
             b'd'     => Some(InputAction::Detach),
             b'0'..=b'9' => Some(InputAction::SwitchIndex(byte - b'0')),
@@ -162,6 +163,13 @@ mod tests {
     fn ctrl_a_quote_shows_list() {
         let (_, _, action) = run_from(EscapeState::Normal, &[0x01, b'"']);
         assert!(matches!(action, Some(InputAction::ShowList)));
+    }
+
+    #[test]
+    fn ctrl_a_s_shows_scrollback() {
+        let (_, bytes, action) = run_from(EscapeState::Normal, &[0x01, b's']);
+        assert!(matches!(action, Some(InputAction::ShowScrollback)));
+        assert!(bytes.is_empty());
     }
 
     #[test]

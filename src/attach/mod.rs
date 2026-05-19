@@ -13,6 +13,7 @@ pub(super) enum InputAction {
     SwitchNext,
     SwitchIndex(u8),
     ShowList,
+    ShowScrollback,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -477,6 +478,8 @@ pub async fn run(
                             }
                         }
                     }
+
+                    InputAction::ShowScrollback => {}
                 }
             }
         }
