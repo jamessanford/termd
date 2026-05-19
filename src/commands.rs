@@ -220,13 +220,23 @@ pub async fn handle_refresh(registry: &PtyRegistry, req: RefreshRequest) -> Term
     }
 }
 
-pub async fn handle_scrollback(registry: &PtyRegistry, req: ScrollbackRequest) -> TerminalResponse {
+pub async fn handle_scrollback(
+    registry: &PtyRegistry,
+    req: ScrollbackRequest,
+) -> TerminalResponse {
     let id = req.pty_id.clone();
     match registry.get(&id) {
         None => err_response(id, "PTY not found".into()),
-        Some(h) => {
-            let _ = (h, req.row_offset, req.row_count);
-            err_response(id, "scrollback not yet implemented".into())
+        Some(h) => match h.scrollback(req.row_offset, req.row_count).await {
+            Ok(data) => TerminalResponse {
+                response: Some(Response::Scrollback(ScrollbackResponse {
+                    pty_id:                id,
+                    generation:            data.generation,
+                    data:                  data.data.to_vec(),
+                    total_scrollback_rows: data.total_scrollback_rows,
+                })),
+            },
+            Err(e) => err_response(id, e.to_string()),
         },
     }
 }
