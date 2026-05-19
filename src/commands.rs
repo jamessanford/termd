@@ -224,8 +224,8 @@ pub async fn handle_scrollback(registry: &PtyRegistry, req: ScrollbackRequest) -
     let id = req.pty_id.clone();
     match registry.get(&id) {
         None => err_response(id, "PTY not found".into()),
-        Some(_h) => {
-            // TODO: Implement scrollback retrieval from PTY history
+        Some(h) => {
+            let _ = (h, req.row_offset, req.row_count);
             err_response(id, "scrollback not yet implemented".into())
         },
     }

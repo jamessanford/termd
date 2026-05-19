@@ -79,6 +79,7 @@ pub struct RefreshData {
     pub cursor_y: u32,
 }
 
+// pty_id is not included — callers supply it directly from the request (see RefreshData).
 pub struct ScrollbackData {
     pub generation: u64,
     pub data: Bytes,
