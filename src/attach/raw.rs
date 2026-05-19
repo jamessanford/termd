@@ -24,7 +24,6 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
     stdout.flush().await?;
 
     let mut sigwinch = signal(SignalKind::window_change())?;
-    let mut server_closed = false;
 
     loop {
         tokio::select! {
@@ -49,13 +48,12 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                                 let _ = stdout.write_all(b"\x1b[2J").await;
                                 let _ = stdout.flush().await;
                             } else if m.reason == StreamMetadataReason::Closed as i32 {
-                                server_closed = true;
                                 break;
                             }
                         }
                         _ => {}
                     },
-                    _ => { server_closed = true; break; }
+                    _ => { break; }
                 }
             }
             action = action_rx.recv() => {

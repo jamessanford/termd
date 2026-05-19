@@ -36,7 +36,6 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
     stdout.flush().await?;
 
     let mut sigwinch = signal(SignalKind::window_change())?;
-    let mut server_closed = false;
 
     loop {
         out.clear();
@@ -59,13 +58,12 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                                     }
                                 }
                             } else if m.reason == StreamMetadataReason::Closed as i32 {
-                                server_closed = true;
                                 break;
                             }
                         }
                         _ => {}
                     },
-                    _ => { server_closed = true; break; }
+                    _ => { break; }
                 }
             }
             action = action_rx.recv() => {
