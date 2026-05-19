@@ -53,7 +53,7 @@ pub(super) enum RunOutcome {
 
 use termd::proto::{
     terminal_command::Command, terminal_response::Response,
-    PtyItem, RefreshRequest, SubscribeRequest, TerminalCommand, WriteRequest,
+    PtyItem, RefreshRequest, SubscribeRequest, TerminalCommand,
     StreamMetadataReason,
     terminal_service_client::TerminalServiceClient,
 };
@@ -184,7 +184,9 @@ pub async fn run(
     // Enter raw terminal mode; guard restores settings on any exit path
     let _guard = setup_raw_mode()?;
 
-    // Spawn stdin forwarder; action_rx receives InputAction when an escape sequence fires
+    // Spawn stdin forwarder; action_rx receives InputAction when an escape sequence fires.
+    // _action_rx dropped here; render modes still use the old shutdown_rx oneshot
+    // until Task 2 replaces RunContext.shutdown_rx with action_rx.
     let (action_tx, _action_rx) = mpsc::channel::<InputAction>(4);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let _ = shutdown_tx; // will be removed in Task 2
