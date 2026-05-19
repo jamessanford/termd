@@ -96,8 +96,9 @@ pub struct PtyHandle {
     title: Arc<Mutex<String>>,
     tx: broadcast::Sender<Arc<PtyChunk>>,
     writer: Mutex<File>,
-    refresh_tx: std::sync::mpsc::SyncSender<oneshot::Sender<Result<RefreshData>>>,
-    resize_tx: std::sync::mpsc::SyncSender<(u32, u32)>,
+    refresh_tx:    std::sync::mpsc::SyncSender<oneshot::Sender<Result<RefreshData>>>,
+    scrollback_tx: std::sync::mpsc::SyncSender<(u32, u32, oneshot::Sender<Result<ScrollbackData>>)>,
+    resize_tx:     std::sync::mpsc::SyncSender<(u32, u32)>,
     meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
     generation: Arc<AtomicU64>,
     child_pid: Pid,
@@ -181,6 +182,18 @@ impl PtyHandle {
             tracing::debug!("wakeup write failed: {}", std::io::Error::last_os_error());
         }
         rx.await.map_err(|_| anyhow!("PTY reader thread dropped refresh response"))?
+    }
+
+    pub async fn scrollback(&self, row_offset: u32, row_count: u32) -> Result<ScrollbackData> {
+        let (tx, rx) = oneshot::channel();
+        self.scrollback_tx.send((row_offset, row_count, tx))
+            .map_err(|_| anyhow!("PTY reader thread is dead"))?;
+        let wfd = self.wakeup_write.as_raw_fd();
+        let ret = unsafe { libc::write(wfd, [1u8].as_ptr() as *const libc::c_void, 1) };
+        if ret < 0 {
+            tracing::debug!("wakeup write failed: {}", std::io::Error::last_os_error());
+        }
+        rx.await.map_err(|_| anyhow!("PTY reader thread dropped scrollback response"))?
     }
 
     pub fn id(&self) -> &str {
@@ -294,6 +307,8 @@ impl PtyRegistry {
         let (meta_tx, _) = broadcast::channel::<Arc<PtyMetadata>>(64);
         let (refresh_tx, refresh_rx) =
             std::sync::mpsc::sync_channel::<oneshot::Sender<Result<RefreshData>>>(8);
+        let (scrollback_tx, scrollback_rx) =
+            std::sync::mpsc::sync_channel::<(u32, u32, oneshot::Sender<Result<ScrollbackData>>)>(8);
         let (resize_tx, resize_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(8);
         let generation = Arc::new(AtomicU64::new(0));
 
@@ -330,6 +345,7 @@ impl PtyRegistry {
             tx: tx.clone(),
             writer: Mutex::new(unsafe { File::from_raw_fd(master_fd) }),
             refresh_tx,
+            scrollback_tx,
             resize_tx,
             meta_tx: meta_tx.clone(),
             generation: generation.clone(),
@@ -343,7 +359,7 @@ impl PtyRegistry {
         std::thread::Builder::new()
             .name(format!("pty-reader-{id}"))
             .spawn(move || reader_thread(
-                master_reader, tx, generation, refresh_rx, resize_rx, wakeup_read,
+                master_reader, tx, generation, refresh_rx, scrollback_rx, resize_rx, wakeup_read,
                 child, title_for_thread, cols, rows,
                 meta_tx_for_thread, id_for_thread, hostname_for_thread,
                 pts_name_for_thread, created_at,
@@ -456,6 +472,7 @@ fn reader_thread(
     tx: broadcast::Sender<Arc<PtyChunk>>,
     generation: Arc<AtomicU64>,
     refresh_rx: std::sync::mpsc::Receiver<oneshot::Sender<Result<RefreshData>>>,
+    _scrollback_rx: std::sync::mpsc::Receiver<(u32, u32, oneshot::Sender<Result<ScrollbackData>>)>,
     resize_rx: std::sync::mpsc::Receiver<(u32, u32)>,
     wakeup_read: OwnedFd,
     mut child: std::process::Child,
