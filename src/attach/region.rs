@@ -301,6 +301,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
     let mut sigwinch = signal(SignalKind::window_change())?;
     // Set to Some when region mode needs to hand off to cell mode.
     let mut fallback_ctx: Option<super::RunContext> = None;
+    let mut pty_closed = false;
 
     loop {
         out.clear();
@@ -344,7 +345,10 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                                     }
                                 }
                             } else if m.reason == StreamMetadataReason::Closed as i32 {
-                                break;
+                                if !pty_closed {
+                                    pty_closed = true;
+                                    eprint!("\r\n[PTY closed]\r\n");
+                                }
                             }
                         }
                         _ => {}
