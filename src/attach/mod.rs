@@ -376,6 +376,7 @@ pub async fn run(
         };
 
         input_task.abort();
+        let _ = input_task.await; // synchronize: ensure run_stdin has stopped reading stdin
 
         match outcome {
             RunOutcome::ServerClosed => {
