@@ -504,18 +504,24 @@ fn do_scrollback(
         },
     };
 
-    // Optimization: full-buffer dump avoids the expensive grid_ref page-list traversal.
+    // Full-buffer case: use Point::History endpoints to restrict output to scrollback only.
+    // (selection: None would include the active screen — incorrect for a scrollback request.)
     // NOTE: grid_ref(Point::History(...)) traverses the internal scrollback page list to
-    // locate the target row, which is O(scrollback_depth). For partial ranges this is
-    // required; for the full-buffer case we skip it by passing selection: None to the
-    // Formatter. If scrollback requests become a latency concern (do_scrollback runs on
-    // the reader thread, blocking live PTY I/O), consider offloading to a background thread.
+    // locate the target row, which is O(scrollback_depth). If scrollback requests become a
+    // latency concern (do_scrollback runs on the reader thread, blocking live PTY I/O),
+    // consider offloading to a background thread.
     if row_offset == 0 && row_count >= total {
+        let top_left = terminal.grid_ref(Point::History(PointCoordinate { x: 0, y: 0 }))?;
+        let bot_right = terminal.grid_ref(Point::History(PointCoordinate {
+            x: cols.saturating_sub(1) as u16,
+            y: total - 1,
+        }))?;
+        let selection = Selection { start: top_left, end: bot_right, rectangle: false };
         let mut fmt = Formatter::new(terminal, FormatterOptions {
             format: Format::Vt,
             trim: false,
             unwrap: false,
-            selection: None,
+            selection: Some(selection),
             extra: make_extra(),
         })?;
         let vt = fmt.format_alloc(None)?;
