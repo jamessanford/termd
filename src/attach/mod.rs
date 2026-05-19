@@ -35,20 +35,21 @@ pub(crate) struct RunContext {
     pub refresh_gen:   u64,
     pub refresh_bytes: Vec<u8>,
     pub buffered:      Vec<(u64, Vec<u8>)>,
-    pub shutdown_rx:   tokio::sync::oneshot::Receiver<()>,
+    pub action_rx:     tokio::sync::mpsc::Receiver<InputAction>,
 }
 
 /// Outcome returned by every render-mode runner.
 pub(super) enum RunOutcome {
     /// The server PTY exited or closed.
     ServerClosed,
-    /// The client disconnected (stdin EOF or `~.` escape).
-    ClientDisconnected,
     /// Region mode detected it can no longer handle current dimensions.
     /// `refresh_bytes` is empty — this relies on the server sending a
     /// refresh following a resize event. That holds for resize-triggered
     /// fallbacks but would not hold for arbitrary render-mode changes.
     FallbackToCell(RunContext),
+    /// An input action was received; the render mode returns the context
+    /// so the outer session loop can handle PTY switching.
+    Action(InputAction, RunContext),
 }
 
 use termd::proto::{
@@ -185,11 +186,7 @@ pub async fn run(
     let _guard = setup_raw_mode()?;
 
     // Spawn stdin forwarder; action_rx receives InputAction when an escape sequence fires.
-    // _action_rx dropped here; render modes still use the old shutdown_rx oneshot
-    // until Task 2 replaces RunContext.shutdown_rx with action_rx.
-    let (action_tx, _action_rx) = mpsc::channel::<InputAction>(4);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let _ = shutdown_tx; // will be removed in Task 2
+    let (action_tx, action_rx) = mpsc::channel::<InputAction>(4);
     let stdin_task = tokio::spawn(input::run_stdin(cmd_tx.clone(), action_tx, pty_id.clone()));
 
     let ctx = RunContext {
@@ -200,7 +197,7 @@ pub async fn run(
         refresh_gen,
         refresh_bytes,
         buffered,
-        shutdown_rx,
+        action_rx,
     };
 
     let mut dispatch_mode = mode;
@@ -216,6 +213,11 @@ pub async fn run(
             RunOutcome::FallbackToCell(fallback_ctx) => {
                 dispatch_mode = RenderMode::Cell;
                 dispatch_ctx = fallback_ctx;
+            }
+            RunOutcome::Action(_, fallback_ctx) => {
+                // For now, treat any action as detach (Task 3 will handle routing).
+                drop(fallback_ctx);
+                break RunOutcome::ServerClosed;
             }
             other => break other,
         }

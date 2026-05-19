@@ -283,7 +283,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
 
     let super::RunContext {
         mut resp_rx, cmd_tx, pty_id, mut item,
-        refresh_gen, refresh_bytes, buffered, mut shutdown_rx,
+        refresh_gen, refresh_bytes, buffered, mut action_rx,
     } = ctx;
 
     let mut filter = VtFilter::new(server_rows, server_cols, client_rows, client_cols);
@@ -342,7 +342,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                                                 refresh_gen: 0, // zero so cell mode accepts the server's next Refresh
                                                 refresh_bytes: vec![],
                                                 buffered: vec![],
-                                                shutdown_rx,
+                                                action_rx,
                                             });
                                             break;
                                         }
@@ -360,7 +360,21 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                     _ => { server_closed = true; break; }
                 }
             }
-            _ = &mut shutdown_rx => break,
+            action = action_rx.recv() => {
+                let action = action.unwrap_or(super::InputAction::Detach);
+                // Restore client terminal margins before handing back context.
+                let _ = stdout.write_all(b"\x1b[r").await;
+                if filter.declrmm_active {
+                    let _ = stdout.write_all(b"\x1b[?69l").await;
+                }
+                let _ = stdout.flush().await;
+                return Ok(super::RunOutcome::Action(action, super::RunContext {
+                    resp_rx, cmd_tx, pty_id, item,
+                    refresh_gen: current_refresh_gen,
+                    refresh_bytes: vec![], buffered: vec![],
+                    action_rx,
+                }));
+            }
             _ = sigwinch.recv() => {
                 let (new_cols, new_rows) = get_terminal_size();
                 if new_rows < filter.server_rows || new_cols < filter.server_cols {
@@ -374,7 +388,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                         refresh_gen: 0, // zero so cell mode accepts the server's next Refresh
                         refresh_bytes: vec![],
                         buffered: vec![],
-                        shutdown_rx,
+                        action_rx,
                     });
                     break;
                 }
@@ -398,7 +412,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
     if let Some(ctx) = fallback_ctx {
         return Ok(super::RunOutcome::FallbackToCell(ctx));
     }
-    Ok(if server_closed { super::RunOutcome::ServerClosed } else { super::RunOutcome::ClientDisconnected })
+    Ok(super::RunOutcome::ServerClosed)
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────

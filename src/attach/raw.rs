@@ -10,7 +10,7 @@ use termd::proto::{
 };
 
 pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
-    let super::RunContext { mut resp_rx, cmd_tx, pty_id, mut refresh_gen, refresh_bytes, buffered, mut shutdown_rx, .. } = ctx;
+    let super::RunContext { mut resp_rx, cmd_tx, pty_id, item, mut refresh_gen, refresh_bytes, buffered, mut action_rx } = ctx;
 
     let mut stdout = tokio::io::stdout();
 
@@ -58,7 +58,14 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                     _ => { server_closed = true; break; }
                 }
             }
-            _ = &mut shutdown_rx => break,
+            action = action_rx.recv() => {
+                let action = action.unwrap_or(super::InputAction::Detach);
+                return Ok(super::RunOutcome::Action(action, super::RunContext {
+                    resp_rx, cmd_tx, pty_id, item,
+                    refresh_gen, refresh_bytes: vec![], buffered: vec![],
+                    action_rx,
+                }));
+            }
             _ = sigwinch.recv() => {
                 // Request a fresh screen dump from the server; response arrives as Response::Refresh above
                 let _ = cmd_tx.send(TerminalCommand {
@@ -68,5 +75,5 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
         }
     }
 
-    Ok(if server_closed { super::RunOutcome::ServerClosed } else { super::RunOutcome::ClientDisconnected })
+    Ok(super::RunOutcome::ServerClosed)
 }

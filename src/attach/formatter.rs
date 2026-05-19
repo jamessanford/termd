@@ -14,7 +14,7 @@ use termd::proto::{
 };
 
 pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
-    let super::RunContext { mut resp_rx, item, refresh_gen, refresh_bytes, buffered, mut shutdown_rx, .. } = ctx;
+    let super::RunContext { mut resp_rx, cmd_tx, pty_id, item, refresh_gen, refresh_bytes, buffered, mut action_rx } = ctx;
 
     let mut lt = super::LocalTerminal::new(item.cols, item.rows)?;
     lt.terminal.vt_write(&refresh_bytes);
@@ -68,7 +68,14 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                     _ => { server_closed = true; break; }
                 }
             }
-            _ = &mut shutdown_rx => break,
+            action = action_rx.recv() => {
+                let action = action.unwrap_or(super::InputAction::Detach);
+                return Ok(super::RunOutcome::Action(action, super::RunContext {
+                    resp_rx, cmd_tx, pty_id, item,
+                    refresh_gen, refresh_bytes: vec![], buffered: vec![],
+                    action_rx,
+                }));
+            }
             _ = sigwinch.recv() => {
                 render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
             }
@@ -79,7 +86,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
         }
     }
 
-    Ok(if server_closed { super::RunOutcome::ServerClosed } else { super::RunOutcome::ClientDisconnected })
+    Ok(super::RunOutcome::ServerClosed)
 }
 
 fn render_dirty(
