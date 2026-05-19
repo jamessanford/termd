@@ -295,19 +295,26 @@ pub async fn run(
                             match resp_rx.message().await? {
                                 None => { eprintln!("[server disconnected]"); break 'session; }
                                 Some(r) => if let Some(Response::Create(cr)) = r.response {
-                                    if let Some(new_item) = cr.item {
-                                        let _ = cmd_tx.send(TerminalCommand {
-                                            command: Some(Command::Unsubscribe(
-                                                UnsubscribeRequest { pty_id: current_pty_id.clone() }
-                                            )),
-                                        }).await;
-                                        current_pty_id = new_item.pty_id.clone();
-                                        current_item = new_item;
-                                        break 'create;
+                                    match cr.item {
+                                        Some(new_item) => {
+                                            let _ = cmd_tx.send(TerminalCommand {
+                                                command: Some(Command::Unsubscribe(
+                                                    UnsubscribeRequest { pty_id: current_pty_id.clone() }
+                                                )),
+                                            }).await;
+                                            current_pty_id = new_item.pty_id.clone();
+                                            current_item = new_item;
+                                            break 'create;
+                                        }
+                                        None => {
+                                            eprintln!("[server returned Create with no item]");
+                                            break 'session;
+                                        }
                                     }
                                 }
                             }
                         }
+                        pty_list.clear();
                     }
 
                     InputAction::SwitchNext => {
