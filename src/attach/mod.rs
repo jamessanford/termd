@@ -203,6 +203,12 @@ fn next_pty<'a>(list: &'a [PtyItem], current_id: &str) -> Option<&'a PtyItem> {
     Some(&list[(pos + 1) % list.len()])
 }
 
+fn clear_screen() {
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(b"\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
+}
+
 fn draw_list(items: &[PtyItem], selected: usize) {
     use std::io::Write;
     let mut out = Vec::new();
@@ -210,10 +216,12 @@ fn draw_list(items: &[PtyItem], selected: usize) {
     for (i, item) in items.iter().enumerate() {
         if i == selected { out.extend_from_slice(b"\x1b[7m"); }
         let title = if item.title.is_empty() { &item.pts_name } else { &item.title };
+        let pty_id_trunc: String = item.pty_id.chars().take(16).collect();
+        let title_trunc: String = title.chars().take(32).collect();
         let line = format!(
             " {:<16}  {:<32}  {}x{}\r\n",
-            &item.pty_id[..item.pty_id.len().min(16)],
-            &title[..title.len().min(32)],
+            pty_id_trunc,
+            title_trunc,
             item.cols, item.rows,
         );
         out.extend_from_slice(line.as_bytes());
@@ -256,6 +264,7 @@ async fn show_list(
         match &buf[..n] {
             // Enter — select
             [b'\r'] | [b'\n'] => {
+                clear_screen();
                 return Ok(Some(pty_list[selected].pty_id.clone()));
             }
             // Arrow keys arrive as 3-byte ESC sequences; match the whole read
@@ -289,6 +298,7 @@ async fn show_list(
                     draw_list(pty_list, selected);
                 } else {
                     // Bare escape — cancel
+                    clear_screen();
                     return Ok(None);
                 }
             }
@@ -456,8 +466,9 @@ pub async fn run(
                                 // Look up item from list so current_item has correct cols/rows.
                                 if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
                                     current_item = target;
+                                    current_pty_id = new_id;
+                                    pty_list.clear();
                                 }
-                                current_pty_id = new_id;
                             }
                             _ => {
                                 // Cancel or selected same PTY — skip resubscribe, just refresh.
