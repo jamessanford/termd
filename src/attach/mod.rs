@@ -468,6 +468,7 @@ pub async fn run(
                 None => {
                     // PTY reader is dead (closed PTY) — enter with empty state so
                     // the user can still use ^A commands to switch or create.
+                    clear_screen();
                     eprint!("\r\n[PTY closed]\r\n");
                     (0, vec![], vec![])
                 }
@@ -568,7 +569,7 @@ pub async fn run(
                         }).await?;
                         'create: loop {
                             match resp_rx.message().await? {
-                                None => { eprintln!("[server disconnected]"); break 'session; }
+                                None => { move_terminal_end(); eprintln!("[server disconnected]"); break 'session; }
                                 Some(r) => if let Some(Response::Create(cr)) = r.response {
                                     match cr.item {
                                         Some(new_item) => {

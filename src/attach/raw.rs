@@ -51,6 +51,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                             } else if m.reason == StreamMetadataReason::Closed as i32 {
                                 if !pty_closed {
                                     pty_closed = true;
+                                    super::move_terminal_end();
                                     eprint!("\r\n[PTY closed]\r\n");
                                 }
                             }
