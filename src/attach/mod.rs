@@ -159,11 +159,13 @@ async fn subscribe(
     }
 }
 
+// Returns Ok(None) if the server returned an error for this PTY (e.g. reader thread dead).
+// Returns Ok(Some(...)) on success. Returns Err on transport failure.
 async fn request_refresh(
     cmd_tx:  &mpsc::Sender<TerminalCommand>,
     resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
     pty_id:  &str,
-) -> anyhow::Result<(u64, Vec<u8>, Vec<(u64, Vec<u8>)>)> {
+) -> anyhow::Result<Option<(u64, Vec<u8>, Vec<(u64, Vec<u8>)>)>> {
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Refresh(RefreshRequest { pty_id: pty_id.to_owned() })),
     }).await?;
@@ -172,8 +174,9 @@ async fn request_refresh(
         match resp_rx.message().await? {
             None => anyhow::bail!("server disconnected during refresh"),
             Some(r) => match r.response {
-                Some(Response::Refresh(rf)) => return Ok((rf.generation, rf.data, buffered)),
+                Some(Response::Refresh(rf)) => return Ok(Some((rf.generation, rf.data, buffered))),
                 Some(Response::Stream(s))   => buffered.push((s.generation, s.data)),
+                Some(Response::Command(c)) if !c.success => return Ok(None),
                 _ => {}
             }
         }
@@ -339,7 +342,15 @@ pub async fn run(
         should_subscribe = true;
 
         let (refresh_gen, refresh_bytes, buffered) =
-            request_refresh(&cmd_tx, &mut resp_rx, &current_pty_id).await?;
+            match request_refresh(&cmd_tx, &mut resp_rx, &current_pty_id).await? {
+                Some(triple) => triple,
+                None => {
+                    // PTY reader is dead (closed PTY) — enter with empty state so
+                    // the user can still use ^A commands to switch or create.
+                    eprint!("\r\n[PTY closed]\r\n");
+                    (0, vec![], vec![])
+                }
+            };
 
         let (action_tx, action_rx) = mpsc::channel::<InputAction>(4);
         let input_task = tokio::spawn(input::run_stdin(
