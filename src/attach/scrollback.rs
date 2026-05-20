@@ -17,6 +17,20 @@ pub(super) async fn show_scrollback(
     pty_id:  &str,
     rows:    u32,
 ) -> Result<()> {
+    if let Err(e) = run_scrollback(cmd_tx, resp_rx, pty_id, rows).await {
+        super::show_error(&e.to_string()).await;
+    }
+    let _ = std::io::stdout().write_all(b"\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+async fn run_scrollback(
+    cmd_tx:  &mpsc::Sender<TerminalCommand>,
+    resp_rx: &mut tonic::Streaming<TerminalResponse>,
+    pty_id:  &str,
+    rows:    u32,
+) -> Result<()> {
     let mut row_offset: u32 = 0;
     let mut stdin = tokio::io::stdin();
     let mut buf = [0u8; 8];
@@ -30,8 +44,6 @@ pub(super) async fn show_scrollback(
         );
         let _ = std::io::stdout().flush();
         let _ = stdin.read(&mut buf).await;
-        let _ = std::io::stdout().write_all(b"\x1b[2J\x1b[H");
-        let _ = std::io::stdout().flush();
         return Ok(());
     }
 
@@ -108,8 +120,6 @@ pub(super) async fn show_scrollback(
         }
     }
 
-    let _ = std::io::stdout().write_all(b"\x1b[2J\x1b[H");
-    let _ = std::io::stdout().flush();
     Ok(())
 }
 

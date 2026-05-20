@@ -131,6 +131,13 @@ fn setup_raw_mode() -> Result<TerminalGuard> {
 }
 
 
+pub(super) async fn show_error(msg: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(format!("\r\n[Error: {msg}]\r\n").as_bytes());
+    let _ = std::io::stderr().flush();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+}
+
 pub(super) fn get_terminal_size() -> (u32, u32) {
     let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
     unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws); }
