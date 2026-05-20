@@ -582,6 +582,18 @@ pub async fn run(
         }
     }
 
+    // Restore terminal state before returning: disable mouse modes, show cursor, reset SGR,
+    // and move to the last row so the shell prompt appears below the PTY content.
+    {
+        use std::io::Write;
+        let (_, rows) = get_terminal_size();
+        let _ = std::io::stdout().write_all(
+            format!("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[0m\x1b[{rows};1H\r\n")
+                .as_bytes()
+        );
+        let _ = std::io::stdout().flush();
+    }
+
     drop(_guard);
     Ok(())
 }

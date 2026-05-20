@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use libghostty_vt::{Terminal, TerminalOptions, ffi};
+use libghostty_vt::{Terminal, TerminalOptions, RenderState, ffi};
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
 use libghostty_vt::screen::{Screen, Selection};
 use libghostty_vt::terminal::{Point, PointCoordinate};
@@ -412,6 +412,13 @@ fn do_refresh(
     let cursor_x = terminal.cursor_x().unwrap_or(0) as u32;
     let cursor_y = terminal.cursor_y().unwrap_or(0) as u32;
 
+    // Snapshot cursor visibility; formatter modes:true may not emit ?25h for the default-visible
+    // case, so we emit it explicitly at the end to guarantee correct state after a PTY switch.
+    let cursor_visible = {
+        let mut rs = RenderState::new()?;
+        rs.update(terminal)?.cursor_visible().unwrap_or(true)
+    };
+
     // Restrict to the active screen — the server terminal has scrollback and we don't want it.
     // Point::Active resolves within the visible grid only, ignoring history rows.
     let top_left = terminal.grid_ref(Point::Active(PointCoordinate { x: 0, y: 0 }))?;
@@ -449,14 +456,24 @@ fn do_refresh(
     })?;
 
     let mut out: Vec<u8> = Vec::new();
-    // Soft reset (DECSTR) + clear screen + cursor home.
-    // DECSTR resets cursor visibility to the default (visible); modes:true in the formatter
-    // then re-emits ?25l if the server app has the cursor hidden.  No need to hide here —
-    // the formatter output is sent as one blob so there is no per-character cursor flicker.
-    out.extend_from_slice(b"\x1b[!p\x1b[2J\x1b[H");
+    // Soft reset (DECSTR) + explicit mouse-mode disables + clear screen + cursor home.
+    // DECSTR alone does not reliably disable mouse-reporting modes on all terminals, so we
+    // disable them explicitly before the formatter re-enables whatever the server PTY has set
+    // (via modes:true).  The formatter output is sent as one blob, so no cursor flicker.
+    out.extend_from_slice(b"\x1b[!p");
+    out.extend_from_slice(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+    out.extend_from_slice(b"\x1b[2J\x1b[H");
     let vt = fmt.format_alloc(None)?;
     out.extend_from_slice(&vt);
     out.extend_from_slice(b"\x1b[0m"); // trailing SGR reset
+    // Explicit cursor visibility — formatter modes:true may not emit ?25h when cursor is visible
+    // (treating it as the default, no-op), which leaves the cursor hidden after a switch from a
+    // PTY that had it hidden.
+    if cursor_visible {
+        out.extend_from_slice(b"\x1b[?25h");
+    } else {
+        out.extend_from_slice(b"\x1b[?25l");
+    }
 
     Ok(RefreshData {
         generation,
