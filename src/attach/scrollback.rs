@@ -115,6 +115,9 @@ async fn fetch_scrollback(
             Some(r) => match r.response {
                 Some(Response::Scrollback(s)) => return Ok(s),
                 Some(Response::Stream(_)) => {}
+                Some(Response::Command(c)) if !c.success => {
+                    anyhow::bail!("scrollback error: {}", c.error.unwrap_or_default())
+                }
                 _ => {}
             }
         }
