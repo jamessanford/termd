@@ -252,7 +252,10 @@ async fn show_list(
     // Returns Some(new_pty_id) on selection, None on cancel.
     use tokio::io::AsyncReadExt;
 
-    fetch_list(cmd_tx, resp_rx, pty_list).await?;
+    if let Err(e) = fetch_list(cmd_tx, resp_rx, pty_list).await {
+        show_error(&e.to_string()).await;
+        return Ok(None);
+    }
     if pty_list.is_empty() {
         return Ok(None);
     }
@@ -444,7 +447,11 @@ pub async fn run(
 
                     InputAction::SwitchNext => {
                         if pty_list.is_empty() {
-                            fetch_list(&cmd_tx, &mut resp_rx, &mut pty_list).await?;
+                            if let Err(e) = fetch_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                                show_error(&e.to_string()).await;
+                                should_subscribe = false;
+                                continue 'session;
+                            }
                         }
                         if let Some(target) = next_pty(&pty_list, &current_pty_id).cloned() {
                             if target.pty_id != current_pty_id {
@@ -461,7 +468,11 @@ pub async fn run(
 
                     InputAction::SwitchIndex(n) => {
                         if pty_list.is_empty() {
-                            fetch_list(&cmd_tx, &mut resp_rx, &mut pty_list).await?;
+                            if let Err(e) = fetch_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                                show_error(&e.to_string()).await;
+                                should_subscribe = false;
+                                continue 'session;
+                            }
                         }
                         if let Some(target) = pty_list.get(n as usize).cloned() {
                             if target.pty_id != current_pty_id {
