@@ -11,6 +11,9 @@ use termd::proto::{
     TerminalCommand, TerminalResponse,
 };
 
+// This is a fairly naive version of scrollback, more a proof of concept.
+// Right now the scrollback pages get "dumped" out to the screen, instead
+// of rendered (they probably need to go through cell/region formatters)
 pub(super) async fn show_scrollback(
     cmd_tx:  &mpsc::Sender<TerminalCommand>,
     resp_rx: &mut tonic::Streaming<TerminalResponse>,
