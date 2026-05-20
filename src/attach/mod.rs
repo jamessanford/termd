@@ -65,6 +65,7 @@ mod cell;
 mod formatter;
 mod raw;
 mod region;
+mod scrollback;
 
 type AuthedClient = TerminalServiceClient<
     tonic::service::interceptor::InterceptedService<
