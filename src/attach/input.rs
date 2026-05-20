@@ -43,6 +43,7 @@ pub(super) fn process_byte(
             }
         },
         EscapeState::AfterCtrlA => match byte {
+            0x00     => Some(InputAction::SwitchNext), // treat "C-a C-space" as "C-a space" (TODO: Use something like crossterm for input events, so that we can get structured input instead of having to parse ourselves)
             0x01     => Some(InputAction::SwitchRecent),
             b'a'     => { to_send.push(0x01); *state = EscapeState::Normal; None }
             b'c'     => Some(InputAction::Create),
