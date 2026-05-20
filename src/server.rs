@@ -60,7 +60,7 @@ async fn dispatch_command(
                 proto::CommandResponse {
                     pty_id: String::new(),
                     success: false,
-                    error: Some("empty command".into()),
+                    error: Some("unknown command".into()),
                 }
             )),
         },
