@@ -46,6 +46,8 @@ enum Cmd {
     List {
         #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
         socket: Option<PathBuf>,
+        #[arg(long, help = "Show subscribers for each PTY")]
+        verbose: bool,
     },
     /// Create a new PTY
     Create {
@@ -130,7 +132,7 @@ async fn main() -> Result<()> {
             server::serve(registry, &socket_path, tcp_addr, log_grpc).await?;
         }
 
-        Cmd::List { socket } => {
+        Cmd::List { socket, verbose } => {
             let mut client = connect_client(socket).await?;
             let resp = send_recv(&mut client, Command::List(ListRequest {})).await?;
             match resp.response {
@@ -144,6 +146,14 @@ async fn main() -> Result<()> {
                                 "{:<38} {:>5} {:>5}  {}",
                                 item.pty_id, item.cols, item.rows, item.title
                             );
+                            if verbose {
+                                for sub in &item.subscribers {
+                                    println!(
+                                        "  ( {:<36} {} {}x{} )",
+                                        sub.subscriber_id, sub.hostname, sub.cols, sub.rows
+                                    );
+                                }
+                            }
                         }
                     }
                 }
