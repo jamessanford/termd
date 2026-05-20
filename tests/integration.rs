@@ -455,13 +455,13 @@ async fn test_subscribe_receives_closed_metadata() {
         .into_inner();
 
     cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id.clone() })),
+        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id.clone(), ..Default::default() })),
     }).await.unwrap();
 
     // Wait for subscribe ack
     loop {
         match resp_stream.message().await.unwrap().unwrap().response.unwrap() {
-            Response::Command(c) if c.success => break,
+            Response::Subscribe(s) if s.success => break,
             _ => {}
         }
     }
@@ -520,13 +520,13 @@ async fn test_resize_via_grpc_delivers_metadata() {
         .into_inner();
 
     cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id.clone() })),
+        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id.clone(), ..Default::default() })),
     }).await.unwrap();
 
     // Drain until subscribe ack
     loop {
         match resp_stream.message().await.unwrap().unwrap().response.unwrap() {
-            Response::Command(c) if c.success => break,
+            Response::Subscribe(s) if s.success => break,
             _ => {}
         }
     }
@@ -562,6 +562,164 @@ async fn test_resize_via_grpc_delivers_metadata() {
     .unwrap_or(false);
 
     assert!(found, "resize command should deliver StreamMetadata::Resize to subscriber");
+}
+
+#[tokio::test]
+async fn test_subscribe_returns_subscriber_id() {
+    use termd::proto::{
+        terminal_command::Command, terminal_response::Response,
+        TerminalCommand, SubscribeRequest,
+    };
+
+    let (_dir, mut client) = test_server().await;
+
+    let resp = send_recv(&mut client, Command::Create(CreateRequest {
+        cols: 80, rows: 24, command: None,
+    })).await;
+    let pty_id = match resp.response.unwrap() {
+        Response::Create(c) => c.item.unwrap().pty_id,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
+    let mut resp_stream = client
+        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx))
+        .await.unwrap().into_inner();
+
+    cmd_tx.send(TerminalCommand {
+        command: Some(Command::Subscribe(SubscribeRequest {
+            pty_id:   pty_id.clone(),
+            hostname: "tester".into(),
+            cols:     80,
+            rows:     24,
+        })),
+    }).await.unwrap();
+
+    loop {
+        match resp_stream.message().await.unwrap().unwrap().response.unwrap() {
+            Response::Subscribe(s) => {
+                assert!(s.success, "subscribe should succeed");
+                assert!(!s.subscriber_id.is_empty(), "subscriber_id must not be empty");
+                assert_eq!(s.pty_id, pty_id, "subscribe ack should reference the correct PTY");
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_list_shows_subscribers() {
+    use termd::proto::{
+        terminal_command::Command, terminal_response::Response,
+        TerminalCommand, SubscribeRequest,
+    };
+
+    let (_dir, mut client) = test_server().await;
+
+    let resp = send_recv(&mut client, Command::Create(CreateRequest {
+        cols: 80, rows: 24, command: None,
+    })).await;
+    let pty_id = match resp.response.unwrap() {
+        Response::Create(c) => c.item.unwrap().pty_id,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    // Subscribe
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
+    let mut resp_stream = client
+        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx))
+        .await.unwrap().into_inner();
+
+    cmd_tx.send(TerminalCommand {
+        command: Some(Command::Subscribe(SubscribeRequest {
+            pty_id:   pty_id.clone(),
+            hostname: "tester".into(),
+            cols:     80,
+            rows:     24,
+        })),
+    }).await.unwrap();
+
+    // Wait for subscribe ack and capture subscriber_id
+    let subscriber_id = loop {
+        match resp_stream.message().await.unwrap().unwrap().response.unwrap() {
+            Response::Subscribe(s) if s.success => break s.subscriber_id,
+            _ => {}
+        }
+    };
+
+    // List via a new single-shot stream
+    let resp = send_recv(&mut client, Command::List(ListRequest {})).await;
+    match resp.response.unwrap() {
+        Response::List(l) => {
+            let item = l.items.iter().find(|i| i.pty_id == pty_id)
+                .expect("PTY not found in list");
+            assert_eq!(item.subscribers.len(), 1, "expected 1 subscriber");
+            assert_eq!(item.subscribers[0].hostname, "tester");
+            assert_eq!(item.subscribers[0].cols, 80);
+            assert_eq!(item.subscribers[0].rows, 24);
+            assert_eq!(item.subscribers[0].subscriber_id, subscriber_id,
+                "subscriber_id in list should match the one returned by Subscribe");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_disconnect_removes_subscriber() {
+    use termd::proto::{
+        terminal_command::Command, terminal_response::Response,
+        TerminalCommand, SubscribeRequest,
+    };
+
+    let (_dir, mut client) = test_server().await;
+
+    let resp = send_recv(&mut client, Command::Create(CreateRequest {
+        cols: 80, rows: 24, command: None,
+    })).await;
+    let pty_id = match resp.response.unwrap() {
+        Response::Create(c) => c.item.unwrap().pty_id,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    // Subscribe, wait for ack, then drop the stream (disconnect)
+    {
+        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
+        let mut sub_stream = client
+            .stream(tokio_stream::wrappers::ReceiverStream::new(sub_rx))
+            .await.unwrap().into_inner();
+
+        sub_tx.send(TerminalCommand {
+            command: Some(Command::Subscribe(SubscribeRequest {
+                pty_id:   pty_id.clone(),
+                hostname: "subscriber".into(),
+                cols:     80,
+                rows:     24,
+            })),
+        }).await.unwrap();
+
+        loop {
+            match sub_stream.message().await.unwrap().unwrap().response.unwrap() {
+                Response::Subscribe(s) if s.success => break,
+                _ => {}
+            }
+        }
+        // sub_tx and sub_stream drop here — client disconnect
+    }
+
+    // Poll until the subscriber list is empty or we time out
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let resp = send_recv(&mut client, Command::List(ListRequest {})).await;
+            if let Response::List(l) = resp.response.unwrap() {
+                let item = l.items.iter().find(|i| i.pty_id == pty_id);
+                if item.map(|i| i.subscribers.is_empty()).unwrap_or(false) {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("subscriber not removed within 5s");
 }
 
 #[test]
