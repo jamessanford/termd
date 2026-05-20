@@ -145,12 +145,6 @@ pub(super) fn get_terminal_size() -> (u32, u32) {
     (ws.ws_col as u32, ws.ws_row as u32)
 }
 
-fn get_hostname() -> String {
-    hostname::get()
-        .map(|h| h.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "unknown".into())
-}
-
 // Disable any PTY-set terminal modes so client-side UI and new-PTY refreshes start clean.
 // Called on every renderer exit (before ShowList, PTY switch, etc.) and also at session exit
 // (where the caller appends the cursor-to-last-row tail).

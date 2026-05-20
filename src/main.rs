@@ -147,12 +147,7 @@ async fn main() -> Result<()> {
                                 item.pty_id, item.cols, item.rows, item.title
                             );
                             if verbose {
-                                for sub in &item.subscribers {
-                                    println!(
-                                        "  ( {:<36} {} {}x{} )",
-                                        sub.subscriber_id, sub.hostname, sub.cols, sub.rows
-                                    );
-                                }
+                                println!("TODO");
                             }
                         }
                     }

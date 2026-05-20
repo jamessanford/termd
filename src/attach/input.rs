@@ -47,6 +47,7 @@ pub(super) fn process_byte(
             0x01     => Some(InputAction::SwitchRecent),
             b'a'     => { to_send.push(0x01); *state = EscapeState::Normal; None }
             b'c'     => Some(InputAction::Create),
+            b'i'     => Some(InputAction::ShowInfo),
             b'F'     => Some(InputAction::ForceResize),
             b'"'     => Some(InputAction::ShowList),
             b's'     => Some(InputAction::ShowScrollback),
