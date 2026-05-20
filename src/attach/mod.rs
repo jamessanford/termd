@@ -212,6 +212,21 @@ async fn fetch_list(
     }
 }
 
+// Ensures pty_list is populated, fetching if needed. Returns false and shows
+// an error message if the fetch fails; the caller should continue 'session.
+async fn ensure_list(
+    cmd_tx:   &mpsc::Sender<TerminalCommand>,
+    resp_rx:  &mut tonic::Streaming<termd::proto::TerminalResponse>,
+    pty_list: &mut Vec<PtyItem>,
+) -> bool {
+    if !pty_list.is_empty() { return true; }
+    if let Err(e) = fetch_list(cmd_tx, resp_rx, pty_list).await {
+        show_error(&e.to_string()).await;
+        return false;
+    }
+    true
+}
+
 fn next_pty<'a>(list: &'a [PtyItem], current_id: &str) -> Option<&'a PtyItem> {
     if list.is_empty() { return None; }
     let pos = list.iter().position(|p| p.pty_id == current_id).unwrap_or(0);
@@ -222,6 +237,23 @@ fn prev_pty<'a>(list: &'a [PtyItem], current_id: &str) -> Option<&'a PtyItem> {
     if list.is_empty() { return None; }
     let pos = list.iter().position(|p| p.pty_id == current_id).unwrap_or(0);
     Some(&list[(pos + list.len() - 1) % list.len()])
+}
+
+// Unsubscribes from the current PTY, updates session state, and subscribes to new_item.
+async fn switch_pty(
+    cmd_tx:          &mpsc::Sender<TerminalCommand>,
+    current_pty_id:  &mut String,
+    current_item:    &mut PtyItem,
+    previous_pty_id: &mut Option<String>,
+    new_item:        PtyItem,
+) {
+    let _ = cmd_tx.send(TerminalCommand {
+        command: Some(Command::Unsubscribe(UnsubscribeRequest {
+            pty_id: current_pty_id.clone(),
+        })),
+    }).await;
+    *previous_pty_id = Some(std::mem::replace(current_pty_id, new_item.pty_id.clone()));
+    *current_item = new_item;
 }
 
 fn clear_screen() {
@@ -445,14 +477,7 @@ pub async fn run(
                                 Some(r) => if let Some(Response::Create(cr)) = r.response {
                                     match cr.item {
                                         Some(new_item) => {
-                                            let _ = cmd_tx.send(TerminalCommand {
-                                                command: Some(Command::Unsubscribe(
-                                                    UnsubscribeRequest { pty_id: current_pty_id.clone() }
-                                                )),
-                                            }).await;
-                                            previous_pty_id = Some(current_pty_id.clone());
-                                            current_pty_id = new_item.pty_id.clone();
-                                            current_item = new_item;
+                                            switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, new_item).await;
                                             break 'create;
                                         }
                                         None => {
@@ -467,57 +492,34 @@ pub async fn run(
                     }
 
                     InputAction::SwitchNext => {
-                        if pty_list.is_empty() {
-                            if let Err(e) = fetch_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
-                                show_error(&e.to_string()).await;
-                                should_subscribe = false;
-                                continue 'session;
-                            }
+                        if !ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                            should_subscribe = false;
+                            continue 'session;
                         }
                         if let Some(target) = next_pty(&pty_list, &current_pty_id).cloned() {
                             if target.pty_id != current_pty_id {
-                                let _ = cmd_tx.send(TerminalCommand {
-                                    command: Some(Command::Unsubscribe(
-                                        UnsubscribeRequest { pty_id: current_pty_id.clone() }
-                                    )),
-                                }).await;
-                                previous_pty_id = Some(current_pty_id.clone());
-                                current_pty_id = target.pty_id.clone();
-                                current_item = target;
+                                switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
                             }
                         }
                     }
 
                     InputAction::SwitchPrevious => {
-                        if pty_list.is_empty() {
-                            if let Err(e) = fetch_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
-                                show_error(&e.to_string()).await;
-                                should_subscribe = false;
-                                continue 'session;
-                            }
+                        if !ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                            should_subscribe = false;
+                            continue 'session;
                         }
                         if let Some(target) = prev_pty(&pty_list, &current_pty_id).cloned() {
                             if target.pty_id != current_pty_id {
-                                let _ = cmd_tx.send(TerminalCommand {
-                                    command: Some(Command::Unsubscribe(
-                                        UnsubscribeRequest { pty_id: current_pty_id.clone() }
-                                    )),
-                                }).await;
-                                previous_pty_id = Some(current_pty_id.clone());
-                                current_pty_id = target.pty_id.clone();
-                                current_item = target;
+                                switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
                             }
                         }
                     }
 
                     InputAction::SwitchRecent => {
                         if let Some(prev_id) = previous_pty_id.clone() {
-                            if pty_list.is_empty() {
-                                if let Err(e) = fetch_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
-                                    show_error(&e.to_string()).await;
-                                    should_subscribe = false;
-                                    continue 'session;
-                                }
+                            if !ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                                should_subscribe = false;
+                                continue 'session;
                             }
                             // If the previous PTY is gone, fall back to the first available one.
                             let new_id = if pty_list.iter().any(|p| p.pty_id == prev_id) {
@@ -529,16 +531,9 @@ pub async fn run(
                                 continue 'session;
                             };
                             if new_id != current_pty_id {
-                                let _ = cmd_tx.send(TerminalCommand {
-                                    command: Some(Command::Unsubscribe(
-                                        UnsubscribeRequest { pty_id: current_pty_id.clone() }
-                                    )),
-                                }).await;
-                                if let Some(item) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-                                    current_item = item;
+                                if let Some(new_item) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
+                                    switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, new_item).await;
                                 }
-                                previous_pty_id = Some(current_pty_id.clone());
-                                current_pty_id = new_id;
                             }
                         } else {
                             should_subscribe = false;
@@ -546,23 +541,13 @@ pub async fn run(
                     }
 
                     InputAction::SwitchIndex(n) => {
-                        if pty_list.is_empty() {
-                            if let Err(e) = fetch_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
-                                show_error(&e.to_string()).await;
-                                should_subscribe = false;
-                                continue 'session;
-                            }
+                        if !ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                            should_subscribe = false;
+                            continue 'session;
                         }
                         if let Some(target) = pty_list.get(n as usize).cloned() {
                             if target.pty_id != current_pty_id {
-                                let _ = cmd_tx.send(TerminalCommand {
-                                    command: Some(Command::Unsubscribe(
-                                        UnsubscribeRequest { pty_id: current_pty_id.clone() }
-                                    )),
-                                }).await;
-                                previous_pty_id = Some(current_pty_id.clone());
-                                current_pty_id = target.pty_id.clone();
-                                current_item = target;
+                                switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
                             }
                         }
                     }
@@ -570,16 +555,9 @@ pub async fn run(
                     InputAction::ShowList => {
                         match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id).await? {
                             Some(new_id) if new_id != current_pty_id => {
-                                let _ = cmd_tx.send(TerminalCommand {
-                                    command: Some(Command::Unsubscribe(
-                                        UnsubscribeRequest { pty_id: current_pty_id.clone() }
-                                    )),
-                                }).await;
                                 // Look up item from list so current_item has correct cols/rows.
                                 if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-                                    current_item = target;
-                                    previous_pty_id = Some(current_pty_id.clone());
-                                    current_pty_id = new_id;
+                                    switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
                                     pty_list.clear();
                                 }
                             }
