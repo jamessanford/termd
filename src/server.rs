@@ -4,7 +4,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tonic::service::interceptor::InterceptedService;
 
 use crate::proto;
-use crate::pty::{MetadataReason, PtyEvent, PtyRegistry};
+use crate::pty::{MetadataReason, PtyEvent, PtyMetadata, PtyRegistry};
 use crate::commands;
 
 pub use crate::proto::terminal_service_server::{TerminalService, TerminalServiceServer};
@@ -46,34 +46,30 @@ pub fn make_service(
 }
 
 async fn dispatch_command(
-    cmd: proto::TerminalCommand,
-    registry: &Arc<PtyRegistry>,
+    cmd:            proto::TerminalCommand,
+    registry:       &Arc<PtyRegistry>,
+    subscriber_id:  &str,
     subscribed_ids: &mut std::collections::HashSet<String>,
-    sub_tasks: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
-    sub_tx: &tokio::sync::mpsc::Sender<(String, PtyEvent)>,
+    sub_tasks:      &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    sub_tx:         &tokio::sync::mpsc::Sender<(String, PtyEvent)>,
 ) -> proto::TerminalResponse {
     use proto::terminal_command::Command;
-
     match cmd.command {
         None => proto::TerminalResponse {
             response: Some(proto::terminal_response::Response::Command(
-                proto::CommandResponse {
-                    pty_id: String::new(),
-                    success: false,
-                    error: Some("unknown command".into()),
-                }
+                proto::CommandResponse { pty_id: String::new(), success: false, error: Some("unknown command".into()) }
             )),
         },
-        Some(Command::List(_r))        => commands::handle_list(registry, subscribed_ids),
-        Some(Command::Create(r))      => commands::handle_create(registry, r),
-        Some(Command::Destroy(r))     => commands::handle_destroy(registry, r, subscribed_ids, sub_tasks),
-        Some(Command::Subscribe(r))   => commands::handle_subscribe(registry, r, subscribed_ids, sub_tasks, sub_tx),
-        Some(Command::Unsubscribe(r)) => commands::handle_unsubscribe(registry, r, subscribed_ids, sub_tasks),
-        Some(Command::Write(r))       => commands::handle_write(registry, r),
-        Some(Command::Resize(r))      => commands::handle_resize(registry, r),
-        Some(Command::SetTitle(r))    => commands::handle_set_title(registry, r),
-        Some(Command::Refresh(r))     => commands::handle_refresh(registry, r).await,
-        Some(Command::Scrollback(r))  => commands::handle_scrollback(registry, r).await,
+        Some(Command::List(_r))        => commands::handle_list(registry),
+        Some(Command::Create(r))       => commands::handle_create(registry, r),
+        Some(Command::Destroy(r))      => commands::handle_destroy(registry, r, subscriber_id, subscribed_ids, sub_tasks),
+        Some(Command::Subscribe(r))    => commands::handle_subscribe(registry, r, subscriber_id, subscribed_ids, sub_tasks, sub_tx),
+        Some(Command::Unsubscribe(r))  => commands::handle_unsubscribe(registry, r, subscriber_id, subscribed_ids, sub_tasks),
+        Some(Command::Write(r))        => commands::handle_write(registry, r),
+        Some(Command::Resize(r))       => commands::handle_resize(registry, r),
+        Some(Command::SetTitle(r))     => commands::handle_set_title(registry, r),
+        Some(Command::Refresh(r))      => commands::handle_refresh(registry, r).await,
+        Some(Command::Scrollback(r))   => commands::handle_scrollback(registry, r).await,
     }
 }
 
@@ -97,6 +93,7 @@ impl TerminalService for TerminalServiceImpl {
         let (sub_tx, mut sub_rx) = mpsc::channel::<(String, PtyEvent)>(1024);
 
         tokio::spawn(async move {
+            let subscriber_id = uuid::Uuid::new_v4().to_string();
             let mut sub_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
             let mut subscribed_ids: HashSet<String> = HashSet::new();
 
@@ -106,21 +103,15 @@ impl TerminalService for TerminalServiceImpl {
                         match cmd {
                             None => break,
                             Some(Err(e)) => {
-                                // NOTE: When clients disappear, e.code() == tonic::Code::Unknown happens,
-                                // check if this is expected or if we are missing something.
                                 tracing::warn!("stream read error: {e}");
                                 break;
                             }
                             Some(Ok(cmd)) => {
-                                if log_grpc {
-                                    tracing::debug!(command = ?cmd, "gRPC request");
-                                }
+                                if log_grpc { tracing::debug!(command = ?cmd, "gRPC request"); }
                                 let resp = dispatch_command(
-                                    cmd, &registry, &mut subscribed_ids, &mut sub_tasks, &sub_tx
+                                    cmd, &registry, &subscriber_id, &mut subscribed_ids, &mut sub_tasks, &sub_tx
                                 ).await;
-                                if log_grpc {
-                                    tracing::debug!(response = ?resp, "gRPC response");
-                                }
+                                if log_grpc { tracing::debug!(response = ?resp, "gRPC response"); }
                                 if resp_tx.send(Ok(resp)).await.is_err() { break; }
                             }
                         }
@@ -129,11 +120,7 @@ impl TerminalService for TerminalServiceImpl {
                         let resp = match event {
                             PtyEvent::Data(chunk) => proto::TerminalResponse {
                                 response: Some(proto::terminal_response::Response::Stream(
-                                    proto::StreamData {
-                                        pty_id,
-                                        generation: chunk.generation,
-                                        data: chunk.data.to_vec(),
-                                    }
+                                    proto::StreamData { pty_id, generation: chunk.generation, data: chunk.data.to_vec() }
                                 )),
                             },
                             PtyEvent::Metadata(meta) => {
@@ -148,9 +135,9 @@ impl TerminalService for TerminalServiceImpl {
                                     response: Some(proto::terminal_response::Response::Metadata(
                                         proto::StreamMetadata {
                                             pty_id,
-                                            item: Some(commands::pty_info_to_item(meta.info.clone(), true)),
-                                            reason: reason as i32,
-                                            exit_code: meta.exit_code,
+                                            item:       Some(commands::pty_info_to_item(meta.info.clone())),
+                                            reason:     reason as i32,
+                                            exit_code:  meta.exit_code,
                                             generation: meta.generation,
                                         }
                                     )),
@@ -159,6 +146,19 @@ impl TerminalService for TerminalServiceImpl {
                         };
                         if resp_tx.send(Ok(resp)).await.is_err() { break; }
                     }
+                }
+            }
+
+            // Disconnect cleanup: remove this client from every subscribed PTY
+            for pty_id in &subscribed_ids {
+                if let Some(handle) = registry.get(pty_id) {
+                    handle.remove_subscriber(&subscriber_id);
+                    handle.broadcast_metadata(Arc::new(PtyMetadata {
+                        reason:     MetadataReason::SubscribersChanged,
+                        exit_code:  None,
+                        generation: handle.current_generation(),
+                        info:       handle.info(),
+                    }));
                 }
             }
             for (_, t) in sub_tasks { t.abort(); }

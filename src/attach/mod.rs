@@ -189,15 +189,16 @@ async fn subscribe(
     resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
     pty_id:  &str,
 ) -> anyhow::Result<()> {
+    let (cols, rows) = get_terminal_size();
     cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id.to_owned() })),
+        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id.to_owned(), hostname: "unknown".to_string(), cols: cols, rows: rows })),
     }).await?;
     loop {
         match resp_rx.message().await? {
             None => anyhow::bail!("server disconnected during subscribe"),
             Some(r) => match r.response {
-                Some(Response::Command(c)) if c.success => return Ok(()),
-                Some(Response::Command(c)) => {
+                Some(Response::Subscribe(c)) if c.success => return Ok(()),
+                Some(Response::Subscribe(c)) => {
                     anyhow::bail!("subscribe failed: {}", c.error.unwrap_or_default())
                 }
                 _ => {}
@@ -683,8 +684,9 @@ async fn run_debug(client: &mut AuthedClient, pty_id: String) -> Result<()> {
         .into_inner();
 
     // Subscribe
+    let (cols, rows) = get_terminal_size();
     cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id.clone() })),
+        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id.clone(), hostname: "unknown".to_string(), cols: cols, rows: rows })),
     }).await?;
 
     loop {

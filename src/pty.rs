@@ -25,14 +25,23 @@ const TERM_NAME: &str = "xterm-ghostty";
 // TODO: expose from libghostty_vt::build_info when available
 
 #[derive(Clone, Debug)]
+pub struct SubscriberInfo {
+    pub hostname:   String,
+    pub cols:       u32,
+    pub rows:       u32,
+    pub created_at: std::time::SystemTime,
+}
+
+#[derive(Clone, Debug)]
 pub struct PtyInfo {
-    pub id: String,
-    pub hostname: String,
-    pub pts_name: String,
-    pub cols: u32,
-    pub rows: u32,
-    pub title: String,
-    pub created_at: SystemTime,
+    pub id:          String,
+    pub hostname:    String,
+    pub pts_name:    String,
+    pub cols:        u32,
+    pub rows:        u32,
+    pub title:       String,
+    pub created_at:  SystemTime,
+    pub subscribers: Vec<(String, SubscriberInfo)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,20 +110,26 @@ pub struct PtyHandle {
     resize_tx:     std::sync::mpsc::SyncSender<(u32, u32)>,
     meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
     generation: Arc<AtomicU64>,
+    subscribers: Arc<RwLock<HashMap<String, SubscriberInfo>>>,
     child_pid: Pid,
     wakeup_write: OwnedFd,
 }
 
 impl PtyHandle {
     pub fn info(&self) -> PtyInfo {
+        let subscribers: Vec<(String, SubscriberInfo)> = {
+            let map = self.subscribers.read().unwrap();
+            map.iter().map(|(id, s)| (id.clone(), s.clone())).collect()
+        };  // read-lock released here
         PtyInfo {
-            id: self.id.clone(),
-            hostname: self.hostname.clone(),
-            pts_name: self.pts_name.clone(),
-            cols: self.cols.load(Ordering::Relaxed),
-            rows: self.rows.load(Ordering::Relaxed),
-            title: self.title.lock().unwrap().clone(),
-            created_at: self.created_at,
+            id:          self.id.clone(),
+            hostname:    self.hostname.clone(),
+            pts_name:    self.pts_name.clone(),
+            cols:        self.cols.load(Ordering::Relaxed),
+            rows:        self.rows.load(Ordering::Relaxed),
+            title:       self.title.lock().unwrap().clone(),
+            created_at:  self.created_at,
+            subscribers,
         }
     }
 
@@ -202,6 +217,22 @@ impl PtyHandle {
 
     pub fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    pub fn upsert_subscriber(&self, subscriber_id: &str, info: SubscriberInfo) {
+        let mut map = self.subscribers.write().unwrap();
+        map.entry(subscriber_id.to_owned())
+            .and_modify(|e| {
+                e.hostname = info.hostname.clone();
+                e.cols     = info.cols;
+                e.rows     = info.rows;
+                // created_at intentionally not updated — preserve original
+            })
+            .or_insert(info);
+    }
+
+    pub fn remove_subscriber(&self, subscriber_id: &str) {
+        self.subscribers.write().unwrap().remove(subscriber_id);
     }
 }
 
@@ -349,6 +380,7 @@ impl PtyRegistry {
             resize_tx,
             meta_tx: meta_tx.clone(),
             generation: generation.clone(),
+            subscribers: Arc::new(RwLock::new(HashMap::new())),
             child_pid,
             wakeup_write,
         });
@@ -744,6 +776,7 @@ fn reader_thread(
                     rows: current_rows,
                     title: current_title,
                     created_at,
+                    subscribers: vec![], // subscriber list unavailable in reader thread
                 },
             }));
         }
@@ -793,6 +826,7 @@ fn reader_thread(
             rows: current_rows,
             title: title.lock().unwrap().clone(),
             created_at,
+            subscribers: vec![], // subscriber list unavailable in reader thread
         },
     }));
 
@@ -809,6 +843,61 @@ fn reader_thread(
     }
 
     drop(wakeup_read); // closes read end; wakeup_write already closed (PtyHandle dropped)
+}
+
+#[cfg(test)]
+mod subscriber_tests {
+    use super::*;
+
+    fn make_handle() -> Arc<PtyHandle> {
+        let reg = PtyRegistry::new();
+        reg.create(80, 24, None).unwrap()
+    }
+
+    fn make_info(hostname: &str) -> SubscriberInfo {
+        SubscriberInfo { hostname: hostname.into(), cols: 80, rows: 24, created_at: SystemTime::now() }
+    }
+
+    #[test]
+    fn upsert_inserts_new_subscriber() {
+        let h = make_handle();
+        h.upsert_subscriber("abc", make_info("host1"));
+        let subs = h.info().subscribers;
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].0, "abc");
+        assert_eq!(subs[0].1.hostname, "host1");
+    }
+
+    #[test]
+    fn upsert_updates_existing_preserves_created_at() {
+        let h = make_handle();
+        let t = SystemTime::UNIX_EPOCH;
+        h.upsert_subscriber("abc", SubscriberInfo {
+            hostname: "host1".into(), cols: 80, rows: 24, created_at: t,
+        });
+        h.upsert_subscriber("abc", SubscriberInfo {
+            hostname: "host2".into(), cols: 100, rows: 30, created_at: SystemTime::now(),
+        });
+        let subs = h.info().subscribers;
+        assert_eq!(subs.len(), 1, "no duplicate");
+        assert_eq!(subs[0].1.hostname, "host2");
+        assert_eq!(subs[0].1.cols, 100);
+        assert_eq!(subs[0].1.created_at, t, "original created_at preserved");
+    }
+
+    #[test]
+    fn remove_subscriber_deletes_entry() {
+        let h = make_handle();
+        h.upsert_subscriber("abc", make_info("host1"));
+        h.remove_subscriber("abc");
+        assert!(h.info().subscribers.is_empty());
+    }
+
+    #[test]
+    fn remove_nonexistent_is_noop() {
+        let h = make_handle();
+        h.remove_subscriber("nonexistent"); // must not panic
+    }
 }
 
 #[cfg(test)]
