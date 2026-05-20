@@ -155,17 +155,27 @@ fn get_hostname() -> String {
 // Called on every renderer exit (before ShowList, PTY switch, etc.) and also at session exit
 // (where the caller appends the cursor-to-last-row tail).
 fn reset_terminal_modes() {
+    // Consider using a full "RIS" reset to initial state,
+    // keeping it specific like this does help us understand the missing gaps.
     use std::io::Write;
     let _ = std::io::stdout().write_all(concat!(
+        "\x1b[?1049l",  // leave alternate screen mode
         "\x1b[?1000l",  // disable X10 mouse reporting
         "\x1b[?1002l",  // disable button-event mouse tracking
         "\x1b[?1003l",  // disable all-motion mouse tracking
         "\x1b[?1006l",  // disable SGR mouse extension
+        "\x1b[?1016l",  // disable SGR-pixels mouse extension
+        "\x1b[?1015l",  // disable urxvt mouse extension
         "\x1b[?2004l",  // disable bracketed paste
         "\x1b[r",       // reset DECSTBM scroll region to full screen
         "\x1b[?69l",    // disable DECLRMM (horizontal margins)
-        "\x1b[?25h",    // show cursor
         "\x1b[0m",      // reset SGR (colors, attributes)
+        "\x1b[<1u",     // pop kitty keyboard protocol
+        "\x1b[0q",      // reset cursor style to default
+        "\x1b[?25h",    // show cursor
+        "\x1b[?1l",     // DECCKM - normal cursor keys
+        "\x1b>",        // DECNKM - normal keypad mode
+        "\x1b(B",       // reset G0 character set to ASCII
     ).as_bytes());
     let _ = std::io::stdout().flush();
 }
@@ -515,7 +525,7 @@ pub async fn run(
                                             break 'create;
                                         }
                                         None => {
-                                            show_error("[server returned Create with no item]").await;
+                                            show_error("[Failed to create new PTY]").await;
                                             pty_list.clear();
                                             continue 'session;
                                         }
