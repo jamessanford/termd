@@ -23,8 +23,6 @@ pub(super) enum InputAction {
 pub enum RenderMode {
     /// Cell-by-cell render state for all dirty states (default)
     Cell,
-    /// VT formatter for full repaints, cell-by-cell for partial repaints
-    Formatter,
     /// Raw PTY byte passthrough — no libghostty on the client render path
     Raw,
     /// Raw passthrough within a DECSTBM scroll region; rewrites conflicting sequences
@@ -65,7 +63,6 @@ use termd::proto::{
 };
 
 mod cell;
-mod formatter;
 mod raw;
 mod region;
 mod scrollback;
@@ -451,9 +448,8 @@ pub async fn run(
         let mut dispatch_ctx = ctx;
         let outcome = loop {
             let result = match dispatch_mode {
-                RenderMode::Cell      => cell::run(dispatch_ctx).await?,
-                RenderMode::Formatter => formatter::run(dispatch_ctx).await?,
-                RenderMode::Raw       => raw::run(dispatch_ctx).await?,
+                RenderMode::Cell   => cell::run(dispatch_ctx).await?,
+                RenderMode::Raw    => raw::run(dispatch_ctx).await?,
                 RenderMode::Region    => region::run(dispatch_ctx).await?,
             };
             match result {
