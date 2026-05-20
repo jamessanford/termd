@@ -16,6 +16,7 @@ pub(super) enum InputAction {
     SwitchRecent,
     SwitchIndex(u8),
     ShowList,
+    ShowInfo,
     ShowScrollback,
 }
 
@@ -166,6 +167,15 @@ fn reset_terminal_modes() {
         "\x1b[?25h",    // show cursor
         "\x1b[0m",      // reset SGR (colors, attributes)
     ).as_bytes());
+    let _ = std::io::stdout().flush();
+}
+
+fn move_terminal_end() {
+    use std::io::Write;
+    let (_, rows) = get_terminal_size();
+    let _ = std::io::stdout().write_all(
+        format!("\x1b[{rows};1H\r\n").as_bytes() // move cursor to last row
+    );
     let _ = std::io::stdout().flush();
 }
 
@@ -467,6 +477,7 @@ pub async fn run(
         match outcome {
             RunOutcome::ServerClosed => {
                 reset_terminal_modes();
+                move_terminal_end();
                 eprintln!("[Connection closed]");
                 break 'session;
             }
@@ -504,8 +515,9 @@ pub async fn run(
                                             break 'create;
                                         }
                                         None => {
-                                            eprintln!("[server returned Create with no item]");
-                                            break 'session;
+                                            show_error("[server returned Create with no item]").await;
+                                            pty_list.clear();
+                                            continue 'session;
                                         }
                                     }
                                 }
@@ -591,6 +603,13 @@ pub async fn run(
                         }
                     }
 
+                    InputAction::ShowInfo => {
+                        show_error(&format!(
+                            "requested={mode:?} actual={dispatch_mode:?} pty={current_pty_id}"
+                        )).await;
+                        should_subscribe = false;
+                    }
+
                     InputAction::ShowScrollback => {
                         scrollback::show_scrollback(
                             &cmd_tx,
@@ -607,14 +626,7 @@ pub async fn run(
 
     // reset_terminal_modes() was already called when the last renderer exited above.
     // Append the last-row move so the shell prompt lands below the PTY content.
-    {
-        use std::io::Write;
-        let (_, rows) = get_terminal_size();
-        let _ = std::io::stdout().write_all(
-            format!("\x1b[{rows};1H\r\n").as_bytes() // move cursor to last row
-        );
-        let _ = std::io::stdout().flush();
-    }
+    move_terminal_end();
 
     drop(_guard);
     Ok(())
