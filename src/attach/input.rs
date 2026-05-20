@@ -43,7 +43,8 @@ pub(super) fn process_byte(
             }
         },
         EscapeState::AfterCtrlA => match byte {
-            0x01     => { to_send.push(0x01); *state = EscapeState::Normal; None }
+            0x01     => Some(InputAction::SwitchRecent),
+            b'a'     => { to_send.push(0x01); *state = EscapeState::Normal; None }
             b'c'     => Some(InputAction::Create),
             b'F'     => Some(InputAction::ForceResize),
             b'"'     => Some(InputAction::ShowList),
@@ -131,8 +132,15 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_a_ctrl_a_sends_literal() {
-        let (state, bytes, action) = run_from(EscapeState::Normal, &[0x01, 0x01]);
+    fn ctrl_a_ctrl_a_switches_recent() {
+        let (_, bytes, action) = run_from(EscapeState::Normal, &[0x01, 0x01]);
+        assert!(matches!(action, Some(InputAction::SwitchRecent)));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn ctrl_a_a_sends_literal() {
+        let (state, bytes, action) = run_from(EscapeState::Normal, &[0x01, b'a']);
         assert!(action.is_none());
         assert_eq!(bytes, &[0x01]);
         assert!(matches!(state, EscapeState::Normal));

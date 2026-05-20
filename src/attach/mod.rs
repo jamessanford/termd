@@ -13,6 +13,7 @@ pub(super) enum InputAction {
     ForceResize,
     SwitchNext,
     SwitchPrevious,
+    SwitchRecent,
     SwitchIndex(u8),
     ShowList,
     ShowScrollback,
@@ -351,6 +352,7 @@ pub async fn run(
     let mut current_pty_id = item.pty_id.clone();
     let mut current_item = item;
     let mut pty_list: Vec<PtyItem> = Vec::new();
+    let mut previous_pty_id: Option<String> = None;
     let mut should_subscribe = true;
 
     'session: loop {
@@ -448,6 +450,7 @@ pub async fn run(
                                                     UnsubscribeRequest { pty_id: current_pty_id.clone() }
                                                 )),
                                             }).await;
+                                            previous_pty_id = Some(current_pty_id.clone());
                                             current_pty_id = new_item.pty_id.clone();
                                             current_item = new_item;
                                             break 'create;
@@ -478,6 +481,7 @@ pub async fn run(
                                         UnsubscribeRequest { pty_id: current_pty_id.clone() }
                                     )),
                                 }).await;
+                                previous_pty_id = Some(current_pty_id.clone());
                                 current_pty_id = target.pty_id.clone();
                                 current_item = target;
                             }
@@ -499,9 +503,45 @@ pub async fn run(
                                         UnsubscribeRequest { pty_id: current_pty_id.clone() }
                                     )),
                                 }).await;
+                                previous_pty_id = Some(current_pty_id.clone());
                                 current_pty_id = target.pty_id.clone();
                                 current_item = target;
                             }
+                        }
+                    }
+
+                    InputAction::SwitchRecent => {
+                        if let Some(prev_id) = previous_pty_id.clone() {
+                            if pty_list.is_empty() {
+                                if let Err(e) = fetch_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                                    show_error(&e.to_string()).await;
+                                    should_subscribe = false;
+                                    continue 'session;
+                                }
+                            }
+                            // If the previous PTY is gone, fall back to the first available one.
+                            let new_id = if pty_list.iter().any(|p| p.pty_id == prev_id) {
+                                prev_id
+                            } else if let Some(first) = pty_list.first() {
+                                first.pty_id.clone()
+                            } else {
+                                should_subscribe = false;
+                                continue 'session;
+                            };
+                            if new_id != current_pty_id {
+                                let _ = cmd_tx.send(TerminalCommand {
+                                    command: Some(Command::Unsubscribe(
+                                        UnsubscribeRequest { pty_id: current_pty_id.clone() }
+                                    )),
+                                }).await;
+                                if let Some(item) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
+                                    current_item = item;
+                                }
+                                previous_pty_id = Some(current_pty_id.clone());
+                                current_pty_id = new_id;
+                            }
+                        } else {
+                            should_subscribe = false;
                         }
                     }
 
@@ -520,6 +560,7 @@ pub async fn run(
                                         UnsubscribeRequest { pty_id: current_pty_id.clone() }
                                     )),
                                 }).await;
+                                previous_pty_id = Some(current_pty_id.clone());
                                 current_pty_id = target.pty_id.clone();
                                 current_item = target;
                             }
@@ -537,6 +578,7 @@ pub async fn run(
                                 // Look up item from list so current_item has correct cols/rows.
                                 if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
                                     current_item = target;
+                                    previous_pty_id = Some(current_pty_id.clone());
                                     current_pty_id = new_id;
                                     pty_list.clear();
                                 }
