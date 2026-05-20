@@ -17,11 +17,17 @@ pub(super) async fn show_scrollback(
     pty_id:  &str,
     rows:    u32,
 ) -> Result<()> {
-    if let Err(e) = run_scrollback(cmd_tx, resp_rx, pty_id, rows).await {
+    let _ = std::io::stdout().write_all(b"\x1b[?1049h");
+    let _ = std::io::stdout().flush();
+
+    let result = run_scrollback(cmd_tx, resp_rx, pty_id, rows).await;
+
+    let _ = std::io::stdout().write_all(b"\x1b[?1049l");
+    let _ = std::io::stdout().flush();
+
+    if let Err(e) = result {
         super::show_error(&e.to_string()).await;
     }
-    let _ = std::io::stdout().write_all(b"\x1b[2J\x1b[H");
-    let _ = std::io::stdout().flush();
     Ok(())
 }
 
