@@ -47,9 +47,10 @@ pub(super) fn process_byte(
             0x01     => Some(InputAction::SwitchRecent),
             b'a'     => { to_send.push(0x01); *state = EscapeState::Normal; None }
             b'c'     => Some(InputAction::Create),
-            b'i'     => Some(InputAction::ShowInfo),
             b'F'     => Some(InputAction::ForceResize),
             b'"'     => Some(InputAction::ShowList),
+            b'i'     => Some(InputAction::ShowInfo),
+            b'k'     => Some(InputAction::Destroy),
             b's'     => Some(InputAction::ShowScrollback),
             b' '     => Some(InputAction::SwitchNext),
             b'p'     => Some(InputAction::SwitchPrevious),
@@ -188,6 +189,13 @@ mod tests {
     fn ctrl_a_shift_f_force_resize() {
         let (_, bytes, action) = run_from(EscapeState::Normal, &[0x01, b'F']);
         assert!(matches!(action, Some(InputAction::ForceResize)));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn ctrl_a_k_destroys() {
+        let (_, bytes, action) = run_from(EscapeState::Normal, &[0x01, b'k']);
+        assert!(matches!(action, Some(InputAction::Destroy)));
         assert!(bytes.is_empty());
     }
 

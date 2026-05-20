@@ -9,6 +9,7 @@ mod input;
 
 pub(super) enum InputAction {
     Detach,
+    Destroy,
     Create,
     ForceResize,
     SwitchNext,
@@ -57,7 +58,7 @@ pub(super) enum RunOutcome {
 
 use termd::proto::{
     terminal_command::Command, terminal_response::Response,
-    CreateRequest, ListRequest, PtyItem, RefreshRequest, ResizeRequest,
+    CreateRequest, DestroyRequest, ListRequest, PtyItem, RefreshRequest, ResizeRequest,
     SubscribeRequest, UnsubscribeRequest,
     TerminalCommand, StreamMetadataReason,
     terminal_service_client::TerminalServiceClient,
@@ -292,6 +293,38 @@ async fn switch_pty(
     *current_item = new_item;
 }
 
+// Switches to the previous PTY, falling back to the first available if it's gone.
+// Returns true if the session should subscribe on the next iteration, false otherwise.
+async fn switch_to_recent(
+    cmd_tx:          &mpsc::Sender<TerminalCommand>,
+    resp_rx:         &mut tonic::Streaming<termd::proto::TerminalResponse>,
+    pty_list:        &mut Vec<PtyItem>,
+    current_pty_id:  &mut String,
+    current_item:    &mut PtyItem,
+    previous_pty_id: &mut Option<String>,
+) -> bool {
+    let prev_id = match previous_pty_id.clone() {
+        Some(id) => id,
+        None => return false,
+    };
+    if !ensure_list(cmd_tx, resp_rx, pty_list).await {
+        return false;
+    }
+    let new_id = if pty_list.iter().any(|p| p.pty_id == prev_id) {
+        prev_id
+    } else if let Some(first) = pty_list.first() {
+        first.pty_id.clone()
+    } else {
+        return false;
+    };
+    if new_id != *current_pty_id {
+        if let Some(new_item) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
+            switch_pty(cmd_tx, current_pty_id, current_item, previous_pty_id, new_item).await;
+        }
+    }
+    true
+}
+
 fn clear_screen() {
     use std::io::Write;
     let _ = std::io::stdout().write_all(b"\x1b[2J\x1b[H");
@@ -492,6 +525,30 @@ pub async fn run(
                 match action {
                     InputAction::Detach => break 'session,
 
+                    InputAction::Destroy => {
+                        cmd_tx.send(TerminalCommand {
+                            command: Some(Command::Destroy(DestroyRequest {
+                                pty_id: current_pty_id.clone(),
+                            })),
+                        }).await?;
+                        loop {
+                            match resp_rx.message().await? {
+                                None => { eprintln!("[server disconnected]"); break 'session; }
+                                Some(r) => if let Some(Response::Command(c)) = r.response {
+                                    if !c.success {
+                                        show_error(&format!("[Failed to destroy PTY: {}]", c.error.unwrap_or_default())).await;
+                                        continue 'session;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        pty_list.clear();
+                        if !switch_to_recent(&cmd_tx, &mut resp_rx, &mut pty_list, &mut current_pty_id, &mut current_item, &mut previous_pty_id).await {
+                            should_subscribe = false;
+                        }
+                    }
+
                     InputAction::ForceResize => {
                         let (cols, rows) = get_terminal_size();
                         let _ = cmd_tx.send(TerminalCommand {
@@ -555,26 +612,7 @@ pub async fn run(
                     }
 
                     InputAction::SwitchRecent => {
-                        if let Some(prev_id) = previous_pty_id.clone() {
-                            if !ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
-                                should_subscribe = false;
-                                continue 'session;
-                            }
-                            // If the previous PTY is gone, fall back to the first available one.
-                            let new_id = if pty_list.iter().any(|p| p.pty_id == prev_id) {
-                                prev_id
-                            } else if let Some(first) = pty_list.first() {
-                                first.pty_id.clone()
-                            } else {
-                                should_subscribe = false;
-                                continue 'session;
-                            };
-                            if new_id != current_pty_id {
-                                if let Some(new_item) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-                                    switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, new_item).await;
-                                }
-                            }
-                        } else {
+                        if !switch_to_recent(&cmd_tx, &mut resp_rx, &mut pty_list, &mut current_pty_id, &mut current_item, &mut previous_pty_id).await {
                             should_subscribe = false;
                         }
                     }
