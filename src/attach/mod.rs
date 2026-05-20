@@ -614,8 +614,6 @@ async fn run_debug(client: &mut AuthedClient, pty_id: String) -> Result<()> {
         }
     }
 
-    // NOTE: no resize sent — server PTY owns its dimensions
-
     // Request refresh
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Refresh(RefreshRequest { pty_id: pty_id.clone() })),
