@@ -587,10 +587,19 @@ pub async fn run(
     {
         use std::io::Write;
         let (_, rows) = get_terminal_size();
-        let _ = std::io::stdout().write_all(
-            format!("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[r\x1b[?69l\x1b[?25h\x1b[0m\x1b[{rows};1H\r\n")
-                .as_bytes()
-        );
+        let _ = std::io::stdout().write_all(format!(concat!(
+            "\x1b[?1000l",  // disable X10 mouse reporting
+            "\x1b[?1002l",  // disable button-event mouse tracking
+            "\x1b[?1003l",  // disable all-motion mouse tracking
+            "\x1b[?1006l",  // disable SGR mouse extension
+            "\x1b[?2004l",  // disable bracketed paste
+            "\x1b[r",       // reset DECSTBM scroll region to full screen
+            "\x1b[?69l",    // disable DECLRMM (horizontal margins)
+            "\x1b[?25h",    // show cursor
+            "\x1b[0m",      // reset SGR (colors, attributes)
+            "\x1b[{};1H",   // move cursor to last row
+            "\r\n",
+        ), rows).as_bytes());
         let _ = std::io::stdout().flush();
     }
 
