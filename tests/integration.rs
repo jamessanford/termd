@@ -573,3 +573,33 @@ fn test_destroy_all_empties_registry() {
     registry.destroy_all();
     assert_eq!(registry.list().len(), 0);
 }
+
+#[tokio::test]
+async fn test_scrollback_via_grpc() {
+    let (_dir, mut client) = test_server().await;
+
+    let resp = send_recv(
+        &mut client,
+        terminal_command::Command::Create(CreateRequest { cols: 80, rows: 24, command: None }),
+    ).await;
+    let pty_id = match resp.response.unwrap() {
+        termd::proto::terminal_response::Response::Create(c) => c.item.unwrap().pty_id,
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    let resp = send_recv(
+        &mut client,
+        terminal_command::Command::Scrollback(termd::proto::ScrollbackRequest {
+            pty_id: pty_id.clone(),
+            row_offset: 0,
+            row_count: 24,
+        }),
+    ).await;
+
+    match resp.response.unwrap() {
+        termd::proto::terminal_response::Response::Scrollback(sr) => {
+            assert_eq!(sr.pty_id, pty_id);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}

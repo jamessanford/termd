@@ -480,7 +480,15 @@ pub async fn run(
                         }
                     }
 
-                    InputAction::ShowScrollback => {}
+                    InputAction::ShowScrollback => {
+                        scrollback::show_scrollback(
+                            &cmd_tx,
+                            &mut resp_rx,
+                            &current_pty_id,
+                            current_item.rows,
+                        ).await?;
+                        should_subscribe = false;
+                    }
                 }
             }
         }
