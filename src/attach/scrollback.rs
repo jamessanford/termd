@@ -1,3 +1,132 @@
+use std::io::Write as IoWrite;
+
+use anyhow::Result;
+use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
+
+use termd::proto::{
+    terminal_command::Command,
+    terminal_response::Response,
+    ScrollbackRequest, ScrollbackResponse,
+    TerminalCommand, TerminalResponse,
+};
+
+pub(super) async fn show_scrollback(
+    cmd_tx:  &mpsc::Sender<TerminalCommand>,
+    resp_rx: &mut tonic::Streaming<TerminalResponse>,
+    pty_id:  &str,
+    rows:    u32,
+) -> Result<()> {
+    let mut row_offset: u32 = 0;
+    let mut stdin = tokio::io::stdin();
+    let mut buf = [0u8; 8];
+
+    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
+    let mut total = resp.total_scrollback_rows;
+
+    if total == 0 {
+        let _ = std::io::stdout().write_all(
+            b"\x1b[2J\x1b[H[No scrollback available]\r\n(ESC to exit)"
+        );
+        let _ = std::io::stdout().flush();
+        let _ = stdin.read(&mut buf).await;
+        let _ = std::io::stdout().write_all(b"\x1b[2J\x1b[H");
+        let _ = std::io::stdout().flush();
+        return Ok(());
+    }
+
+    display_page(&resp.data, row_offset, total, rows);
+
+    loop {
+        let n = match stdin.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+
+        match &buf[..n] {
+            [0x1b, b'[', b'A', ..] => {
+                if row_offset < max_row_offset(total, rows) {
+                    row_offset += 1;
+                    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
+                    total = resp.total_scrollback_rows;
+                    display_page(&resp.data, row_offset, total, rows);
+                }
+            }
+            [0x1b, b'[', b'B', ..] => {
+                if row_offset > 0 {
+                    row_offset -= 1;
+                    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
+                    total = resp.total_scrollback_rows;
+                    display_page(&resp.data, row_offset, total, rows);
+                }
+            }
+            [0x1b] => {
+                let mut rest = [0u8; 2];
+                let extra = tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    stdin.read(&mut rest),
+                ).await.ok().and_then(|r| r.ok());
+                match extra {
+                    Some(2) if rest[0] == b'[' && rest[1] == b'A' => {
+                        if row_offset < max_row_offset(total, rows) {
+                            row_offset += 1;
+                            let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
+                            total = resp.total_scrollback_rows;
+                            display_page(&resp.data, row_offset, total, rows);
+                        }
+                    }
+                    Some(2) if rest[0] == b'[' && rest[1] == b'B' => {
+                        if row_offset > 0 {
+                            row_offset -= 1;
+                            let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
+                            total = resp.total_scrollback_rows;
+                            display_page(&resp.data, row_offset, total, rows);
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let _ = std::io::stdout().write_all(b"\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+async fn fetch_scrollback(
+    cmd_tx:     &mpsc::Sender<TerminalCommand>,
+    resp_rx:    &mut tonic::Streaming<TerminalResponse>,
+    pty_id:     &str,
+    row_offset: u32,
+    row_count:  u32,
+) -> Result<ScrollbackResponse> {
+    cmd_tx.send(TerminalCommand {
+        command: Some(Command::Scrollback(ScrollbackRequest {
+            pty_id: pty_id.to_owned(),
+            row_offset,
+            row_count,
+        })),
+    }).await?;
+    loop {
+        match resp_rx.message().await? {
+            None => anyhow::bail!("server disconnected during scrollback fetch"),
+            Some(r) => match r.response {
+                Some(Response::Scrollback(s)) => return Ok(s),
+                Some(Response::Stream(_)) => {}
+                _ => {}
+            }
+        }
+    }
+}
+
+fn display_page(data: &[u8], row_offset: u32, total: u32, rows: u32) {
+    let out = format_page(data, row_offset, total, rows);
+    let _ = std::io::stdout().write_all(&out);
+    let _ = std::io::stdout().flush();
+}
+
 fn max_row_offset(total: u32, rows: u32) -> u32 {
     total.saturating_sub(rows)
 }
