@@ -147,6 +147,31 @@ pub(super) fn get_terminal_size() -> (u32, u32) {
     (ws.ws_col as u32, ws.ws_row as u32)
 }
 
+fn get_hostname() -> String {
+    hostname::get()
+        .map(|h| h.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "unknown".into())
+}
+
+// Disable any PTY-set terminal modes so client-side UI and new-PTY refreshes start clean.
+// Called on every renderer exit (before ShowList, PTY switch, etc.) and also at session exit
+// (where the caller appends the cursor-to-last-row tail).
+fn reset_terminal_modes() {
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(concat!(
+        "\x1b[?1000l",  // disable X10 mouse reporting
+        "\x1b[?1002l",  // disable button-event mouse tracking
+        "\x1b[?1003l",  // disable all-motion mouse tracking
+        "\x1b[?1006l",  // disable SGR mouse extension
+        "\x1b[?2004l",  // disable bracketed paste
+        "\x1b[r",       // reset DECSTBM scroll region to full screen
+        "\x1b[?69l",    // disable DECLRMM (horizontal margins)
+        "\x1b[?25h",    // show cursor
+        "\x1b[0m",      // reset SGR (colors, attributes)
+    ).as_bytes());
+    let _ = std::io::stdout().flush();
+}
+
 async fn subscribe(
     cmd_tx:  &mpsc::Sender<TerminalCommand>,
     resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
@@ -445,12 +470,14 @@ pub async fn run(
 
         match outcome {
             RunOutcome::ServerClosed => {
+                reset_terminal_modes();
                 eprintln!("[Connection closed]");
                 break 'session;
             }
             RunOutcome::FallbackToCell(_) => unreachable!(),
             RunOutcome::Action(action, ctx) => {
                 resp_rx = ctx.resp_rx;
+                reset_terminal_modes();
                 match action {
                     InputAction::Detach => break 'session,
 
@@ -582,24 +609,14 @@ pub async fn run(
         }
     }
 
-    // Restore terminal state before returning: disable mouse modes, show cursor, reset SGR,
-    // and move to the last row so the shell prompt appears below the PTY content.
+    // reset_terminal_modes() was already called when the last renderer exited above.
+    // Append the last-row move so the shell prompt lands below the PTY content.
     {
         use std::io::Write;
         let (_, rows) = get_terminal_size();
-        let _ = std::io::stdout().write_all(format!(concat!(
-            "\x1b[?1000l",  // disable X10 mouse reporting
-            "\x1b[?1002l",  // disable button-event mouse tracking
-            "\x1b[?1003l",  // disable all-motion mouse tracking
-            "\x1b[?1006l",  // disable SGR mouse extension
-            "\x1b[?2004l",  // disable bracketed paste
-            "\x1b[r",       // reset DECSTBM scroll region to full screen
-            "\x1b[?69l",    // disable DECLRMM (horizontal margins)
-            "\x1b[?25h",    // show cursor
-            "\x1b[0m",      // reset SGR (colors, attributes)
-            "\x1b[{};1H",   // move cursor to last row
-            "\r\n",
-        ), rows).as_bytes());
+        let _ = std::io::stdout().write_all(
+            format!("\x1b[{rows};1H\r\n").as_bytes() // move cursor to last row
+        );
         let _ = std::io::stdout().flush();
     }
 
