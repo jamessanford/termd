@@ -22,6 +22,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
     let mut stdout = tokio::io::stdout();
     let mut out = Vec::new();
 
+    out.extend_from_slice(b"\x1b[2J\x1b[H");
     render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
     stdout.write_all(&out).await?;
 

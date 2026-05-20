@@ -21,7 +21,10 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
     let mut stdout = tokio::io::stdout();
     let mut out = Vec::new();
 
-    // Full repaint from seeded state
+    // Full repaint from seeded state — clear first so content outside the PTY
+    // dimensions (e.g. larger host terminal, or previous PTY of different size)
+    // doesn't bleed through.
+    out.extend_from_slice(b"\x1b[2J\x1b[H");
     render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
     stdout.write_all(&out).await?;
 
