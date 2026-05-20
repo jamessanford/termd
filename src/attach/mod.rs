@@ -12,6 +12,7 @@ pub(super) enum InputAction {
     Create,
     ForceResize,
     SwitchNext,
+    SwitchPrevious,
     SwitchIndex(u8),
     ShowList,
     ShowScrollback,
@@ -214,6 +215,12 @@ fn next_pty<'a>(list: &'a [PtyItem], current_id: &str) -> Option<&'a PtyItem> {
     if list.is_empty() { return None; }
     let pos = list.iter().position(|p| p.pty_id == current_id).unwrap_or(0);
     Some(&list[(pos + 1) % list.len()])
+}
+
+fn prev_pty<'a>(list: &'a [PtyItem], current_id: &str) -> Option<&'a PtyItem> {
+    if list.is_empty() { return None; }
+    let pos = list.iter().position(|p| p.pty_id == current_id).unwrap_or(0);
+    Some(&list[(pos + list.len() - 1) % list.len()])
 }
 
 fn clear_screen() {
@@ -465,6 +472,27 @@ pub async fn run(
                             }
                         }
                         if let Some(target) = next_pty(&pty_list, &current_pty_id).cloned() {
+                            if target.pty_id != current_pty_id {
+                                let _ = cmd_tx.send(TerminalCommand {
+                                    command: Some(Command::Unsubscribe(
+                                        UnsubscribeRequest { pty_id: current_pty_id.clone() }
+                                    )),
+                                }).await;
+                                current_pty_id = target.pty_id.clone();
+                                current_item = target;
+                            }
+                        }
+                    }
+
+                    InputAction::SwitchPrevious => {
+                        if pty_list.is_empty() {
+                            if let Err(e) = fetch_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                                show_error(&e.to_string()).await;
+                                should_subscribe = false;
+                                continue 'session;
+                            }
+                        }
+                        if let Some(target) = prev_pty(&pty_list, &current_pty_id).cloned() {
                             if target.pty_id != current_pty_id {
                                 let _ = cmd_tx.send(TerminalCommand {
                                     command: Some(Command::Unsubscribe(

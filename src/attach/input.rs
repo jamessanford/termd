@@ -49,6 +49,7 @@ pub(super) fn process_byte(
             b'"'     => Some(InputAction::ShowList),
             b's'     => Some(InputAction::ShowScrollback),
             b' '     => Some(InputAction::SwitchNext),
+            b'p'     => Some(InputAction::SwitchPrevious),
             b'd'     => Some(InputAction::Detach),
             b'0'..=b'9' => Some(InputAction::SwitchIndex(byte - b'0')),
             _ => {
@@ -147,6 +148,13 @@ mod tests {
     fn ctrl_a_space_switches_next() {
         let (_, _, action) = run_from(EscapeState::Normal, &[0x01, b' ']);
         assert!(matches!(action, Some(InputAction::SwitchNext)));
+    }
+
+    #[test]
+    fn ctrl_a_p_switches_previous() {
+        let (_, bytes, action) = run_from(EscapeState::Normal, &[0x01, b'p']);
+        assert!(matches!(action, Some(InputAction::SwitchPrevious)));
+        assert!(bytes.is_empty());
     }
 
     #[test]
