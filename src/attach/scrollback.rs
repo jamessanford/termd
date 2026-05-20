@@ -26,7 +26,7 @@ pub(super) async fn show_scrollback(
 
     if total == 0 {
         let _ = std::io::stdout().write_all(
-            b"\x1b[2J\x1b[H[No scrollback available]\r\n(ESC to exit)"
+            b"\x1b[2J\x1b[H[No scrollback available]\r\n(any key to exit)"
         );
         let _ = std::io::stdout().flush();
         let _ = stdin.read(&mut buf).await;
@@ -60,6 +60,24 @@ pub(super) async fn show_scrollback(
                     display_page(&resp.data, row_offset, total, rows);
                 }
             }
+            [0x02] => {  // Ctrl-B: page back (further into history)
+                let max = max_row_offset(total, rows);
+                if row_offset < max {
+                    row_offset = (row_offset + rows).min(max);
+                    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
+                    total = resp.total_scrollback_rows;
+                    display_page(&resp.data, row_offset, total, rows);
+                }
+            }
+            [0x06] => {  // Ctrl-F: page forward (towards active screen)
+                if row_offset > 0 {
+                    row_offset = row_offset.saturating_sub(rows);
+                    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
+                    total = resp.total_scrollback_rows;
+                    display_page(&resp.data, row_offset, total, rows);
+                }
+            }
+            [b'q'] => break,
             [0x1b] => {
                 let mut rest = [0u8; 2];
                 let extra = tokio::time::timeout(
@@ -139,7 +157,7 @@ fn format_page(data: &[u8], row_offset: u32, total: u32, rows: u32) -> Vec<u8> {
     out.extend_from_slice(b"\x1b[2J\x1b[H");
     out.extend_from_slice(data);
     let status = format!(
-        "\x1b[{rows};1H\x1b[2K\x1b[7m SCROLLBACK  row {} / {}  (ESC to exit) \x1b[0m",
+        "\x1b[{rows};1H\x1b[2K\x1b[7m SCROLLBACK  row {} / {}  (q/ESC exit  ^B/^F page  ↑↓ line) \x1b[0m",
         row_offset + 1, total,
     );
     out.extend_from_slice(status.as_bytes());
