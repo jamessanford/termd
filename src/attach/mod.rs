@@ -10,6 +10,7 @@ mod input;
 pub(super) enum InputAction {
     Detach,
     Create,
+    ForceResize,
     SwitchNext,
     SwitchIndex(u8),
     ShowList,
@@ -55,7 +56,7 @@ pub(super) enum RunOutcome {
 
 use termd::proto::{
     terminal_command::Command, terminal_response::Response,
-    CreateRequest, ListRequest, PtyItem, RefreshRequest,
+    CreateRequest, ListRequest, PtyItem, RefreshRequest, ResizeRequest,
     SubscribeRequest, UnsubscribeRequest,
     TerminalCommand, StreamMetadataReason,
     terminal_service_client::TerminalServiceClient,
@@ -411,6 +412,16 @@ pub async fn run(
                 resp_rx = ctx.resp_rx;
                 match action {
                     InputAction::Detach => break 'session,
+
+                    InputAction::ForceResize => {
+                        let (cols, rows) = get_terminal_size();
+                        let _ = cmd_tx.send(TerminalCommand {
+                            command: Some(Command::Resize(ResizeRequest {
+                                pty_id: current_pty_id.clone(), cols, rows,
+                            })),
+                        }).await;
+                        should_subscribe = false;
+                    }
 
                     InputAction::Create => {
                         let (cols, rows) = get_terminal_size();
