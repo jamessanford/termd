@@ -68,7 +68,7 @@ pub struct PtyMetadata {
 
 #[derive(Debug, Clone)]
 pub enum PtyEvent {
-    Data(Arc<PtyChunk>),
+    Data(PtyChunk),
     Refresh(Arc<RefreshData>),
     Metadata(Arc<PtyMetadata>),
 }
@@ -753,11 +753,10 @@ fn reader_thread(
             prev_title = current_title.clone();
         }
         let gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let chunk = Arc::new(PtyChunk {
+        let _ = tx.send(PtyEvent::Data(PtyChunk {
             generation: gen,
             data: Bytes::from(batch),
-        });
-        let _ = tx.send(PtyEvent::Data(chunk)); // ignore SendError (no subscribers is fine)
+        })); // ignore SendError (no subscribers is fine)
         // Emit TitleChanged after fetch_add so generation matches the accompanying chunk.
         if title_changed {
             let _ = meta_tx.send(Arc::new(PtyMetadata {
@@ -804,10 +803,10 @@ fn reader_thread(
         }
     };
     let gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
-    let _ = tx.send(PtyEvent::Data(Arc::new(PtyChunk {
+    let _ = tx.send(PtyEvent::Data(PtyChunk {
         generation: gen,
         data: Bytes::from(exit_msg.into_bytes()),
-    })));
+    }));
     let exit_code = status.as_ref().and_then(|s| s.code());
     let _ = meta_tx.send(Arc::new(PtyMetadata {
         reason: MetadataReason::Closed,
