@@ -134,6 +134,7 @@ fn setup_raw_mode() -> Result<TerminalGuard> {
 
 
 pub(super) async fn show_error(msg: &str) {
+    clear_screen();
     use std::io::Write;
     let _ = std::io::stderr().write_all(format!("\r\n[Error: {msg}]\r\n").as_bytes());
     let _ = std::io::stderr().flush();
