@@ -12,12 +12,12 @@ name = "termd"
 path = "src/lib.rs"
 
 [dependencies]
-tonic = { version = "0.12", features = ["transport"] }
-prost = "0.13"
-prost-types = "0.13"
+tonic = { version = "0.14", features = ["transport"] }
+prost = "0.14"
+prost-types = "0.14"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync", "net"] }
-tower = "0.4"
+tower = "0.5"
 clap = { version = "4", features = ["derive"] }
 nix = { version = "0.31", features = ["process", "signal", "term"] }
 libc = "0.2"
@@ -30,9 +30,10 @@ hostname = "0.4"
 libghostty-vt = { path = "examples/libghostty-rs/crates/libghostty-vt", default-features = false, features = ["kitty-graphics"] }
 libghostty-vt-sys = { path = "examples/libghostty-rs/crates/libghostty-vt-sys", default-features = false, features = ["pkg-config", "kitty-graphics"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+tonic-prost = "0.14.6"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"
 pkg-config = "0.3"
 
 [dev-dependencies]
