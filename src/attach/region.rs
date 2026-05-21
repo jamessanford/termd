@@ -314,6 +314,11 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                         }
                         Some(Response::Refresh(rf)) => {
                             current_refresh_gen = rf.generation;
+                            // TODO: fallback_ctx if out of bounds
+                            item.cols = rf.cols;
+                            item.rows = rf.rows;
+                            filter.update_region(rf.rows, rf.cols);
+                            filter.emit_region_setup(&mut out);
                             filter.filter(&rf.data, &mut out);
                         }
                         Some(Response::Metadata(m)) => {

@@ -54,6 +54,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                         }
                         Some(Response::Refresh(rf)) => {
                             current_refresh_gen = rf.generation;
+                            lt.resize(rf.cols, rf.rows)?;
                             lt.terminal.vt_write(&rf.data);
                             render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
                         }

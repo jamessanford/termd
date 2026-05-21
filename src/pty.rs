@@ -84,6 +84,8 @@ pub enum PtyEvent {
 pub struct RefreshData {
     pub generation: u64,
     pub data: Bytes,
+    pub cols: u32,
+    pub rows: u32,
 }
 
 // pty_id is not included — callers supply it directly from the request (see RefreshData).
@@ -508,6 +510,8 @@ fn do_refresh(
     Ok(RefreshData {
         generation,
         data: Bytes::from(out),
+        cols: cols,
+        rows: rows,
     })
 }
 
@@ -671,6 +675,8 @@ fn reader_thread(
             if let Err(e) = terminal.resize(cols as u16, rows as u16, 0, 0) {
                 tracing::debug!("PTY reader: terminal resize failed: {e}");
             } else {
+                // TODO: This looks sketchy?  It is using the new columns/rows for the refresh request even though the resize failed.  Shouldn't it use the old terminal size?
+                // TODO: I think we should STOP passing cols/rows to do_refresh everywhere, and instead have do_refresh RETURN the actual cols_rows, which the clients will accept/deal with.
                 let refresh_gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
                 match do_refresh(&terminal, current_cols, current_rows, refresh_gen) {
                     Ok(data) => { let _ = tx.send(Arc::new(PtyChunk { generation: refresh_gen, data: data.data, kind: PtyChunkKind::Repaint })); }
