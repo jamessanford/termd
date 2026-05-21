@@ -1,3 +1,6 @@
+[alias]
+release-static = "build --release --features libghostty-vt-sys/link-static"
+
 [env]
 # Always build libghostty-vt with Zig ReleaseFast optimizations regardless of
 # whether the Rust build is debug or release. This disables the debug-mode
