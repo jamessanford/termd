@@ -34,7 +34,7 @@ message RefreshRequest     { string pty_id = 1; }
 message ScrollbackRequest {
   string pty_id     = 1;
   // Distance from the active-screen edge, in rows.
-  // 0 = the row immediately above the active screen (most recent history).
+  // 0 = the bottom of the active screen
   uint32 row_offset = 2;
   // Maximum number of scrollback rows to return. Must be > 0; 0 returns empty data.
   uint32 row_count  = 3;
