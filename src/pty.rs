@@ -636,7 +636,7 @@ fn reader_thread(
     let mut terminal = match Terminal::new(TerminalOptions {
         cols: init_cols as u16,
         rows: init_rows as u16,
-        max_scrollback: 10_000,
+        max_scrollback: 1_000_000, // NOTE: this is bytes of scrollback, not lines
     }) {
         Ok(t) => t,
         Err(e) => {
