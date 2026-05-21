@@ -22,7 +22,7 @@ pub fn pty_info_to_item(info: PtyInfo) -> PtyItem {
             seconds: created.as_secs() as i64,
             nanos:   created.subsec_nanos() as i32,
         }),
-        subscribers: info.subscribers.into_iter().map(|(id, s)| {
+        subscribers: info.subscribers.unwrap_or_default().into_iter().map(|(id, s)| {
             let sub_created = s.created_at
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();

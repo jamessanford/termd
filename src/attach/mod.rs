@@ -191,7 +191,12 @@ async fn subscribe(
 ) -> anyhow::Result<()> {
     let (cols, rows) = get_terminal_size();
     cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id.to_owned(), hostname: "unknown".to_string(), cols: cols, rows: rows })),
+        command: Some(Command::Subscribe(SubscribeRequest {
+            pty_id:   pty_id.to_owned(),
+            hostname: hostname::get().unwrap_or_default().to_string_lossy().into_owned(),
+            cols,
+            rows,
+        })),
     }).await?;
     loop {
         match resp_rx.message().await? {
@@ -686,7 +691,12 @@ async fn run_debug(client: &mut AuthedClient, pty_id: String) -> Result<()> {
     // Subscribe
     let (cols, rows) = get_terminal_size();
     cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id.clone(), hostname: "unknown".to_string(), cols: cols, rows: rows })),
+        command: Some(Command::Subscribe(SubscribeRequest {
+            pty_id:   pty_id.clone(),
+            hostname: hostname::get().unwrap_or_default().to_string_lossy().into_owned(),
+            cols,
+            rows,
+        })),
     }).await?;
 
     loop {

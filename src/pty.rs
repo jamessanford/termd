@@ -41,7 +41,7 @@ pub struct PtyInfo {
     pub rows:        u32,
     pub title:       String,
     pub created_at:  SystemTime,
-    pub subscribers: Vec<(String, SubscriberInfo)>,
+    pub subscribers: Option<Vec<(String, SubscriberInfo)>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,9 +117,12 @@ pub struct PtyHandle {
 
 impl PtyHandle {
     pub fn info(&self) -> PtyInfo {
-        let subscribers: Vec<(String, SubscriberInfo)> = {
+        let subscribers = {
             let map = self.subscribers.read().unwrap();
-            map.iter().map(|(id, s)| (id.clone(), s.clone())).collect()
+            let mut v: Vec<(String, SubscriberInfo)> =
+                map.iter().map(|(id, s)| (id.clone(), s.clone())).collect();
+            v.sort_by_key(|(_, s)| s.created_at);
+            v
         };  // read-lock released here
         PtyInfo {
             id:          self.id.clone(),
@@ -129,7 +132,7 @@ impl PtyHandle {
             rows:        self.rows.load(Ordering::Relaxed),
             title:       self.title.lock().unwrap().clone(),
             created_at:  self.created_at,
-            subscribers,
+            subscribers: Some(subscribers),
         }
     }
 
@@ -776,7 +779,7 @@ fn reader_thread(
                     rows: current_rows,
                     title: current_title,
                     created_at,
-                    subscribers: vec![], // subscriber list unavailable in reader thread
+                    subscribers: None, // subscriber map lives on PtyHandle, unavailable here
                 },
             }));
         }
@@ -826,7 +829,7 @@ fn reader_thread(
             rows: current_rows,
             title: title.lock().unwrap().clone(),
             created_at,
-            subscribers: vec![], // subscriber list unavailable in reader thread
+            subscribers: None, // subscriber map lives on PtyHandle, unavailable here
         },
     }));
 
@@ -862,7 +865,7 @@ mod subscriber_tests {
     fn upsert_inserts_new_subscriber() {
         let h = make_handle();
         h.upsert_subscriber("abc", make_info("host1"));
-        let subs = h.info().subscribers;
+        let subs = h.info().subscribers.unwrap();
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].0, "abc");
         assert_eq!(subs[0].1.hostname, "host1");
@@ -878,7 +881,7 @@ mod subscriber_tests {
         h.upsert_subscriber("abc", SubscriberInfo {
             hostname: "host2".into(), cols: 100, rows: 30, created_at: SystemTime::now(),
         });
-        let subs = h.info().subscribers;
+        let subs = h.info().subscribers.unwrap();
         assert_eq!(subs.len(), 1, "no duplicate");
         assert_eq!(subs[0].1.hostname, "host2");
         assert_eq!(subs[0].1.cols, 100);
@@ -890,7 +893,7 @@ mod subscriber_tests {
         let h = make_handle();
         h.upsert_subscriber("abc", make_info("host1"));
         h.remove_subscriber("abc");
-        assert!(h.info().subscribers.is_empty());
+        assert!(h.info().subscribers.unwrap().is_empty());
     }
 
     #[test]
