@@ -20,13 +20,14 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
 
     let mut stdout = tokio::io::stdout();
     let mut out = Vec::new();
+    let mut current_refresh_gen = refresh_gen;
 
     render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
     stdout.write_all(&out).await?;
 
     // Replay stream chunks buffered while awaiting the initial Refresh response
     for (gen, data) in &buffered {
-        if *gen > refresh_gen {
+        if *gen > current_refresh_gen {
             lt.terminal.vt_write(data);
             out.clear();
             render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, false, &mut out)?;
@@ -46,10 +47,15 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                 match msg {
                     Ok(Some(r)) => match r.response {
                         Some(Response::Stream(s)) => {
-                            if s.generation > refresh_gen {
+                            if s.generation > current_refresh_gen {
                                 lt.terminal.vt_write(&s.data);
                                 render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, false, &mut out)?;
                             }
+                        }
+                        Some(Response::Refresh(rf)) => {
+                            current_refresh_gen = rf.generation;
+                            lt.terminal.vt_write(&rf.data);
+                            render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
                         }
                         Some(Response::Metadata(m)) => {
                             if m.reason == StreamMetadataReason::Resize as i32 {
@@ -76,7 +82,8 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                 let action = action.unwrap_or(super::InputAction::Detach);
                 return Ok(super::RunOutcome::Action(action, super::RunContext {
                     resp_rx, cmd_tx, pty_id, item,
-                    refresh_gen, refresh_bytes: vec![], buffered: vec![],
+                    refresh_gen: current_refresh_gen,
+                    refresh_bytes: vec![], buffered: vec![],
                     action_rx,
                 }));
             }
