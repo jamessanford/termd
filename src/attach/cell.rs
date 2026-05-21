@@ -130,6 +130,11 @@ fn render_dirty(
         ),
     };
 
+    // Disable auto-wrap for the entire repaint. Writing to the last cell of the
+    // last row would otherwise scroll the screen up. All cursor movement here is
+    // explicit, so wrap mode is irrelevant until we're done.
+    out.extend_from_slice(b"\x1b[?7l");
+
     let mut row_iter_active = row_iter.update(&snapshot)?;
     let mut row_idx: u32 = 0;
     let mut char_enc = [0u8; 4];
@@ -191,7 +196,7 @@ fn render_dirty(
         row_idx += 1;
     }
 
-    out.extend_from_slice(b"\x1b[0m");
+    out.extend_from_slice(b"\x1b[0m\x1b[?7h");
     if cursor_visible { out.extend_from_slice(b"\x1b[?25h"); } else { out.extend_from_slice(b"\x1b[?25l"); }
     write!(out, "\x1b[{};{}H", cursor_y + 1, cursor_x + 1).ok();
 
