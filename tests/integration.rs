@@ -757,8 +757,10 @@ async fn test_scrollback_via_grpc() {
     match resp.response.unwrap() {
         termd::proto::terminal_response::Response::Scrollback(sr) => {
             assert_eq!(sr.pty_id, pty_id);
-            assert_eq!(sr.total_scrollback_rows, 0, "fresh PTY should have no scrollback history");
-            assert!(sr.data.is_empty(), "fresh PTY should return no scrollback data");
+            // With Point::Screen semantics total includes the active screen rows even
+            // when there is no history yet.
+            assert_eq!(sr.total_scrollback_rows, 24, "fresh PTY total should equal screen rows");
+            assert!(sr.data.is_empty(), "blank active screen produces no VT output");
         }
         other => panic!("unexpected: {other:?}"),
     }

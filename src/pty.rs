@@ -525,7 +525,10 @@ fn do_scrollback(
     generation: u64,
     cols:       u32,
 ) -> Result<ScrollbackData> {
-    let total = terminal.scrollback_rows()? as u32;
+    // Screen space covers history + active screen; y=0 is oldest history, y=total-1
+    // is the last row of the active screen. row_offset=0 therefore starts from the
+    // visible screen and increases upward into history.
+    let total = terminal.total_rows()? as u32;
 
     if total == 0 || row_count == 0 {
         return Ok(ScrollbackData { generation, data: Bytes::new(), total_scrollback_rows: total });
@@ -556,15 +559,14 @@ fn do_scrollback(
         },
     };
 
-    // Full-buffer case: use Point::History endpoints to restrict output to scrollback only.
-    // (selection: None would include the active screen — incorrect for a scrollback request.)
-    // NOTE: grid_ref(Point::History(...)) traverses the internal scrollback page list to
+    // Full-buffer case: use Point::Screen endpoints to cover history + active screen.
+    // NOTE: grid_ref(Point::Screen(...)) traverses the internal scrollback page list to
     // locate the target row, which is O(scrollback_depth). If scrollback requests become a
     // latency concern (do_scrollback runs on the reader thread, blocking live PTY I/O),
     // consider offloading to a background thread.
     if row_offset == 0 && row_count >= total {
-        let top_left = terminal.grid_ref(Point::History(PointCoordinate { x: 0, y: 0 }))?;
-        let bot_right = terminal.grid_ref(Point::History(PointCoordinate {
+        let top_left = terminal.grid_ref(Point::Screen(PointCoordinate { x: 0, y: 0 }))?;
+        let bot_right = terminal.grid_ref(Point::Screen(PointCoordinate {
             x: cols.saturating_sub(1) as u16,
             y: total - 1,
         }))?;
@@ -584,14 +586,14 @@ fn do_scrollback(
         });
     }
 
-    // Partial range: convert row_offset (distance from bottom) to Point::History y-coords.
-    // History: y=0 = oldest row, y=total-1 = most recent row (just above active screen).
+    // Partial range: convert row_offset (distance from bottom of screen) to Point::Screen y-coords.
+    // Screen: y=0 = oldest history row, y=total-1 = last row of active screen.
     let end_y   = total - 1 - row_offset;
     let rows    = row_count.min(end_y + 1);
     let start_y = end_y + 1 - rows;
 
-    let top_left = terminal.grid_ref(Point::History(PointCoordinate { x: 0, y: start_y }))?;
-    let bot_right = terminal.grid_ref(Point::History(PointCoordinate {
+    let top_left = terminal.grid_ref(Point::Screen(PointCoordinate { x: 0, y: start_y }))?;
+    let bot_right = terminal.grid_ref(Point::Screen(PointCoordinate {
         x: cols.saturating_sub(1) as u16,
         y: end_y,
     }))?;
@@ -912,13 +914,11 @@ mod scrollback_tests {
     }
 
     #[test]
-    fn do_scrollback_empty_when_no_history() {
+    fn do_scrollback_empty_when_row_count_zero() {
         let terminal = make_terminal(80, 24, 1000);
-        // No data written — scrollback_rows() == 0
-        let result = do_scrollback(&terminal, 0, 100, 42, 80).unwrap();
+        let result = do_scrollback(&terminal, 0, 0, 42, 80).unwrap();
         assert_eq!(result.generation, 42);
         assert!(result.data.is_empty());
-        assert_eq!(result.total_scrollback_rows, 0);
     }
 
     #[test]
@@ -928,8 +928,8 @@ mod scrollback_tests {
         for i in 0..15u8 {
             terminal.vt_write(format!("line{}\n", i).as_bytes());
         }
-        let total = terminal.scrollback_rows().unwrap() as u32;
-        assert!(total > 0, "expected some scrollback");
+        let total = terminal.total_rows().unwrap() as u32;
+        assert!(total > 0, "expected rows");
         let result = do_scrollback(&terminal, total, 10, 7, 80).unwrap();
         assert!(result.data.is_empty());
         assert_eq!(result.total_scrollback_rows, total);
