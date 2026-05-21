@@ -165,6 +165,7 @@ fn reset_terminal_modes() {
         "\x1b[?2004l",  // disable bracketed paste
         "\x1b[r",       // reset DECSTBM scroll region to full screen
         "\x1b[?69l",    // disable DECLRMM (horizontal margins)
+        "\x1b[?7h",     // re-enable auto-wrap (DECAWM)
         "\x1b[0m",      // reset SGR (colors, attributes)
         "\x1b[<1u",     // pop kitty keyboard protocol
         "\x1b[0q",      // reset cursor style to default
