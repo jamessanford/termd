@@ -706,9 +706,11 @@ async fn run_debug(client: &mut AuthedClient, pty_id: String) -> Result<()> {
         match resp_rx.message().await? {
             None => { eprintln!("server disconnected during subscribe"); return Ok(()); }
             Some(r) => match r.response {
-                Some(Response::Command(c)) => {
-                    if !c.success {
-                        eprintln!("subscribe failed: {}", c.error.unwrap_or_default());
+                Some(Response::Subscribe(s)) => {
+                    if s.success {
+                        eprintln!("[Subscribe pty_id={} subscriber_id={}]", s.pty_id, s.subscriber_id);
+                    } else {
+                        eprintln!("subscribe failed: {}", s.error.unwrap_or_default());
                         return Ok(());
                     }
                     break;
@@ -748,4 +750,3 @@ async fn run_debug(client: &mut AuthedClient, pty_id: String) -> Result<()> {
 
     Ok(())
 }
-
