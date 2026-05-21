@@ -440,10 +440,12 @@ impl Default for PtyRegistry {
 // pushing a full render of the new screen to all subscribers immediately after the switch.
 fn do_refresh(
     terminal: &Terminal<'static, 'static>,
-    cols: u32,
-    rows: u32,
     generation: u64,
 ) -> Result<RefreshData> {
+
+    let cols = terminal.cols()? as u32;
+    let rows = terminal.rows()? as u32;
+
     // Snapshot cursor visibility; formatter modes:true may not emit ?25h for the default-visible
     // case, so we emit it explicitly at the end to guarantee correct state after a PTY switch.
     let cursor_visible = {
@@ -675,10 +677,8 @@ fn reader_thread(
             if let Err(e) = terminal.resize(cols as u16, rows as u16, 0, 0) {
                 tracing::debug!("PTY reader: terminal resize failed: {e}");
             } else {
-                // TODO: This looks sketchy?  It is using the new columns/rows for the refresh request even though the resize failed.  Shouldn't it use the old terminal size?
-                // TODO: I think we should STOP passing cols/rows to do_refresh everywhere, and instead have do_refresh RETURN the actual cols_rows, which the clients will accept/deal with.
                 let refresh_gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
-                match do_refresh(&terminal, current_cols, current_rows, refresh_gen) {
+                match do_refresh(&terminal, refresh_gen) {
                     Ok(data) => { let _ = tx.send(Arc::new(PtyChunk { generation: refresh_gen, data: data.data, kind: PtyChunkKind::Repaint })); }
                     Err(e) => tracing::debug!("PTY reader: resize refresh failed: {e}"),
                 }
@@ -686,7 +686,7 @@ fn reader_thread(
         }
         while let Ok(reply_tx) = refresh_rx.try_recv() {
             let gen = generation.load(Ordering::Relaxed);
-            let result = do_refresh(&terminal, current_cols, current_rows, gen);
+            let result = do_refresh(&terminal, gen);
             let _ = reply_tx.send(result);
         }
         while let Ok((row_offset, row_count, reply_tx)) = scrollback_rx.try_recv() {
@@ -788,7 +788,7 @@ fn reader_thread(
         // so subscribers that hadn't seen it get the correct content immediately.
         if screen_changed {
             let refresh_gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
-            match do_refresh(&terminal, current_cols, current_rows, refresh_gen) {
+            match do_refresh(&terminal, refresh_gen) {
                 Ok(data) => { let _ = tx.send(Arc::new(PtyChunk { generation: refresh_gen, data: data.data, kind: PtyChunkKind::Repaint })); }
                 Err(e) => tracing::debug!("PTY reader: screen-switch refresh failed: {e}"),
             }
@@ -837,7 +837,7 @@ fn reader_thread(
     // Drain any refresh requests that arrived just before exit
     while let Ok(reply_tx) = refresh_rx.try_recv() {
         let gen = generation.load(Ordering::Relaxed);
-        let result = do_refresh(&terminal, current_cols, current_rows, gen);
+        let result = do_refresh(&terminal, gen);
         let _ = reply_tx.send(result);
     }
     while let Ok((row_offset, row_count, reply_tx)) = scrollback_rx.try_recv() {
