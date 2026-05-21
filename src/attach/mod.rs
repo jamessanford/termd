@@ -375,6 +375,7 @@ async fn show_list(
         return Ok(None);
     }
     if pty_list.is_empty() {
+        show_error("[No PTYs available]").await;
         return Ok(None);
     }
 
