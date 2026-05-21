@@ -375,6 +375,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
             _ = sigwinch.recv() => {
                 let (new_cols, new_rows) = super::get_terminal_size();
                 if new_rows < filter.server_rows || new_cols < filter.server_cols {
+                    // TODO: Move to consolidated upgrade/downgrade code that can dynamically switch, as long as we originally started in region mode.  The logic should remain in mod.rs.
                     eprintln!(
                         "[region: client shrank to ({}x{}), smaller than server ({}x{}); \
                          switching to cell mode]",
@@ -389,6 +390,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                     });
                     break;
                 }
+                // TODO: Send a SubscribeUpdate RPC to inform new_rows new_cols in a fire-and-forget way
                 filter.update_client_size(new_rows, new_cols);
                 filter.emit_region_setup(&mut out);
             }
