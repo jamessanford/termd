@@ -329,7 +329,6 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                                         // hands cell mode the current server dimensions.
                                         item.cols = mi.cols;
                                         item.rows = mi.rows;
-                                        filter.update_region(mi.rows, mi.cols);
                                         if mi.cols > client_cols || mi.rows > client_rows {
                                             eprintln!(
                                                 "[region: server resized to ({}x{}), larger than \
@@ -345,7 +344,9 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                                             });
                                             break;
                                         }
-                                        out.extend_from_slice(b"\x1b[2J");
+                                        filter.update_region(mi.rows, mi.cols);
+// CHECK
+//                                        out.extend_from_slice(b"\x1b[2J");
                                         filter.emit_region_setup(&mut out);
                                     }
                                 }
@@ -395,7 +396,9 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                     });
                     break;
                 }
+
                 // TODO: Send a SubscribeUpdate RPC to inform new_rows new_cols in a fire-and-forget way
+                // BUG: Something is broken here, we should be able to handle sigwinch no problem (and not do anything weird to our terminal), but without emit_region, we lose the regions?!  and something is resetting the cursor position.
                 filter.update_client_size(new_rows, new_cols);
                 filter.emit_region_setup(&mut out);
             }
