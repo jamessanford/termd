@@ -60,7 +60,7 @@ message PtyItem {
   uint32                    cols        = 4;
   uint32                    rows        = 5;
   string                    title       = 6;
-  reserved                  7;
+  reserved                                7;
   google.protobuf.Timestamp created_at  = 8;
   repeated SubscriberInfo   subscribers = 9;
 }
@@ -73,8 +73,8 @@ message RefreshResponse {
   string pty_id     = 1;
   uint64 generation = 2;
   bytes  data       = 3;
-  uint32 cursor_x   = 4;
-  uint32 cursor_y   = 5;
+  reserved            4;
+  reserved            5;
 }
 
 message ScrollbackResponse {

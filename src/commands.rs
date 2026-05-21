@@ -251,8 +251,6 @@ pub async fn handle_refresh(registry: &PtyRegistry, req: RefreshRequest) -> Term
                     pty_id: id,
                     generation: data.generation,
                     data: data.data.to_vec(),
-                    cursor_x: data.cursor_x,
-                    cursor_y: data.cursor_y,
                 })),
             },
             Err(e) => err_response(id, e.to_string()),

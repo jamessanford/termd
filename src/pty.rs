@@ -84,8 +84,6 @@ pub enum PtyEvent {
 pub struct RefreshData {
     pub generation: u64,
     pub data: Bytes,
-    pub cursor_x: u32,
-    pub cursor_y: u32,
 }
 
 // pty_id is not included — callers supply it directly from the request (see RefreshData).
@@ -444,9 +442,6 @@ fn do_refresh(
     rows: u32,
     generation: u64,
 ) -> Result<RefreshData> {
-    let cursor_x = terminal.cursor_x().unwrap_or(0) as u32;
-    let cursor_y = terminal.cursor_y().unwrap_or(0) as u32;
-
     // Snapshot cursor visibility; formatter modes:true may not emit ?25h for the default-visible
     // case, so we emit it explicitly at the end to guarantee correct state after a PTY switch.
     let cursor_visible = {
@@ -513,8 +508,6 @@ fn do_refresh(
     Ok(RefreshData {
         generation,
         data: Bytes::from(out),
-        cursor_x,
-        cursor_y,
     })
 }
 
