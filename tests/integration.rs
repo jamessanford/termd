@@ -7,7 +7,7 @@ use tonic::Request;
 use tower::service_fn;
 use hyper_util::rt::TokioIo;
 use termd::pty::PtyRegistry;
-use termd::pty::MetadataReason;
+use termd::pty::{MetadataReason, PtyEvent};
 use termd::server::make_service;
 use termd::proto::terminal_service_client::TerminalServiceClient;
 use termd::proto::{TerminalCommand, terminal_command};
@@ -171,13 +171,14 @@ async fn test_exit_notification_broadcast() {
     let found = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(chunk) => {
+                Ok(PtyEvent::Data(chunk)) => {
                     // Exit notification format: "\r\n[Command <title> exited with code <N>]\r\n"
                     // Match the stable prefix regardless of title content or exit code.
                     if chunk.data.windows(9).any(|w| w == b"[Command ") {
                         return true;
                     }
                 }
+                Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             }
@@ -198,10 +199,14 @@ async fn test_write_produces_broadcast_output() {
 
     let chunk = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let chunk = rx.recv().await.expect("broadcast recv failed");
-            let text = String::from_utf8_lossy(&chunk.data);
-            if text.contains("__termd_test__") {
-                return chunk;
+            match rx.recv().await.expect("broadcast recv failed") {
+                PtyEvent::Data(chunk) => {
+                    let text = String::from_utf8_lossy(&chunk.data);
+                    if text.contains("__termd_test__") {
+                        return chunk;
+                    }
+                }
+                _ => continue,
             }
         }
     })
@@ -367,6 +372,36 @@ async fn test_resize_broadcasts_metadata() {
     .unwrap_or(false);
 
     assert!(found, "resize should broadcast a Resize metadata event");
+}
+
+#[tokio::test]
+async fn test_resize_broadcasts_refresh_event() {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let registry = PtyRegistry::new();
+    let handle = registry.create(80, 24, None).unwrap();
+    let mut rx = handle.subscribe();
+
+    handle.resize(120, 40).unwrap();
+
+    let found = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.recv().await {
+                Ok(event) => match event {
+                    PtyEvent::Refresh(rd) => {
+                        return rd.cols == 120 && rd.rows == 40;
+                    }
+                    _ => continue,
+                },
+                Err(RecvError::Closed) => return false,
+                Err(RecvError::Lagged(_)) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(found, "resize should broadcast a PtyEvent::Refresh with updated cols/rows");
 }
 
 #[tokio::test]

@@ -141,8 +141,8 @@ pub fn handle_subscribe(
                     loop {
                         tokio::select! {
                             item = data_stream.next() => match item {
-                                Some(Ok(chunk)) => {
-                                    if tx.send((pty_id_clone.clone(), PtyEvent::Data(chunk))).await.is_err() { break; }
+                                Some(Ok(event)) => {
+                                    if tx.send((pty_id_clone.clone(), event)).await.is_err() { break; }
                                 }
                                 Some(Err(BroadcastStreamRecvError::Lagged(n))) => {
                                     tracing::warn!(pty_id = %pty_id_clone, skipped = n, "data broadcast lagged");

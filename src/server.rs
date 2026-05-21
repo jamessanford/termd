@@ -123,6 +123,17 @@ impl TerminalService for TerminalServiceImpl {
                                     proto::StreamData { pty_id, generation: chunk.generation, data: chunk.data.to_vec() }
                                 )),
                             },
+                            PtyEvent::Refresh(rd) => proto::TerminalResponse {
+                                response: Some(proto::terminal_response::Response::Refresh(
+                                    proto::RefreshResponse {
+                                        pty_id,
+                                        generation: rd.generation,
+                                        data: rd.data.to_vec(),
+                                        cols: rd.cols,
+                                        rows: rd.rows,
+                                    }
+                                )),
+                            },
                             PtyEvent::Metadata(meta) => {
                                 use proto::StreamMetadataReason;
                                 let reason = match meta.reason {

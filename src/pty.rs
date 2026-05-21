@@ -44,19 +44,10 @@ pub struct PtyInfo {
     pub subscribers: Option<Vec<(String, SubscriberInfo)>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PtyChunkKind {
-    /// Raw bytes from the PTY master — incremental update.
-    Stream,
-    /// Full screen repaint (formatter output) — treat as a refresh snapshot.
-    Repaint,
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PtyChunk {
     pub generation: u64,
     pub data: Bytes,
-    pub kind: PtyChunkKind,
 }
 
 #[derive(Clone, Debug)]
@@ -75,12 +66,14 @@ pub struct PtyMetadata {
     pub info: PtyInfo,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PtyEvent {
     Data(Arc<PtyChunk>),
+    Refresh(Arc<RefreshData>),
     Metadata(Arc<PtyMetadata>),
 }
 
+#[derive(Clone, Debug)]
 pub struct RefreshData {
     pub generation: u64,
     pub data: Bytes,
@@ -103,7 +96,7 @@ pub struct PtyHandle {
     cols: AtomicU32,
     rows: AtomicU32,
     title: Arc<Mutex<String>>,
-    tx: broadcast::Sender<Arc<PtyChunk>>,
+    tx: broadcast::Sender<PtyEvent>,
     writer: Mutex<File>,
     refresh_tx:    std::sync::mpsc::SyncSender<oneshot::Sender<Result<RefreshData>>>,
     scrollback_tx: std::sync::mpsc::SyncSender<(u32, u32, oneshot::Sender<Result<ScrollbackData>>)>,
@@ -136,7 +129,7 @@ impl PtyHandle {
         }
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<PtyChunk>> {
+    pub fn subscribe(&self) -> broadcast::Receiver<PtyEvent> {
         self.tx.subscribe()
     }
 
@@ -337,7 +330,7 @@ impl PtyRegistry {
             return Err(std::io::Error::last_os_error()).context("set O_NONBLOCK on master reader fd");
         }
 
-        let (tx, _) = broadcast::channel::<Arc<PtyChunk>>(512);
+        let (tx, _) = broadcast::channel::<PtyEvent>(512);
         let (meta_tx, _) = broadcast::channel::<Arc<PtyMetadata>>(64);
         let (refresh_tx, refresh_rx) =
             std::sync::mpsc::sync_channel::<oneshot::Sender<Result<RefreshData>>>(8);
@@ -616,7 +609,7 @@ fn do_scrollback(
 // Reader thread — owns libghostty Terminal state (not Send + Sync).
 fn reader_thread(
     mut master: File,
-    tx: broadcast::Sender<Arc<PtyChunk>>,
+    tx: broadcast::Sender<PtyEvent>,
     generation: Arc<AtomicU64>,
     refresh_rx: std::sync::mpsc::Receiver<oneshot::Sender<Result<RefreshData>>>,
     scrollback_rx: std::sync::mpsc::Receiver<(u32, u32, oneshot::Sender<Result<ScrollbackData>>)>,
@@ -679,7 +672,7 @@ fn reader_thread(
             } else {
                 let refresh_gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
                 match do_refresh(&terminal, refresh_gen) {
-                    Ok(data) => { let _ = tx.send(Arc::new(PtyChunk { generation: refresh_gen, data: data.data, kind: PtyChunkKind::Repaint })); }
+                    Ok(data) => { let _ = tx.send(PtyEvent::Refresh(Arc::new(data))); }
                     Err(e) => tracing::debug!("PTY reader: resize refresh failed: {e}"),
                 }
             }
@@ -763,9 +756,8 @@ fn reader_thread(
         let chunk = Arc::new(PtyChunk {
             generation: gen,
             data: Bytes::from(batch),
-            kind: PtyChunkKind::Stream,
         });
-        let _ = tx.send(chunk); // ignore SendError (no subscribers is fine)
+        let _ = tx.send(PtyEvent::Data(chunk)); // ignore SendError (no subscribers is fine)
         // Emit TitleChanged after fetch_add so generation matches the accompanying chunk.
         if title_changed {
             let _ = meta_tx.send(Arc::new(PtyMetadata {
@@ -789,7 +781,7 @@ fn reader_thread(
         if screen_changed {
             let refresh_gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
             match do_refresh(&terminal, refresh_gen) {
-                Ok(data) => { let _ = tx.send(Arc::new(PtyChunk { generation: refresh_gen, data: data.data, kind: PtyChunkKind::Repaint })); }
+                Ok(data) => { let _ = tx.send(PtyEvent::Refresh(Arc::new(data))); }
                 Err(e) => tracing::debug!("PTY reader: screen-switch refresh failed: {e}"),
             }
         }
@@ -812,11 +804,10 @@ fn reader_thread(
         }
     };
     let gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
-    let _ = tx.send(Arc::new(PtyChunk {
+    let _ = tx.send(PtyEvent::Data(Arc::new(PtyChunk {
         generation: gen,
         data: Bytes::from(exit_msg.into_bytes()),
-        kind: PtyChunkKind::Stream,
-    }));
+    })));
     let exit_code = status.as_ref().and_then(|s| s.code());
     let _ = meta_tx.send(Arc::new(PtyMetadata {
         reason: MetadataReason::Closed,
