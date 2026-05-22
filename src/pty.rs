@@ -267,17 +267,18 @@ impl PtyRegistry {
             nix::pty::ptsname_r(&nix::pty::PtyMaster::from_owned_fd(owned))
         }.unwrap_or_else(|_| String::from("unknown"));
 
-        // Set close-on-exec on master fd so child doesn't inherit it
-        let rc = unsafe { libc::fcntl(master_fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        if rc < 0 {
-            return Err(std::io::Error::last_os_error()).context("set FD_CLOEXEC on master fd");
-        }
+        // NOTE: Check if we leak fds (master_fd, master_reader_fd, slave_fd, slave_stdout, slave_stderr) after this point if things fail (probably OK to leak if "weird" things fail, like the fnctl's but if the child spawn itself fails, and we bail out, make sure we don't leak)
 
-        // Spawn child shell
-        let shell = command.map(String::from).unwrap_or_else(|| {
-            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
-        });
-        let title = Arc::new(Mutex::new(pts_name.clone()));
+        // Dup master_fd for the reader thread before File::from_raw_fd takes ownership
+        let master_reader_fd = unsafe { libc::dup(master_fd) };
+        if master_reader_fd < 0 {
+            return Err(std::io::Error::last_os_error()).context("dup master fd for reader");
+        }
+        // Set O_NONBLOCK so the reader can drain all available bytes in a loop
+        let flags = unsafe { libc::fcntl(master_reader_fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(master_reader_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("set O_NONBLOCK on master reader fd");
+        }
 
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
@@ -287,15 +288,19 @@ impl PtyRegistry {
         if slave_stdout < 0 || slave_stderr < 0 {
             return Err(std::io::Error::last_os_error()).context("dup slave fd");
         }
-        // Set FD_CLOEXEC on all slave fds so concurrent forks (e.g., tests spawning
-        // other PTYs) don't inherit them.  Rust's spawn dup2s them to 0/1/2 in the
+        // Set FD_CLOEXEC on all master_fd and slave fds so concurrent forks
+        // don't inherit them. Rust's spawn dup2s them to 0/1/2 in the
         // child before exec, so the shell still gets them correctly.
-        for &fd in &[slave_fd, slave_stdout, slave_stderr] {
+        for &fd in &[master_fd, master_reader_fd, slave_fd, slave_stdout, slave_stderr] {
             let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
             if rc < 0 {
-                return Err(std::io::Error::last_os_error()).context("set FD_CLOEXEC on slave fd");
+                return Err(std::io::Error::last_os_error()).context("set FD_CLOEXEC on open fds");
             }
         }
+        // Spawn child shell
+        let shell = command.map(String::from).unwrap_or_else(|| {
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+        });
         let mut cmd = Command::new(&shell);
         cmd.env("TERM", TERM_NAME)
            .env_remove("TERM_PROGRAM")
@@ -317,17 +322,6 @@ impl PtyRegistry {
                 // TODO: systemd-logind session registration (Linux)
                 Ok(())
             });
-        }
-
-        // Dup master_fd for the reader thread before File::from_raw_fd takes ownership
-        let master_reader_fd = unsafe { libc::dup(master_fd) };
-        if master_reader_fd < 0 {
-            return Err(std::io::Error::last_os_error()).context("dup master fd for reader");
-        }
-        // Set O_NONBLOCK so the reader can drain all available bytes in a loop
-        let flags = unsafe { libc::fcntl(master_reader_fd, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(master_reader_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(std::io::Error::last_os_error()).context("set O_NONBLOCK on master reader fd");
         }
 
         let (tx, _) = broadcast::channel::<PtyEvent>(512);
@@ -355,8 +349,9 @@ impl PtyRegistry {
         // slave fds are owned by the Stdio objects passed to Command and closed after fork;
 
         let child_pid = Pid::from_raw(child.id() as i32);
-        crate::utmp::add_record(master_reader_fd, &hostname);
+        crate::utmp::add_record(master.as_raw_fd(), &hostname);
         let created_at = SystemTime::now();
+        let title = Arc::new(Mutex::new(pts_name.clone()));
         let meta_tx_for_thread = meta_tx.clone();
         let id_for_thread = id.clone();
         let hostname_for_thread = hostname.clone();
