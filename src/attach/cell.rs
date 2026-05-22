@@ -90,7 +90,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                 }));
             }
             _ = sigwinch.recv() => {
-                // TODO: Send a SubscribeUpdate RPC to inform new_rows new_cols in a fire-and-forget way
+                // Placeholder: Trigger debounced SubscribeUpdate RPC here to inform new_rows new_cols
                 render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
             }
         }

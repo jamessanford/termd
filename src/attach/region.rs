@@ -402,8 +402,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                     break;
                 }
 
-                // TODO: Send a SubscribeUpdate RPC to inform new_rows new_cols in a fire-and-forget way
-                // BUG: When the client's terminal resizes, it loses the regions, but when we reset them, we lose the cursor position.  Let's send RefreshRequest down the line (debounce it, wait a second, we might be getting lots of sigwinches).  Don't emit region setup here; let refresh do that (so during the resizing stream data will "fill the terminal" but then "snap back" to normal only once when the refresh arrives)
+                // Placeholder: Trigger debounced SubscribeUpdate RPC here to inform new_rows new_cols
                 filter.update_client_size(new_rows, new_cols);
                 filter.emit_region_setup(&mut out);
             }
