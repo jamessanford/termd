@@ -63,7 +63,8 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                                 if let Some(ref mi) = m.item {
                                     if mi.cols > 0 && mi.rows > 0 {
                                         lt.resize(mi.cols, mi.rows)?;
-                                        out.extend_from_slice(b"\x1b[2J");
+                                        // No need to clear screen or re-render,
+                                        // a full Refresh will be arriving soon.
                                     }
                                 }
                             } else if m.reason == StreamMetadataReason::Closed as i32 {
