@@ -345,9 +345,10 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                                             break;
                                         }
                                         filter.update_region(mi.rows, mi.cols);
-// CHECK
-//                                        out.extend_from_slice(b"\x1b[2J");
                                         filter.emit_region_setup(&mut out);
+                                        // A full refresh is almost certainly arriving next,
+                                        // don't output any other codes.
+                                        // Consider ignoring StreamMetadataReason::Resize entirely.
                                     }
                                 }
                             } else if m.reason == StreamMetadataReason::Closed as i32 {
@@ -364,6 +365,10 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                 }
             }
             action = action_rx.recv() => {
+                // TODO: Consider changing this to a "next_action_ctx" and break out of the loop,
+                //       also have the "fallback_ctx" code set next_action instead.
+                //       That way we always get the correct cleanup code on exit (right now, just the margin restoration)
+                //  Also, we probably don't need to return a "ctx" at all, just the Outcome.  The existing code doesn't really need the ctx returned back.
                 let action = action.unwrap_or(super::InputAction::Detach);
                 // Restore client terminal margins before handing back context.
                 let _ = stdout.write_all(b"\x1b[r").await;
@@ -398,7 +403,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                 }
 
                 // TODO: Send a SubscribeUpdate RPC to inform new_rows new_cols in a fire-and-forget way
-                // BUG: Something is broken here, we should be able to handle sigwinch no problem (and not do anything weird to our terminal), but without emit_region, we lose the regions?!  and something is resetting the cursor position.
+                // BUG: When the client's terminal resizes, it loses the regions, but when we reset them, we lose the cursor position.  Let's send RefreshRequest down the line (debounce it, wait a second, we might be getting lots of sigwinches).  Don't emit region setup here; let refresh do that (so during the resizing stream data will "fill the terminal" but then "snap back" to normal only once when the refresh arrives)
                 filter.update_client_size(new_rows, new_cols);
                 filter.emit_region_setup(&mut out);
             }
