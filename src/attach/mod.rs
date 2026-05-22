@@ -12,6 +12,7 @@ pub(super) enum InputAction {
     Destroy,
     Create,
     ForceResize,
+    ForceRefresh,
     SwitchNext,
     SwitchPrevious,
     SwitchRecent,
@@ -564,6 +565,15 @@ pub async fn run(
                         let _ = cmd_tx.send(TerminalCommand {
                             command: Some(Command::Resize(ResizeRequest {
                                 pty_id: current_pty_id.clone(), cols, rows,
+                            })),
+                        }).await;
+                        should_subscribe = false;
+                    }
+
+                    InputAction::ForceRefresh => {
+                        let _ = cmd_tx.send(TerminalCommand {
+                            command: Some(Command::Refresh(RefreshRequest {
+                                pty_id: current_pty_id.clone(),
                             })),
                         }).await;
                         should_subscribe = false;

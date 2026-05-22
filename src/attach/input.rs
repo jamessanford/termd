@@ -48,6 +48,7 @@ pub(super) fn process_byte(
             b'a'     => { to_send.push(0x01); *state = EscapeState::Normal; None }
             b'c'     => Some(InputAction::Create),
             b'F'     => Some(InputAction::ForceResize),
+            b'R'     => Some(InputAction::ForceRefresh),
             b'"'     => Some(InputAction::ShowList),
             b'i'     => Some(InputAction::ShowInfo),
             b'k'     => Some(InputAction::Destroy),
