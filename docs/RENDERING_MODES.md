@@ -1,37 +1,35 @@
-# TODO
-
 ## Rendering modes for `termd attach`
 
 ### Background
 
-The client-side renderer in `attach` has gone through several iterations. The
-current approach uses the libghostty-vt render state API, which parses the
-server PTY byte stream into terminal state and re-encodes it as VT for the
-client. There are multiple viable strategies with different tradeoffs, and we
-should be able to compare them at runtime rather than via branches.
+Rendering the server VT data stream to a local terminal is not necessarily
+straightforward, especially when the client window columns and rows do not
+match the server side.
 
-### Proposed: `--render-mode` flag for `termd attach`
+We've settled on two primary render modes to help this:
 
-Add a `--render-mode <mode>` flag (or `--renderer`) to the `Attach` subcommand
+### `--render-mode` flag for `termd attach`
+
+`--render-mode <mode>` flag (or `--renderer`) to the `Attach` subcommand
 in `src/main.rs`. Possible values:
 
 - **`cell`** (current default on `main`) — cell-by-cell render state iteration.
   Dirty tracking at row level; `Dirty::Partial` repaints only changed rows,
   `Dirty::Full` repaints everything row-by-row with cursor-goto per row.
+  Has reduced performance, but allows a "viewport" into the server window.
+  Clients typically do not want to stay in this mode for long, because they
+  cannot see the entire screen.
 
-- **`formatter`** (current default on `experimental/vt-formatter-full-dirty`) —
-  cell-by-cell for `Dirty::Partial`, libghostty VT formatter for `Dirty::Full`.
-  The formatter produces a compact VT representation of the full screen state,
-  likely much smaller than row-by-row for scroll events.
+- **`region`** (see below) — raw passthrough within a DECSTBM scroll
+  region sized to the server PTY, with in-stream rewriting of conflicting
+  escape sequences. Requires a VT stream filter (see upstream item below).
+  Works for both "same-size" and "client is larger than server"
 
-- **`raw`** — original approach: forward the raw PTY byte stream from the server
+- **`raw`** — original approach, code path now exists only for debugging/testing.
+  forward the raw PTY byte stream from the server
   directly to stdout. Works perfectly when server and client are the same size;
   breaks on size mismatch because cursor positions and scroll regions are
   absolute. Fast, zero allocation, zero parsing on the client render path.
-
-- **`region`** (future, see below) — raw passthrough within a DECSTBM scroll
-  region sized to the server PTY, with in-stream rewriting of conflicting
-  escape sequences. Requires a VT stream filter (see upstream item below).
 
 The `attach::run` function in `src/attach.rs` would take a `RenderMode` enum
 argument. Each mode is a different code path; the shared infrastructure
