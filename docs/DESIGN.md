@@ -1,3 +1,6 @@
+This was the original prompt for termd:
+---
+
 Let's create a program that runs as a gRPC bidi stream server, and
 implements those RPCs to manage terminals (PTYs) that are hooked up
 to libghostty-rs instances.
