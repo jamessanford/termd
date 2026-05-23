@@ -195,7 +195,7 @@ async fn subscribe(
     cmd_tx:  &mpsc::Sender<TerminalCommand>,
     resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
     pty_id:  &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let (cols, rows) = get_terminal_size();
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Subscribe(SubscribeRequest {
@@ -209,9 +209,10 @@ async fn subscribe(
         match resp_rx.message().await? {
             None => anyhow::bail!("server disconnected during subscribe"),
             Some(r) => match r.response {
-                Some(Response::Subscribe(c)) if c.success => return Ok(()),
+                Some(Response::Subscribe(c)) if c.success => return Ok(true),
                 Some(Response::Subscribe(c)) => {
-                    anyhow::bail!("subscribe failed: {}", c.error.unwrap_or_default())
+                    show_error("[subscribe failed: {}]", c.error.unwrap_or_default()).await;
+                    return Ok(false);
                 }
                 _ => {}
             }
@@ -306,36 +307,13 @@ async fn switch_pty(
     *current_item = new_item;
 }
 
-// Switches to the previous PTY, falling back to the first available if it's gone.
-// Returns true if the session should subscribe on the next iteration, false otherwise.
-async fn switch_to_recent(
-    cmd_tx:          &mpsc::Sender<TerminalCommand>,
-    resp_rx:         &mut tonic::Streaming<termd::proto::TerminalResponse>,
-    pty_list:        &mut Vec<PtyItem>,
-    current_pty_id:  &mut String,
-    current_item:    &mut PtyItem,
-    previous_pty_id: &mut Option<String>,
-) -> bool {
-    let prev_id = match previous_pty_id.clone() {
-        Some(id) => id,
-        None => return false,
-    };
-    if !ensure_list(cmd_tx, resp_rx, pty_list).await {
-        return false;
-    }
-    let new_id = if pty_list.iter().any(|p| p.pty_id == prev_id) {
-        prev_id
-    } else if let Some(first) = pty_list.first() {
-        first.pty_id.clone()
+fn recent_pty<'a>(list: &'a [PtyItem], previous_pty_id: &Option<String>) -> Option<&'a PtyItem> {
+    let prev_id = previous_pty_id.as_deref()?;
+    if let Some(item) = list.iter().find(|p| p.pty_id == prev_id) {
+        Some(item)
     } else {
-        return false;
-    };
-    if new_id != *current_pty_id {
-        if let Some(new_item) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-            switch_pty(cmd_tx, current_pty_id, current_item, previous_pty_id, new_item).await;
-        }
+        list.first()
     }
-    true
 }
 
 fn clear_screen() {
@@ -476,22 +454,30 @@ pub async fn run(
     let mut dispatch_mode = mode;
 
     'session: loop {
-        if subscribed_pty_id.as_deref() != Some(current_pty_id.as_str()) {
-            subscribe(&cmd_tx, &mut resp_rx, &current_pty_id).await?;
-            subscribed_pty_id = Some(current_pty_id.clone());
-        }
+        let subscribe_ok = if subscribed_pty_id.as_deref() != Some(current_pty_id.as_str()) {
+            let ok = subscribe(&cmd_tx, &mut resp_rx, &current_pty_id).await?;
+            if ok { subscribed_pty_id = Some(current_pty_id.clone()); }
+            ok
+        } else {
+            true
+        };
 
-        let (refresh_gen, refresh_bytes, buffered) =
-            match request_refresh(&cmd_tx, &mut resp_rx, &current_pty_id).await? {
-                Some(triple) => triple,
-                None => {
-                    // PTY reader is dead (closed PTY) — enter with empty state so
-                    // the user can still use ^A commands to switch or create.
-                    clear_screen();
-                    eprint!("\r\n[PTY closed]\r\n");
-                    (0, vec![], vec![])
-                }
-            };
+        let refresh_result = if subscribe_ok {
+            request_refresh(&cmd_tx, &mut resp_rx, &current_pty_id).await?
+        } else {
+            None
+        };
+
+        let (refresh_gen, refresh_bytes, buffered) = match refresh_result {
+            Some(triple) => triple,
+            None => {
+                // PTY reader is dead (closed PTY) — enter with empty state so
+                // the user can still use ^A commands to switch or create.
+                clear_screen();
+                eprint!("\r\n[PTY closed]\r\n");
+                (0, vec![], vec![])
+            }
+        };
 
         let (action_tx, action_rx) = mpsc::channel::<InputAction>(4);
         let input_task = tokio::spawn(input::run_stdin(
@@ -564,7 +550,13 @@ pub async fn run(
                             }
                         }
                         pty_list.clear();
-                        switch_to_recent(&cmd_tx, &mut resp_rx, &mut pty_list, &mut current_pty_id, &mut current_item, &mut previous_pty_id).await;
+                        if ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                            if let Some(target) = recent_pty(&pty_list, &previous_pty_id).cloned() {
+                                if target.pty_id != current_pty_id {
+                                    switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
+                                }
+                            }
+                        }
                     }
 
                     InputAction::ForceResize => {
@@ -635,7 +627,13 @@ pub async fn run(
                     }
 
                     InputAction::SwitchRecent => {
-                        switch_to_recent(&cmd_tx, &mut resp_rx, &mut pty_list, &mut current_pty_id, &mut current_item, &mut previous_pty_id).await;
+                        if ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                            if let Some(target) = recent_pty(&pty_list, &previous_pty_id).cloned() {
+                                if target.pty_id != current_pty_id {
+                                    switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
+                                }
+                            }
+                        }
                     }
 
                     InputAction::SwitchIndex(n) => {
