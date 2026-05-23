@@ -1,13 +1,6 @@
 use std::io::Write as IoWrite;
 
 use anyhow::Result;
-use tokio::io::AsyncWriteExt;
-use tokio::signal::unix::{signal, SignalKind};
-
-use termd::proto::{
-    terminal_response::Response,
-    StreamMetadataReason,
-};
 
 // ── VtFilter ──────────────────────────────────────────────────────────────────
 
@@ -260,171 +253,78 @@ impl VtFilter {
     }
 }
 
-// ── run() ────────────────────────────────────────────────────────────────────
+// ── RegionHandler ────────────────────────────────────────────────────────────
 
-enum LoopExit {
-    ChangeRenderMode,
-    Action(super::InputAction),
+pub(super) struct RegionHandler {
+    filter: VtFilter,
 }
 
-pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
-    let (mut client_cols, mut client_rows) = super::get_terminal_size();
-    let server_rows = ctx.item.rows;
-    let server_cols = ctx.item.cols;
-
-    if !super::server_fits_client(server_cols, server_rows, client_cols, client_rows) {
-        eprintln!(
-            "[region: client ({client_cols}x{client_rows}) smaller than \
-             server ({server_cols}x{server_rows}); switching to cell mode]"
-        );
-        return Ok(super::RunOutcome::ChangeRenderMode(super::RenderMode::Cell, ctx));
-    }
-
-    let super::RunContext {
-        mut resp_rx, cmd_tx, pty_id, mut item,
-        refresh_gen, refresh_bytes, buffered, mut action_rx,
-    } = ctx;
-
-    let mut filter = VtFilter::new(server_rows, server_cols, client_rows, client_cols);
-    let mut stdout = tokio::io::stdout();
-    let mut out = Vec::new();
-    let mut current_refresh_gen = refresh_gen;
-
-    filter.emit_region_setup(&mut out);
-    filter.filter(&refresh_bytes, &mut out);
-    stdout.write_all(&out).await?;
-
-    for (gen, data) in &buffered {
-        if *gen > current_refresh_gen {
-            out.clear();
-            filter.filter(data, &mut out);
-            stdout.write_all(&out).await?;
+impl RegionHandler {
+    pub(super) fn new(server_rows: u32, server_cols: u32, client_rows: u32, client_cols: u32) -> Self {
+        Self {
+            filter: VtFilter::new(server_rows, server_cols, client_rows, client_cols),
         }
     }
-    stdout.flush().await?;
+}
 
-    let mut sigwinch = signal(SignalKind::window_change())?;
-    let mut loop_exit: Option<LoopExit> = None;
-    let mut pty_closed = false;
+impl super::RenderModeHandler for RegionHandler {
+    fn init(&mut self, refresh_data: &[u8], buffered: &[(u64, Vec<u8>)], out: &mut Vec<u8>) -> Result<super::EventResult> {
+        if !super::server_fits_client(self.filter.server_cols, self.filter.server_rows, self.filter.client_cols, self.filter.client_rows) {
+            return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
+        }
+        self.filter.emit_region_setup(out);
+        self.filter.filter(refresh_data, out);
+        for (_gen, data) in buffered {
+            self.filter.filter(data, out);
+        }
+        Ok(super::EventResult::Continue)
+    }
 
-    loop {
-        out.clear();
-        tokio::select! {
-            msg = resp_rx.message() => {
-                match msg {
-                    Ok(Some(r)) => match r.response {
-                        Some(Response::Stream(s)) if s.pty_id == pty_id && s.generation > current_refresh_gen => {
-                            filter.filter(&s.data, &mut out);
-                        }
-                        Some(Response::Refresh(rf)) if rf.pty_id == pty_id => {
-                            current_refresh_gen = rf.generation;
-                            item.cols = rf.cols;
-                            item.rows = rf.rows;
-                            if !super::server_fits_client(rf.cols, rf.rows, client_cols, client_rows) {
-                                eprintln!(
-                                    "[region: server refreshed at ({}x{}), larger than \
-                                     client ({}x{}); switching to cell mode]",
-                                    rf.cols, rf.rows, client_cols, client_rows
-                                );
-                                loop_exit = Some(LoopExit::ChangeRenderMode);
-                                break;
-                            }
-                            filter.update_region(rf.rows, rf.cols);
-                            filter.emit_region_setup(&mut out);
-                            filter.filter(&rf.data, &mut out);
-                        }
-                        Some(Response::Metadata(m)) if m.pty_id == pty_id => {
-                            if m.reason == StreamMetadataReason::Resize as i32 {
-                                if let Some(ref mi) = m.item {
-                                    if mi.cols > 0 && mi.rows > 0 {
-                                        item.cols = mi.cols;
-                                        item.rows = mi.rows;
-                                        if !super::server_fits_client(mi.cols, mi.rows, client_cols, client_rows) {
-                                            eprintln!(
-                                                "[region: server resized to ({}x{}), larger than \
-                                                 client ({}x{}); switching to cell mode]",
-                                                mi.cols, mi.rows, client_cols, client_rows
-                                            );
-                                            loop_exit = Some(LoopExit::ChangeRenderMode);
-                                            break;
-                                        }
-                                        filter.update_region(mi.rows, mi.cols);
-                                        filter.emit_region_setup(&mut out);
-                                        // A full refresh is almost certainly arriving next,
-                                        // don't output any other codes.
-                                        // Consider ignoring StreamMetadataReason::Resize entirely.
-                                    }
-                                }
-                            } else if m.reason == StreamMetadataReason::Closed as i32 {
-                                if !pty_closed {
-                                    pty_closed = true;
-                                    super::move_terminal_end();
-                                    eprint!("\r\n[PTY closed]\r\n");
-                                }
-                            }
-                        }
-                        _ => {}
-                    },
-                    _ => { break; }
+    fn on_pty_event(&mut self, event: super::PtyEvent, out: &mut Vec<u8>) -> Result<super::EventResult> {
+        match event {
+            super::PtyEvent::Stream { data, .. } => {
+                self.filter.filter(data, out);
+            }
+            super::PtyEvent::Refresh { cols, rows, data, .. } => {
+                if !super::server_fits_client(cols, rows, self.filter.client_cols, self.filter.client_rows) {
+                    return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
                 }
+                self.filter.update_region(rows, cols);
+                self.filter.emit_region_setup(out);
+                self.filter.filter(data, out);
             }
-            action = action_rx.recv() => {
-                loop_exit = Some(LoopExit::Action(action.unwrap_or(super::InputAction::Detach)));
-                break;
-            }
-            _ = sigwinch.recv() => {
-                let (new_cols, new_rows) = super::get_terminal_size();
-                if !super::server_fits_client(filter.server_cols, filter.server_rows, new_cols, new_rows) {
-                    eprintln!(
-                        "[region: client shrank to ({}x{}), smaller than server ({}x{}); \
-                         switching to cell mode]",
-                        new_cols, new_rows, filter.server_cols, filter.server_rows
-                    );
-                    loop_exit = Some(LoopExit::ChangeRenderMode);
-                    break;
+            super::PtyEvent::Resize { cols, rows } => {
+                if !super::server_fits_client(cols, rows, self.filter.client_cols, self.filter.client_rows) {
+                    return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
                 }
-                client_cols = new_cols;
-                client_rows = new_rows;
-                // TODO: Trigger debounced SubscribeUpdate RPC here to inform new_rows new_cols
-                filter.update_client_size(new_rows, new_cols);
-                filter.emit_region_setup(&mut out);
+                self.filter.update_region(rows, cols);
+                self.filter.emit_region_setup(out);
             }
+            super::PtyEvent::Closed => {}
         }
-        if !out.is_empty() {
-            if stdout.write_all(&out).await.is_err() { break; }
-            let _ = stdout.flush().await;
-        }
+        Ok(super::EventResult::Continue)
     }
 
-    // Cleanup: restore client terminal margins
-    let _ = stdout.write_all(b"\x1b[r").await;
-    if filter.declrmm_active {
-        let _ = stdout.write_all(b"\x1b[?69l").await;
+    fn on_sigwinch(&mut self, cols: u32, rows: u32, out: &mut Vec<u8>) -> Result<super::EventResult> {
+        if !super::server_fits_client(self.filter.server_cols, self.filter.server_rows, cols, rows) {
+            return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
+        }
+        self.filter.update_client_size(rows, cols);
+        self.filter.emit_region_setup(out);
+        Ok(super::EventResult::Continue)
     }
-    let _ = stdout.flush().await;
 
-    match loop_exit {
-        None => Ok(super::RunOutcome::ServerClosed),
-        Some(LoopExit::ChangeRenderMode) => Ok(super::RunOutcome::ChangeRenderMode(
-            super::RenderMode::Cell,
-            super::RunContext {
-                resp_rx, cmd_tx, pty_id, item,
-                refresh_gen: 0,
-                refresh_bytes: vec![],
-                buffered: vec![],
-                action_rx,
-            },
-        )),
-        Some(LoopExit::Action(action)) => Ok(super::RunOutcome::Action(
-            action,
-            super::RunContext {
-                resp_rx, cmd_tx, pty_id, item,
-                refresh_gen: current_refresh_gen,
-                refresh_bytes: vec![], buffered: vec![],
-                action_rx,
-            },
-        )),
+    fn cleanup(&mut self, out: &mut Vec<u8>) {
+        out.extend_from_slice(b"\x1b[r");
+        if self.filter.declrmm_active {
+            out.extend_from_slice(b"\x1b[?69l");
+        }
     }
+}
+
+// Temporary stub — removed in Task 5 when mod.rs is restructured.
+pub(super) async fn run(_ctx: super::RunContext) -> Result<super::RunOutcome> {
+    unimplemented!("replaced by RegionHandler")
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -432,12 +332,15 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::{PtyEvent, EventResult, RenderMode, RenderModeHandler};
 
     fn filter_all(f: &mut VtFilter, input: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         f.filter(input, &mut out);
         out
     }
+
+    // ── VtFilter tests ──
 
     #[test]
     fn plain_bytes_pass_through() {
@@ -448,14 +351,12 @@ mod tests {
     #[test]
     fn esc_unknown_char_passes_through() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // ESC A is an unknown two-char sequence — both bytes must pass through
         assert_eq!(filter_all(&mut f, b"\x1bA"), b"\x1bA");
     }
 
     #[test]
     fn esc_string_opener_passes_immediately() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // ESC ] is OSC opener — ESC + ] flushed immediately; rest flows through Normal
         assert_eq!(
             filter_all(&mut f, b"\x1b]0;window title\x07"),
             b"\x1b]0;window title\x07",
@@ -465,7 +366,6 @@ mod tests {
     #[test]
     fn esc_ris_emits_region() {
         let mut f = VtFilter::new(24, 80, 40, 80);
-        // ESC c = RIS — pass RIS through, then re-emit DECSTBM
         let out = filter_all(&mut f, b"\x1bc");
         let s = String::from_utf8(out).unwrap();
         assert!(s.starts_with("\x1bc"), "RIS must be passed through first");
@@ -475,15 +375,12 @@ mod tests {
     #[test]
     fn csi_unknown_passes_through() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // ESC [ 5 A = cursor up 5 — unrecognized CSI, passes through unchanged
         assert_eq!(filter_all(&mut f, b"\x1b[5A"), b"\x1b[5A");
     }
 
     #[test]
     fn csi_safety_limit_flushes() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // A CSI sequence longer than 32 bytes must be flushed as-is, not buffered forever.
-        // Input is 34 bytes: buf reaches 33 before the final byte, triggering the > 32 limit.
         let long: Vec<u8> = b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14".to_vec();
         let out = filter_all(&mut f, &long);
         assert!(out.starts_with(b"\x1b["), "safety flush must emit the accumulated bytes");
@@ -492,7 +389,6 @@ mod tests {
     #[test]
     fn nested_esc_in_csi_flushes_buf() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // ESC [ 5 ESC [ 2 J — nested ESC flushes incomplete first CSI
         let out = filter_all(&mut f, b"\x1b[5\x1b[2J");
         assert!(out.starts_with(b"\x1b[5"), "incomplete CSI must be flushed");
         assert!(out.ends_with(b"\x1b[2J"), "subsequent CSI must pass through");
@@ -501,35 +397,30 @@ mod tests {
     #[test]
     fn csi_private_marker_detected() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // ESC [ ? 25 h = show cursor — private CSI not in our rewrite table, passes through
         assert_eq!(filter_all(&mut f, b"\x1b[?25h"), b"\x1b[?25h");
     }
 
     #[test]
     fn decstbm_bare_reset_rewritten() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // ESC [ r with no params = full-screen reset → rewritten to server bounds
         assert_eq!(filter_all(&mut f, b"\x1b[r"), b"\x1b[1;24r");
     }
 
     #[test]
     fn decstbm_bottom_clamped_to_server_rows() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // Bottom margin (30) exceeds server_rows (24) → clamped
         assert_eq!(filter_all(&mut f, b"\x1b[1;30r"), b"\x1b[1;24r");
     }
 
     #[test]
     fn decstbm_within_bounds_unchanged() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // Both margins within server bounds → rewritten to same values
         assert_eq!(filter_all(&mut f, b"\x1b[5;20r"), b"\x1b[5;20r");
     }
 
     #[test]
     fn decstbm_top_exceeds_server_rows_collapses() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // top (25) > server_rows (24) → collapse to full region
         assert_eq!(filter_all(&mut f, b"\x1b[25;30r"), b"\x1b[1;24r");
     }
 
@@ -537,7 +428,6 @@ mod tests {
     fn decstbm_cross_buffer() {
         let mut f = VtFilter::new(24, 80, 40, 120);
         let mut out = Vec::new();
-        // Sequence split across two filter() calls — state must be preserved
         f.filter(b"\x1b[1;30", &mut out);
         f.filter(b"r", &mut out);
         assert_eq!(out, b"\x1b[1;24r");
@@ -546,11 +436,9 @@ mod tests {
     #[test]
     fn decslrm_right_clamped_to_server_cols() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // client_cols (120) > server_cols (80) → emit_region_setup sets declrmm_active
         let mut out = Vec::new();
         f.emit_region_setup(&mut out);
         out.clear();
-        // Right margin (100) exceeds server_cols (80) → clamped
         f.filter(b"\x1b[1;100s", &mut out);
         assert_eq!(out, b"\x1b[1;80s");
     }
@@ -558,7 +446,6 @@ mod tests {
     #[test]
     fn declrmm_enable_suppressed() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // Server app tries to enable DECLRMM — we own this mode, suppress it
         assert_eq!(filter_all(&mut f, b"\x1b[?69h"), b"");
     }
 
@@ -579,7 +466,7 @@ mod tests {
     #[test]
     fn alt_screen_exit_reemits_region() {
         let mut f = VtFilter::new(24, 80, 40, 80);
-        filter_all(&mut f, b"\x1b[?1049h"); // enter alt screen first
+        filter_all(&mut f, b"\x1b[?1049h");
         let out = filter_all(&mut f, b"\x1b[?1049l");
         let s = String::from_utf8(out).unwrap();
         assert!(s.starts_with("\x1b[?1049l"), "alt-screen exit byte must pass through");
@@ -590,7 +477,6 @@ mod tests {
     #[test]
     fn other_private_mode_passes_through() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // ESC [ ? 2004 h = bracketed-paste mode — not intercepted
         assert_eq!(filter_all(&mut f, b"\x1b[?2004h"), b"\x1b[?2004h");
     }
 
@@ -600,7 +486,6 @@ mod tests {
         let mut out = Vec::new();
         f.emit_region_setup(&mut out);
         out.clear();
-        // left (90) > effective_right (80) → collapse to full region
         f.filter(b"\x1b[90;100s", &mut out);
         assert_eq!(out, b"\x1b[1;80s");
     }
@@ -608,12 +493,10 @@ mod tests {
     #[test]
     fn emit_region_setup_disables_declrmm_when_client_shrinks() {
         let mut f = VtFilter::new(24, 80, 40, 120);
-        // Initial setup: client_cols (120) > server_cols (80) → DECLRMM enabled
         let mut out = Vec::new();
         f.emit_region_setup(&mut out);
         assert!(f.declrmm_active);
         out.clear();
-        // Client shrinks to match server width → DECLRMM must be disabled
         f.update_client_size(40, 80);
         f.emit_region_setup(&mut out);
         assert!(!f.declrmm_active);
@@ -627,7 +510,6 @@ mod tests {
         let mut out = Vec::new();
         f.emit_region_setup(&mut out);
         out.clear();
-        // DECSTR resets DECLRMM/DECSLRM — filter must re-establish them afterward
         f.filter(b"\x1b[!p", &mut out);
         let s = String::from_utf8(out).unwrap();
         assert!(s.starts_with("\x1b[!p"), "DECSTR must pass through first");
@@ -641,9 +523,144 @@ mod tests {
         let mut out = Vec::new();
         f.emit_region_setup(&mut out);
         out.clear();
-        // Server sends DECSTBM; some terminals reset horizontal margins on DECSTBM —
-        // filter must re-emit DECSLRM immediately after the rewritten DECSTBM.
         f.filter(b"\x1b[r", &mut out);
         assert_eq!(out, b"\x1b[1;24r\x1b[1;80s");
+    }
+
+    // ── RegionHandler tests ──
+
+    #[test]
+    fn region_init_emits_setup_and_data() {
+        let mut h = RegionHandler::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        let result = h.init(b"hello", &[], &mut out).unwrap();
+        assert!(matches!(result, EventResult::Continue));
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b[1;24r"), "should emit DECSTBM");
+        assert!(s.contains("hello"), "should include refresh data");
+    }
+
+    #[test]
+    fn region_init_too_small_returns_change_mode() {
+        let mut h = RegionHandler::new(24, 80, 20, 60);
+        let mut out = Vec::new();
+        let result = h.init(b"hello", &[], &mut out).unwrap();
+        assert!(matches!(result, EventResult::ChangeRenderMode(RenderMode::Cell)));
+    }
+
+    #[test]
+    fn region_init_replays_buffered() {
+        let mut h = RegionHandler::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        let buffered = vec![(2, b"world".to_vec())];
+        h.init(b"hello", &buffered, &mut out).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("hello"));
+        assert!(s.contains("world"));
+    }
+
+    #[test]
+    fn region_stream_filters_data() {
+        let mut h = RegionHandler::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+
+        let result = h.on_pty_event(PtyEvent::Stream { gen: 1, data: b"test" }, &mut out).unwrap();
+        assert!(matches!(result, EventResult::Continue));
+        assert_eq!(out, b"test");
+    }
+
+    #[test]
+    fn region_refresh_updates_filter_and_re_emits_setup() {
+        let mut h = RegionHandler::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+
+        let result = h.on_pty_event(
+            PtyEvent::Refresh { gen: 2, cols: 80, rows: 30, data: b"new" },
+            &mut out,
+        ).unwrap();
+        assert!(matches!(result, EventResult::Continue));
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b[1;30r"), "should emit updated DECSTBM");
+        assert!(s.contains("new"));
+    }
+
+    #[test]
+    fn region_refresh_too_large_switches_to_cell() {
+        let mut h = RegionHandler::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+
+        let result = h.on_pty_event(
+            PtyEvent::Refresh { gen: 2, cols: 200, rows: 50, data: b"big" },
+            &mut out,
+        ).unwrap();
+        assert!(matches!(result, EventResult::ChangeRenderMode(RenderMode::Cell)));
+    }
+
+    #[test]
+    fn region_resize_too_large_switches_to_cell() {
+        let mut h = RegionHandler::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+
+        let result = h.on_pty_event(
+            PtyEvent::Resize { cols: 200, rows: 50 },
+            &mut out,
+        ).unwrap();
+        assert!(matches!(result, EventResult::ChangeRenderMode(RenderMode::Cell)));
+    }
+
+    #[test]
+    fn region_sigwinch_too_small_switches_to_cell() {
+        let mut h = RegionHandler::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+
+        let result = h.on_sigwinch(60, 20, &mut out).unwrap();
+        assert!(matches!(result, EventResult::ChangeRenderMode(RenderMode::Cell)));
+    }
+
+    #[test]
+    fn region_sigwinch_ok_updates_client_size() {
+        let mut h = RegionHandler::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+
+        let result = h.on_sigwinch(200, 50, &mut out).unwrap();
+        assert!(matches!(result, EventResult::Continue));
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b[1;24r"), "should re-emit DECSTBM on resize");
+    }
+
+    #[test]
+    fn region_cleanup_resets_margins() {
+        let mut h = RegionHandler::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+
+        h.cleanup(&mut out);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b[r"), "should reset DECSTBM");
+    }
+
+    #[test]
+    fn region_cleanup_disables_declrmm_when_active() {
+        let mut h = RegionHandler::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+
+        h.cleanup(&mut out);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b[?69l"), "should disable DECLRMM");
     }
 }
