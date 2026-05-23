@@ -91,7 +91,7 @@ enum Cmd {
         #[arg(long)]
         debug: bool,
         /// Rendering strategy for terminal output
-        #[arg(long, value_enum, default_value_t = attach::RenderMode::Cell)]
+        #[arg(long, value_enum, default_value_t = attach::RenderMode::Region)]
         render_mode: attach::RenderMode,
     },
 }

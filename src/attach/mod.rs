@@ -24,11 +24,11 @@ pub(super) enum InputAction {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum RenderMode {
-    /// Cell-by-cell render state for all dirty states (default)
+    /// Cell-by-cell render state for all dirty states
     Cell,
-    /// Raw PTY byte passthrough — no libghostty on the client render path
+    /// Raw PTY byte passthrough
     Raw,
-    /// Raw passthrough within a DECSTBM scroll region; rewrites conflicting sequences
+    /// Raw passthrough within a DECSTBM scroll region
     Region,
 }
 
