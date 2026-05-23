@@ -1,154 +1,86 @@
 use std::io::Write as IoWrite;
 
 use anyhow::Result;
-use libghostty_vt::{Terminal, RenderState};
 use libghostty_vt::render::{Dirty, RowIterator, CellIterator};
 use libghostty_vt::style::Underline;
-use tokio::io::AsyncWriteExt;
-use tokio::signal::unix::{signal, SignalKind};
 
-use termd::proto::{
-    terminal_response::Response,
-    StreamMetadataReason,
-};
+pub(super) struct CellHandler {
+    lt: super::LocalTerminal,
+    allow_upgrade: bool,
+    server_cols: u32,
+    server_rows: u32,
+}
 
-pub(super) async fn run(ctx: super::RunContext, allow_upgrade: bool) -> Result<super::RunOutcome> {
-    let super::RunContext { mut resp_rx, cmd_tx, pty_id, mut item, refresh_gen, refresh_bytes, buffered, mut action_rx } = ctx;
-
-    let mut lt = super::LocalTerminal::new(item.cols, item.rows)?;
-    lt.terminal.vt_write(&refresh_bytes);
-
-    let mut stdout = tokio::io::stdout();
-    let mut out = Vec::new();
-    let mut current_refresh_gen = refresh_gen;
-
-    render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
-    stdout.write_all(&out).await?;
-
-    // Replay stream chunks buffered while awaiting the initial Refresh response
-    for (gen, data) in &buffered {
-        if *gen > current_refresh_gen {
-            lt.terminal.vt_write(data);
-            out.clear();
-            render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, false, &mut out)?;
-            stdout.write_all(&out).await?;
-        }
+impl CellHandler {
+    pub(super) fn new(cols: u32, rows: u32, allow_upgrade: bool) -> Result<Self> {
+        Ok(Self {
+            lt: super::LocalTerminal::new(cols, rows)?,
+            allow_upgrade,
+            server_cols: cols,
+            server_rows: rows,
+        })
     }
-    stdout.flush().await?;
+}
 
-    let mut sigwinch = signal(SignalKind::window_change())?;
-    out.clear();
+impl super::RenderModeHandler for CellHandler {
+    fn init(&mut self, refresh_data: &[u8], buffered: &[(u64, Vec<u8>)], out: &mut Vec<u8>) -> Result<super::EventResult> {
+        self.lt.terminal.vt_write(refresh_data);
+        render_dirty(&self.lt.terminal, &mut self.lt.render_state, &mut self.lt.row_iter, &mut self.lt.cell_iter, true, out)?;
+        for (_gen, data) in buffered {
+            self.lt.terminal.vt_write(data);
+            render_dirty(&self.lt.terminal, &mut self.lt.render_state, &mut self.lt.row_iter, &mut self.lt.cell_iter, false, out)?;
+        }
+        Ok(super::EventResult::Continue)
+    }
 
-    let mut pty_closed = false;
-    loop {
-        out.clear();
-        tokio::select! {
-            msg = resp_rx.message() => {
-                match msg {
-                    Ok(Some(r)) => match r.response {
-                        Some(Response::Stream(s)) if s.pty_id == pty_id => {
-                            if s.generation > current_refresh_gen {
-                                lt.terminal.vt_write(&s.data);
-                                render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, false, &mut out)?;
-                            }
-                        }
-                        Some(Response::Refresh(rf)) if rf.pty_id == pty_id => {
-                            current_refresh_gen = rf.generation;
-                            item.cols = rf.cols;
-                            item.rows = rf.rows;
-                            let (client_cols, client_rows) = super::get_terminal_size();
-                            if allow_upgrade && super::server_fits_client(rf.cols, rf.rows, client_cols, client_rows) {
-                                return Ok(super::RunOutcome::ChangeRenderMode(
-                                    super::RenderMode::Region,
-                                    super::RunContext {
-                                        resp_rx, cmd_tx, pty_id, item,
-                                        refresh_gen: current_refresh_gen,
-                                        refresh_bytes: rf.data,
-                                        buffered: vec![],
-                                        action_rx,
-                                    }
-                                ));
-                            }
-                            lt.resize(rf.cols, rf.rows)?;
-                            lt.terminal.vt_write(&rf.data);
-                            render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
-                        }
-                        Some(Response::Metadata(m)) if m.pty_id == pty_id => {
-                            if m.reason == StreamMetadataReason::Resize as i32 {
-                                if let Some(ref mi) = m.item {
-                                    if mi.cols > 0 && mi.rows > 0 {
-                                        item.cols = mi.cols;
-                                        item.rows = mi.rows;
-                                        let (client_cols, client_rows) = super::get_terminal_size();
-                                        if allow_upgrade && super::server_fits_client(mi.cols, mi.rows, client_cols, client_rows) {
-                                            return Ok(super::RunOutcome::ChangeRenderMode(
-                                                super::RenderMode::Region,
-                                                super::RunContext {
-                                                    resp_rx, cmd_tx, pty_id, item,
-                                                    refresh_gen: 0,
-                                                    refresh_bytes: vec![],
-                                                    buffered: vec![],
-                                                    action_rx,
-                                                }
-                                            ));
-                                        }
-                                        lt.resize(mi.cols, mi.rows)?;
-                                        // No need to clear screen or re-render,
-                                        // a full Refresh will be arriving soon.
-                                    }
-                                }
-                            } else if m.reason == StreamMetadataReason::Closed as i32 {
-                                if !pty_closed {
-                                    pty_closed = true;
-                                    super::move_terminal_end();
-                                    eprint!("\r\n[PTY closed]\r\n");
-                                }
-                            }
-                        }
-                        _ => {}
-                    },
-                    _ => { break; }
-                }
+    fn on_pty_event(&mut self, event: super::PtyEvent, out: &mut Vec<u8>) -> Result<super::EventResult> {
+        match event {
+            super::PtyEvent::Stream { data, .. } => {
+                self.lt.terminal.vt_write(data);
+                render_dirty(&self.lt.terminal, &mut self.lt.render_state, &mut self.lt.row_iter, &mut self.lt.cell_iter, false, out)?;
             }
-            action = action_rx.recv() => {
-                let action = action.unwrap_or(super::InputAction::Detach);
-                return Ok(super::RunOutcome::Action(action, super::RunContext {
-                    resp_rx, cmd_tx, pty_id, item,
-                    refresh_gen: current_refresh_gen,
-                    refresh_bytes: vec![], buffered: vec![],
-                    action_rx,
-                }));
-            }
-            _ = sigwinch.recv() => {
+            super::PtyEvent::Refresh { cols, rows, data, .. } => {
+                self.server_cols = cols;
+                self.server_rows = rows;
                 let (client_cols, client_rows) = super::get_terminal_size();
-                if allow_upgrade && super::server_fits_client(item.cols, item.rows, client_cols, client_rows) {
-                    return Ok(super::RunOutcome::ChangeRenderMode(
-                        super::RenderMode::Region,
-                        super::RunContext {
-                            resp_rx, cmd_tx, pty_id, item,
-                            refresh_gen: current_refresh_gen,
-                            refresh_bytes: vec![],
-                            buffered: vec![],
-                            action_rx,
-                        }
-                    ));
+                if self.allow_upgrade && super::server_fits_client(cols, rows, client_cols, client_rows) {
+                    return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Region));
                 }
-                // TODO: Trigger debounced SubscribeUpdate RPC here to inform new_rows new_cols
-                render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
+                self.lt.resize(cols, rows)?;
+                self.lt.terminal.vt_write(data);
+                render_dirty(&self.lt.terminal, &mut self.lt.render_state, &mut self.lt.row_iter, &mut self.lt.cell_iter, true, out)?;
             }
+            super::PtyEvent::Resize { cols, rows } => {
+                self.server_cols = cols;
+                self.server_rows = rows;
+                let (client_cols, client_rows) = super::get_terminal_size();
+                if self.allow_upgrade && super::server_fits_client(cols, rows, client_cols, client_rows) {
+                    return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Region));
+                }
+                self.lt.resize(cols, rows)?;
+            }
+            super::PtyEvent::Closed => {}
         }
-        if !out.is_empty() {
-            if stdout.write_all(&out).await.is_err() { break; }
-            let _ = stdout.flush().await;
-        }
+        Ok(super::EventResult::Continue)
     }
 
-    Ok(super::RunOutcome::ServerClosed)
+    fn on_sigwinch(&mut self, cols: u32, rows: u32, out: &mut Vec<u8>) -> Result<super::EventResult> {
+        if self.allow_upgrade && super::server_fits_client(self.server_cols, self.server_rows, cols, rows) {
+            return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Region));
+        }
+        render_dirty(&self.lt.terminal, &mut self.lt.render_state, &mut self.lt.row_iter, &mut self.lt.cell_iter, true, out)?;
+        Ok(super::EventResult::Continue)
+    }
+}
+
+// Temporary stub — removed in Task 5 when mod.rs is restructured.
+pub(super) async fn run(_ctx: super::RunContext, _allow_upgrade: bool) -> Result<super::RunOutcome> {
+    unimplemented!("replaced by CellHandler")
 }
 
 fn render_dirty(
-    terminal: &Terminal<'static, 'static>,
-    render_state: &mut RenderState<'static>,
+    terminal: &libghostty_vt::Terminal<'static, 'static>,
+    render_state: &mut libghostty_vt::RenderState<'static>,
     row_iter: &mut RowIterator<'static>,
     cell_iter: &mut CellIterator<'static>,
     force_full: bool,
@@ -168,9 +100,6 @@ fn render_dirty(
     }
 
     if global_dirty == Dirty::Full {
-        // Full repaint seeded state — clear first so content outside the PTY
-        // dimensions (e.g. larger host terminal, or previous PTY of different size)
-        // doesn't bleed through.
         write!(out, "\x1b[2J\x1b[H").ok();
     }
 
@@ -183,9 +112,6 @@ fn render_dirty(
         ),
     };
 
-    // Disable auto-wrap for the entire repaint. Writing to the last cell of the
-    // last row would otherwise scroll the screen up. All cursor movement here is
-    // explicit, so wrap mode is irrelevant until we're done.
     out.extend_from_slice(b"\x1b[?7l");
 
     let mut row_iter_active = row_iter.update(&snapshot)?;
@@ -260,6 +186,7 @@ fn render_dirty(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::{PtyEvent, EventResult, RenderMode, RenderModeHandler};
 
     #[test]
     fn render_dirty_produces_no_output_when_clean() {
@@ -300,5 +227,81 @@ mod tests {
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("\x1b[1;1H"));
         assert!(s.contains("\x1b[24;1H"));
+    }
+
+    #[test]
+    fn cell_init_renders_content() {
+        let mut h = CellHandler::new(80, 24, false).unwrap();
+        let mut out = Vec::new();
+        let result = h.init(b"Hello", &[], &mut out).unwrap();
+        assert!(matches!(result, EventResult::Continue));
+        assert!(!out.is_empty(), "init should render refresh data");
+    }
+
+    #[test]
+    fn cell_init_replays_buffered() {
+        let mut h = CellHandler::new(80, 24, false).unwrap();
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        let initial_len = out.len();
+
+        let buffered = vec![(2, b"World".to_vec())];
+        out.clear();
+        let mut h2 = CellHandler::new(80, 24, false).unwrap();
+        h2.init(b"", &buffered, &mut out).unwrap();
+        assert!(out.len() > initial_len, "init with buffered should produce more output");
+    }
+
+    #[test]
+    fn cell_stream_renders_dirty() {
+        let mut h = CellHandler::new(80, 24, false).unwrap();
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+
+        let result = h.on_pty_event(PtyEvent::Stream { gen: 1, data: b"Test" }, &mut out).unwrap();
+        assert!(matches!(result, EventResult::Continue));
+        assert!(!out.is_empty(), "stream data should produce render output");
+    }
+
+    #[test]
+    fn cell_refresh_resizes_and_renders() {
+        let mut h = CellHandler::new(80, 24, false).unwrap();
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+
+        let result = h.on_pty_event(
+            PtyEvent::Refresh { gen: 2, cols: 100, rows: 30, data: b"New" },
+            &mut out,
+        ).unwrap();
+        assert!(matches!(result, EventResult::Continue));
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn cell_no_upgrade_when_not_allowed() {
+        let mut h = CellHandler::new(80, 24, false).unwrap();
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+
+        let result = h.on_pty_event(
+            PtyEvent::Refresh { gen: 2, cols: 80, rows: 24, data: b"content" },
+            &mut out,
+        ).unwrap();
+        assert!(matches!(result, EventResult::Continue));
+    }
+
+    #[test]
+    fn cell_sigwinch_re_renders() {
+        let mut h = CellHandler::new(80, 24, false).unwrap();
+        let mut out = Vec::new();
+        h.init(b"Hello", &[], &mut out).unwrap();
+        out.clear();
+
+        let result = h.on_sigwinch(120, 40, &mut out).unwrap();
+        assert!(matches!(result, EventResult::Continue));
+        assert!(!out.is_empty());
     }
 }
