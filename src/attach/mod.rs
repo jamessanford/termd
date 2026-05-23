@@ -1,6 +1,8 @@
 use anyhow::Result;
 use libghostty_vt::{Terminal, TerminalOptions, RenderState};
 use libghostty_vt::render::{RowIterator, CellIterator};
+use tokio::io::AsyncWriteExt;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
@@ -32,6 +34,7 @@ pub enum RenderMode {
     Region,
 }
 
+#[allow(dead_code)]
 pub(super) enum PtyEvent<'a> {
     Stream { gen: u64, data: &'a [u8] },
     Refresh { gen: u64, cols: u32, rows: u32, data: &'a [u8] },
@@ -52,46 +55,25 @@ pub(super) trait RenderModeHandler {
     fn cleanup(&mut self, _out: &mut Vec<u8>) {}
 }
 
-// Uncomment after handler types are defined in Tasks 2-4.
-// fn create_handler(
-//     mode: RenderMode,
-//     server_cols: u32,
-//     server_rows: u32,
-//     allow_upgrade: bool,
-// ) -> anyhow::Result<Box<dyn RenderModeHandler>> {
-//     Ok(match mode {
-//         RenderMode::Cell => Box::new(cell::CellHandler::new(server_cols, server_rows, allow_upgrade)?),
-//         RenderMode::Raw => Box::new(raw::RawHandler::new()),
-//         RenderMode::Region => {
-//             let (client_cols, client_rows) = get_terminal_size();
-//             Box::new(region::RegionHandler::new(server_rows, server_cols, client_rows, client_cols))
-//         }
-//     })
-// }
-
-pub(crate) struct RunContext {
-    pub resp_rx:       tonic::Streaming<termd::proto::TerminalResponse>,
-    pub cmd_tx:        tokio::sync::mpsc::Sender<TerminalCommand>,
-    pub pty_id:        String,
-    pub item:          PtyItem,
-    pub refresh_gen:   u64,
-    pub refresh_bytes: Vec<u8>,
-    pub buffered:      Vec<(u64, Vec<u8>)>,
-    pub action_rx:     tokio::sync::mpsc::Receiver<InputAction>,
+fn create_handler(
+    mode: RenderMode,
+    server_cols: u32,
+    server_rows: u32,
+    allow_upgrade: bool,
+) -> anyhow::Result<Box<dyn RenderModeHandler>> {
+    Ok(match mode {
+        RenderMode::Cell => Box::new(cell::CellHandler::new(server_cols, server_rows, allow_upgrade)?),
+        RenderMode::Raw => Box::new(raw::RawHandler::new()),
+        RenderMode::Region => {
+            let (client_cols, client_rows) = get_terminal_size();
+            Box::new(region::RegionHandler::new(server_rows, server_cols, client_rows, client_cols))
+        }
+    })
 }
 
-/// Outcome returned by every render-mode runner.
-pub(super) enum RunOutcome {
-    /// The server PTY exited or closed.
+enum RunOutcome {
     ServerClosed,
-    /// The current render mode can no longer handle the current dimensions, or has detected
-    /// an opportunity to switch. The given mode should be started next.
-    /// `refresh_bytes` is empty when the caller relies on the server sending a Refresh
-    /// following a resize event; populated when the caller has Refresh data to hand off.
-    ChangeRenderMode(RenderMode, RunContext),
-    /// An input action was received; the render mode returns the context
-    /// so the outer session loop can handle PTY switching.
-    Action(InputAction, RunContext),
+    Action(InputAction),
 }
 
 use termd::proto::{
@@ -485,12 +467,14 @@ pub async fn run(
     let mut previous_pty_id: Option<String> = None;
     let mut subscribed_pty_id: Option<String> = None;
 
-    // Only allow cell→region upgrades if the user originally chose region mode.
-    // --render-mode=cell stays in cell.
     let allow_upgrade = mode == RenderMode::Region;
     let mut dispatch_mode = mode;
+    let mut current_refresh_gen: u64 = 0;
+    let mut stdout = tokio::io::stdout();
+    let mut out = Vec::new();
 
     'session: loop {
+        // === Phase: Subscribe ===
         let subscribe_ok = if subscribed_pty_id.as_deref() != Some(current_pty_id.as_str()) {
             let ok = subscribe(&cmd_tx, &mut resp_rx, &current_pty_id).await?;
             if ok { subscribed_pty_id = Some(current_pty_id.clone()); }
@@ -499,6 +483,7 @@ pub async fn run(
             true
         };
 
+        // === Phase: Request Refresh ===
         let refresh_result = if subscribe_ok {
             request_refresh(&cmd_tx, &mut resp_rx, &current_pty_id).await?
         } else {
@@ -508,51 +493,156 @@ pub async fn run(
         let (refresh_gen, refresh_bytes, buffered) = match refresh_result {
             Some(triple) => triple,
             None => {
-                // PTY reader is dead (closed PTY) — enter with empty state so
-                // the user can still use ^A commands to switch or create.
                 clear_screen();
                 eprint!("\r\n[PTY closed]\r\n");
                 (0, vec![], vec![])
             }
         };
+        current_refresh_gen = refresh_gen;
 
-        let (action_tx, action_rx) = mpsc::channel::<InputAction>(4);
+        let buffered: Vec<_> = buffered.into_iter()
+            .filter(|(gen, _)| *gen > current_refresh_gen)
+            .collect();
+
+        // === Phase: Create Handler & Init ===
+        let mut handler: Box<dyn RenderModeHandler> = create_handler(
+            dispatch_mode, current_item.cols, current_item.rows, allow_upgrade,
+        )?;
+
+        out.clear();
+        if let EventResult::ChangeRenderMode(new_mode) = handler.init(&refresh_bytes, &buffered, &mut out)? {
+            handler.cleanup(&mut out);
+            if !out.is_empty() {
+                stdout.write_all(&out).await?;
+                out.clear();
+            }
+            dispatch_mode = new_mode;
+            handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, allow_upgrade)?;
+            handler.init(&refresh_bytes, &buffered, &mut out)?;
+        }
+        if !out.is_empty() {
+            stdout.write_all(&out).await?;
+            stdout.flush().await?;
+        }
+
+        // === Phase: Spawn Input Task ===
+        let (action_tx, mut action_rx) = mpsc::channel::<InputAction>(4);
         let input_task = tokio::spawn(input::run_stdin(
             cmd_tx.clone(),
             action_tx,
             current_pty_id.clone(),
         ));
 
-        let ctx = RunContext {
-            resp_rx,
-            cmd_tx: cmd_tx.clone(),
-            pty_id: current_pty_id.clone(),
-            item: current_item.clone(),
-            refresh_gen,
-            refresh_bytes,
-            buffered,
-            action_rx,
-        };
+        // === Phase: Event Loop ===
+        let mut sigwinch = signal(SignalKind::window_change())?;
+        let mut pty_closed = false;
+        let mut refresh_debounce = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(86400)));
+        let mut debounce_active = false;
 
-        let mut dispatch_ctx = ctx;
-        let outcome = loop {
-            let result = match dispatch_mode {
-                RenderMode::Cell   => cell::run(dispatch_ctx, allow_upgrade).await?,
-                RenderMode::Raw    => raw::run(dispatch_ctx).await?,
-                RenderMode::Region => region::run(dispatch_ctx).await?,
-            };
-            match result {
-                RunOutcome::ChangeRenderMode(new_mode, new_ctx) => {
-                    // TODO: We really should request a refresh when switching RenderModes (ideally we could keep stdin open and not have to redo the input loop)
-                    dispatch_mode = new_mode;
-                    dispatch_ctx = new_ctx;
+        let outcome: RunOutcome = loop {
+            out.clear();
+            let mut change_mode: Option<(RenderMode, Vec<u8>)> = None;
+
+            tokio::select! {
+                msg = resp_rx.message() => {
+                    match msg {
+                        Ok(Some(r)) => match r.response {
+                            Some(Response::Stream(s)) if s.pty_id == current_pty_id && s.generation > current_refresh_gen => {
+                                let result = handler.on_pty_event(PtyEvent::Stream { gen: s.generation, data: &s.data }, &mut out)?;
+                                if let EventResult::ChangeRenderMode(m) = result {
+                                    change_mode = Some((m, vec![]));
+                                }
+                            }
+                            Some(Response::Refresh(rf)) if rf.pty_id == current_pty_id => {
+                                current_refresh_gen = rf.generation;
+                                current_item.cols = rf.cols;
+                                current_item.rows = rf.rows;
+                                let result = handler.on_pty_event(
+                                    PtyEvent::Refresh { gen: rf.generation, cols: rf.cols, rows: rf.rows, data: &rf.data },
+                                    &mut out,
+                                )?;
+                                if let EventResult::ChangeRenderMode(m) = result {
+                                    change_mode = Some((m, rf.data));
+                                }
+                            }
+                            Some(Response::Metadata(m)) if m.pty_id == current_pty_id => {
+                                if m.reason == StreamMetadataReason::Resize as i32 {
+                                    if let Some(ref mi) = m.item {
+                                        if mi.cols > 0 && mi.rows > 0 {
+                                            current_item.cols = mi.cols;
+                                            current_item.rows = mi.rows;
+                                            let result = handler.on_pty_event(
+                                                PtyEvent::Resize { cols: mi.cols, rows: mi.rows },
+                                                &mut out,
+                                            )?;
+                                            if let EventResult::ChangeRenderMode(m) = result {
+                                                change_mode = Some((m, vec![]));
+                                            }
+                                        }
+                                    }
+                                } else if m.reason == StreamMetadataReason::Closed as i32 {
+                                    if !pty_closed {
+                                        pty_closed = true;
+                                        handler.on_pty_event(PtyEvent::Closed, &mut out)?;
+                                        move_terminal_end();
+                                        eprint!("\r\n[PTY closed]\r\n");
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                        _ => { break RunOutcome::ServerClosed; }
+                    }
                 }
-                other => break other,
+                action = action_rx.recv() => {
+                    break RunOutcome::Action(action.unwrap_or(InputAction::Detach));
+                }
+                _ = sigwinch.recv() => {
+                    let (cols, rows) = get_terminal_size();
+                    match handler.on_sigwinch(cols, rows, &mut out)? {
+                        EventResult::ChangeRenderMode(m) => {
+                            change_mode = Some((m, vec![]));
+                        }
+                        EventResult::RequestRefresh => {
+                            refresh_debounce.as_mut().reset(
+                                tokio::time::Instant::now() + std::time::Duration::from_secs(1)
+                            );
+                            debounce_active = true;
+                        }
+                        EventResult::Continue => {}
+                    }
+                }
+                _ = &mut refresh_debounce, if debounce_active => {
+                    debounce_active = false;
+                    let _ = cmd_tx.send(TerminalCommand {
+                        command: Some(Command::Refresh(RefreshRequest {
+                            pty_id: current_pty_id.clone(),
+                        })),
+                    }).await;
+                }
+            }
+
+            if let Some((new_mode, refresh_data)) = change_mode {
+                handler.cleanup(&mut out);
+                dispatch_mode = new_mode;
+                handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, allow_upgrade)?;
+                let init_result = handler.init(&refresh_data, &[], &mut out)?;
+                if let EventResult::ChangeRenderMode(fallback) = init_result {
+                    handler.cleanup(&mut out);
+                    dispatch_mode = fallback;
+                    handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, allow_upgrade)?;
+                    handler.init(&refresh_data, &[], &mut out)?;
+                }
+            }
+
+            if !out.is_empty() {
+                if stdout.write_all(&out).await.is_err() { break RunOutcome::ServerClosed; }
+                let _ = stdout.flush().await;
             }
         };
 
         input_task.abort();
-        let _ = input_task.await; // synchronize: ensure run_stdin has stopped reading stdin
+        let _ = input_task.await;
 
         match outcome {
             RunOutcome::ServerClosed => {
@@ -561,9 +651,7 @@ pub async fn run(
                 eprintln!("[Connection closed]");
                 break 'session;
             }
-            RunOutcome::ChangeRenderMode(_, _) => unreachable!(),
-            RunOutcome::Action(action, ctx) => {
-                resp_rx = ctx.resp_rx;
+            RunOutcome::Action(action) => {
                 reset_terminal_modes();
                 match action {
                     InputAction::Detach => break 'session,
@@ -688,7 +776,6 @@ pub async fn run(
                     InputAction::ShowList => {
                         match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id).await? {
                             Some(new_id) if new_id != current_pty_id => {
-                                // Look up item from list so current_item has correct cols/rows.
                                 if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
                                     switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
                                     pty_list.clear();
@@ -717,10 +804,7 @@ pub async fn run(
         }
     }
 
-    // reset_terminal_modes() was already called when the last renderer exited above.
-    // Append the last-row move so the shell prompt lands below the PTY content.
     move_terminal_end();
-
     drop(_guard);
     Ok(())
 }

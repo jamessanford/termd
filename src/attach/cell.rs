@@ -73,11 +73,6 @@ impl super::RenderModeHandler for CellHandler {
     }
 }
 
-// Temporary stub — removed in Task 5 when mod.rs is restructured.
-pub(super) async fn run(_ctx: super::RunContext, _allow_upgrade: bool) -> Result<super::RunOutcome> {
-    unimplemented!("replaced by CellHandler")
-}
-
 fn render_dirty(
     terminal: &libghostty_vt::Terminal<'static, 'static>,
     render_state: &mut libghostty_vt::RenderState<'static>,

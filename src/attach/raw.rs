@@ -38,11 +38,6 @@ impl super::RenderModeHandler for RawHandler {
     }
 }
 
-// Temporary stub — removed in Task 5 when mod.rs is restructured.
-pub(super) async fn run(ctx: super::RunContext) -> anyhow::Result<super::RunOutcome> {
-    unimplemented!("replaced by RawHandler")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -322,11 +322,6 @@ impl super::RenderModeHandler for RegionHandler {
     }
 }
 
-// Temporary stub — removed in Task 5 when mod.rs is restructured.
-pub(super) async fn run(_ctx: super::RunContext) -> Result<super::RunOutcome> {
-    unimplemented!("replaced by RegionHandler")
-}
-
 // ── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
