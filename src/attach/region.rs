@@ -346,12 +346,14 @@ mod tests {
     #[test]
     fn esc_unknown_char_passes_through() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // ESC A is an unknown two-char sequence — both bytes must pass through
         assert_eq!(filter_all(&mut f, b"\x1bA"), b"\x1bA");
     }
 
     #[test]
     fn esc_string_opener_passes_immediately() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // ESC ] is OSC opener — ESC + ] flushed immediately; rest flows through Normal
         assert_eq!(
             filter_all(&mut f, b"\x1b]0;window title\x07"),
             b"\x1b]0;window title\x07",
@@ -361,6 +363,7 @@ mod tests {
     #[test]
     fn esc_ris_emits_region() {
         let mut f = VtFilter::new(24, 80, 40, 80);
+        // ESC c = RIS — pass RIS through, then re-emit DECSTBM
         let out = filter_all(&mut f, b"\x1bc");
         let s = String::from_utf8(out).unwrap();
         assert!(s.starts_with("\x1bc"), "RIS must be passed through first");
@@ -370,12 +373,15 @@ mod tests {
     #[test]
     fn csi_unknown_passes_through() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // ESC [ 5 A = cursor up 5 — unrecognized CSI, passes through unchanged
         assert_eq!(filter_all(&mut f, b"\x1b[5A"), b"\x1b[5A");
     }
 
     #[test]
     fn csi_safety_limit_flushes() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // A CSI sequence longer than 32 bytes must be flushed as-is, not buffered forever.
+        // Input is 34 bytes: buf reaches 33 before the final byte, triggering the > 32 limit.
         let long: Vec<u8> = b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14".to_vec();
         let out = filter_all(&mut f, &long);
         assert!(out.starts_with(b"\x1b["), "safety flush must emit the accumulated bytes");
@@ -384,6 +390,7 @@ mod tests {
     #[test]
     fn nested_esc_in_csi_flushes_buf() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // ESC [ 5 ESC [ 2 J — nested ESC flushes incomplete first CSI
         let out = filter_all(&mut f, b"\x1b[5\x1b[2J");
         assert!(out.starts_with(b"\x1b[5"), "incomplete CSI must be flushed");
         assert!(out.ends_with(b"\x1b[2J"), "subsequent CSI must pass through");
@@ -392,30 +399,35 @@ mod tests {
     #[test]
     fn csi_private_marker_detected() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // ESC [ ? 25 h = show cursor — private CSI not in our rewrite table, passes through
         assert_eq!(filter_all(&mut f, b"\x1b[?25h"), b"\x1b[?25h");
     }
 
     #[test]
     fn decstbm_bare_reset_rewritten() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // ESC [ r with no params = full-screen reset → rewritten to server bounds
         assert_eq!(filter_all(&mut f, b"\x1b[r"), b"\x1b[1;24r");
     }
 
     #[test]
     fn decstbm_bottom_clamped_to_server_rows() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // Bottom margin (30) exceeds server_rows (24) → clamped
         assert_eq!(filter_all(&mut f, b"\x1b[1;30r"), b"\x1b[1;24r");
     }
 
     #[test]
     fn decstbm_within_bounds_unchanged() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // Both margins within server bounds → rewritten to same values
         assert_eq!(filter_all(&mut f, b"\x1b[5;20r"), b"\x1b[5;20r");
     }
 
     #[test]
     fn decstbm_top_exceeds_server_rows_collapses() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // top (25) > server_rows (24) → collapse to full region
         assert_eq!(filter_all(&mut f, b"\x1b[25;30r"), b"\x1b[1;24r");
     }
 
@@ -423,6 +435,7 @@ mod tests {
     fn decstbm_cross_buffer() {
         let mut f = VtFilter::new(24, 80, 40, 120);
         let mut out = Vec::new();
+        // Sequence split across two filter() calls — state must be preserved
         f.filter(b"\x1b[1;30", &mut out);
         f.filter(b"r", &mut out);
         assert_eq!(out, b"\x1b[1;24r");
@@ -431,9 +444,11 @@ mod tests {
     #[test]
     fn decslrm_right_clamped_to_server_cols() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // client_cols (120) > server_cols (80) → emit_region_setup sets declrmm_active
         let mut out = Vec::new();
         f.emit_region_setup(&mut out);
         out.clear();
+        // Right margin (100) exceeds server_cols (80) → clamped
         f.filter(b"\x1b[1;100s", &mut out);
         assert_eq!(out, b"\x1b[1;80s");
     }
@@ -441,6 +456,7 @@ mod tests {
     #[test]
     fn declrmm_enable_suppressed() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // Server app tries to enable DECLRMM — we own this mode, suppress it
         assert_eq!(filter_all(&mut f, b"\x1b[?69h"), b"");
     }
 
@@ -472,6 +488,7 @@ mod tests {
     #[test]
     fn other_private_mode_passes_through() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // ESC [ ? 2004 h = bracketed-paste mode — not intercepted
         assert_eq!(filter_all(&mut f, b"\x1b[?2004h"), b"\x1b[?2004h");
     }
 
@@ -481,6 +498,7 @@ mod tests {
         let mut out = Vec::new();
         f.emit_region_setup(&mut out);
         out.clear();
+        // left (90) > effective_right (80) → collapse to full region
         f.filter(b"\x1b[90;100s", &mut out);
         assert_eq!(out, b"\x1b[1;80s");
     }
@@ -488,10 +506,12 @@ mod tests {
     #[test]
     fn emit_region_setup_disables_declrmm_when_client_shrinks() {
         let mut f = VtFilter::new(24, 80, 40, 120);
+        // Initial setup: client_cols (120) > server_cols (80) → DECLRMM enabled
         let mut out = Vec::new();
         f.emit_region_setup(&mut out);
         assert!(f.declrmm_active);
         out.clear();
+        // Client shrinks to match server width → DECLRMM must be disabled
         f.update_client_size(40, 80);
         f.emit_region_setup(&mut out);
         assert!(!f.declrmm_active);
@@ -505,6 +525,7 @@ mod tests {
         let mut out = Vec::new();
         f.emit_region_setup(&mut out);
         out.clear();
+        // DECSTR resets DECLRMM/DECSLRM — filter must re-establish them afterward
         f.filter(b"\x1b[!p", &mut out);
         let s = String::from_utf8(out).unwrap();
         assert!(s.starts_with("\x1b[!p"), "DECSTR must pass through first");
@@ -518,6 +539,8 @@ mod tests {
         let mut out = Vec::new();
         f.emit_region_setup(&mut out);
         out.clear();
+        // Server sends DECSTBM; some terminals reset horizontal margins on DECSTBM —
+        // filter must re-emit DECSLRM immediately after the rewritten DECSTBM.
         f.filter(b"\x1b[r", &mut out);
         assert_eq!(out, b"\x1b[1;24r\x1b[1;80s");
     }
@@ -561,7 +584,7 @@ mod tests {
         h.init(b"", &[], &mut out).unwrap();
         out.clear();
 
-        let result = h.on_pty_event(PtyEvent::Stream { gen: 1, data: b"test" }, &mut out).unwrap();
+        let result = h.on_pty_event(PtyEvent::Stream { data: b"test" }, &mut out).unwrap();
         assert!(matches!(result, EventResult::Continue));
         assert_eq!(out, b"test");
     }
@@ -574,7 +597,7 @@ mod tests {
         out.clear();
 
         let result = h.on_pty_event(
-            PtyEvent::Refresh { gen: 2, cols: 80, rows: 30, data: b"new" },
+            PtyEvent::Refresh { cols: 80, rows: 30, data: b"new" },
             &mut out,
         ).unwrap();
         assert!(matches!(result, EventResult::Continue));
@@ -591,7 +614,7 @@ mod tests {
         out.clear();
 
         let result = h.on_pty_event(
-            PtyEvent::Refresh { gen: 2, cols: 200, rows: 50, data: b"big" },
+            PtyEvent::Refresh { cols: 200, rows: 50, data: b"big" },
             &mut out,
         ).unwrap();
         assert!(matches!(result, EventResult::ChangeRenderMode(RenderMode::Cell)));

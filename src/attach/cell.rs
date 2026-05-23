@@ -254,7 +254,7 @@ mod tests {
         h.init(b"", &[], &mut out).unwrap();
         out.clear();
 
-        let result = h.on_pty_event(PtyEvent::Stream { gen: 1, data: b"Test" }, &mut out).unwrap();
+        let result = h.on_pty_event(PtyEvent::Stream { data: b"Test" }, &mut out).unwrap();
         assert!(matches!(result, EventResult::Continue));
         assert!(!out.is_empty(), "stream data should produce render output");
     }
@@ -267,7 +267,7 @@ mod tests {
         out.clear();
 
         let result = h.on_pty_event(
-            PtyEvent::Refresh { gen: 2, cols: 100, rows: 30, data: b"New" },
+            PtyEvent::Refresh { cols: 100, rows: 30, data: b"New" },
             &mut out,
         ).unwrap();
         assert!(matches!(result, EventResult::Continue));
@@ -282,7 +282,7 @@ mod tests {
         out.clear();
 
         let result = h.on_pty_event(
-            PtyEvent::Refresh { gen: 2, cols: 80, rows: 24, data: b"content" },
+            PtyEvent::Refresh { cols: 80, rows: 24, data: b"content" },
             &mut out,
         ).unwrap();
         assert!(matches!(result, EventResult::Continue));

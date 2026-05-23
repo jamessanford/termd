@@ -34,10 +34,9 @@ pub enum RenderMode {
     Region,
 }
 
-#[allow(dead_code)]
 pub(super) enum PtyEvent<'a> {
-    Stream { gen: u64, data: &'a [u8] },
-    Refresh { gen: u64, cols: u32, rows: u32, data: &'a [u8] },
+    Stream { data: &'a [u8] },
+    Refresh { cols: u32, rows: u32, data: &'a [u8] },
     Resize { cols: u32, rows: u32 },
     Closed,
 }
@@ -547,7 +546,7 @@ pub async fn run(
                     match msg {
                         Ok(Some(r)) => match r.response {
                             Some(Response::Stream(s)) if s.pty_id == current_pty_id && s.generation > current_refresh_gen => {
-                                let result = handler.on_pty_event(PtyEvent::Stream { gen: s.generation, data: &s.data }, &mut out)?;
+                                let result = handler.on_pty_event(PtyEvent::Stream { data: &s.data }, &mut out)?;
                                 if let EventResult::ChangeRenderMode(m) = result {
                                     change_mode = Some((m, vec![]));
                                 }
@@ -557,7 +556,7 @@ pub async fn run(
                                 current_item.cols = rf.cols;
                                 current_item.rows = rf.rows;
                                 let result = handler.on_pty_event(
-                                    PtyEvent::Refresh { gen: rf.generation, cols: rf.cols, rows: rf.rows, data: &rf.data },
+                                    PtyEvent::Refresh { cols: rf.cols, rows: rf.rows, data: &rf.data },
                                     &mut out,
                                 )?;
                                 if let EventResult::ChangeRenderMode(m) = result {

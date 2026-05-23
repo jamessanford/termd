@@ -66,7 +66,7 @@ mod tests {
     fn stream_copies_data_to_output() {
         let mut h = RawHandler::new();
         let mut out = Vec::new();
-        let result = h.on_pty_event(PtyEvent::Stream { gen: 1, data: b"test" }, &mut out).unwrap();
+        let result = h.on_pty_event(PtyEvent::Stream { data: b"test" }, &mut out).unwrap();
         assert!(matches!(result, EventResult::Continue));
         assert_eq!(out, b"test");
     }
@@ -76,7 +76,7 @@ mod tests {
         let mut h = RawHandler::new();
         let mut out = Vec::new();
         let result = h.on_pty_event(
-            PtyEvent::Refresh { gen: 5, cols: 80, rows: 24, data: b"screen" },
+            PtyEvent::Refresh { cols: 80, rows: 24, data: b"screen" },
             &mut out,
         ).unwrap();
         assert!(matches!(result, EventResult::Continue));
