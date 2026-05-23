@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{Read, Write},
-    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
+    os::unix::io::{AsRawFd, FromRawFd},
     os::fd::OwnedFd,
     sync::{Arc, Mutex, RwLock, atomic::{AtomicU32, AtomicU64, Ordering}},
     time::SystemTime,
@@ -257,41 +257,33 @@ impl PtyRegistry {
             ws_ypixel: 0,
         };
         let pty = openpty(Some(&init_winsize), None).context("openpty")?;
-        let master_fd = pty.master.into_raw_fd();
-        let slave_fd = pty.slave.into_raw_fd();
+        let master = pty.master; // OwnedFd — closed automatically on any error return below
+        let slave_fd = pty.slave;   // OwnedFd
 
         // Get slave device name (/dev/pts/N) using thread-safe ptsname_r
         let pts_name = unsafe {
-            let borrowed = std::os::unix::io::BorrowedFd::borrow_raw(master_fd);
+            let borrowed = std::os::unix::io::BorrowedFd::borrow_raw(master.as_raw_fd());
             let owned = borrowed.try_clone_to_owned().context("clone master fd for ptsname_r")?;
             nix::pty::ptsname_r(&nix::pty::PtyMaster::from_owned_fd(owned))
         }.unwrap_or_else(|_| String::from("unknown"));
 
-        // NOTE: Check if we leak fds (master_fd, master_reader_fd, slave_fd, slave_stdout, slave_stderr) after this point if things fail (probably OK to leak if "weird" things fail, like the fnctl's but if the child spawn itself fails, and we bail out, make sure we don't leak)
-
-        // Dup master_fd for the reader thread before File::from_raw_fd takes ownership
-        let master_reader_fd = unsafe { libc::dup(master_fd) };
-        if master_reader_fd < 0 {
-            return Err(std::io::Error::last_os_error()).context("dup master fd for reader");
-        }
+        // Dup master for the reader thread before transferring ownership to File
+        let master_reader = dup_fd(master.as_raw_fd()).context("dup master fd for reader")?;
         // Set O_NONBLOCK so the reader can drain all available bytes in a loop
-        let flags = unsafe { libc::fcntl(master_reader_fd, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(master_reader_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        let flags = unsafe { libc::fcntl(master_reader.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(master_reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             return Err(std::io::Error::last_os_error()).context("set O_NONBLOCK on master reader fd");
         }
 
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
-        // dup slave_fd so each Stdio owns its own fd; the child will have them as 0/1/2
-        let slave_stdout = unsafe { libc::dup(slave_fd) };
-        let slave_stderr = unsafe { libc::dup(slave_fd) };
-        if slave_stdout < 0 || slave_stderr < 0 {
-            return Err(std::io::Error::last_os_error()).context("dup slave fd");
-        }
-        // Set FD_CLOEXEC on all master_fd and slave fds so concurrent forks
+        // dup slave so each Stdio owns its own fd; the child will have them as 0/1/2
+        let slave_stdout = dup_fd(slave_fd.as_raw_fd()).context("dup slave fd for stdout")?;
+        let slave_stderr = dup_fd(slave_fd.as_raw_fd()).context("dup slave fd for stderr")?;
+        // Set FD_CLOEXEC on all master and slave fds so concurrent forks
         // don't inherit them. Rust's spawn dup2s them to 0/1/2 in the
         // child before exec, so the shell still gets them correctly.
-        for &fd in &[master_fd, master_reader_fd, slave_fd, slave_stdout, slave_stderr] {
+        for fd in [master.as_raw_fd(), master_reader.as_raw_fd(), slave_fd.as_raw_fd(), slave_stdout.as_raw_fd(), slave_stderr.as_raw_fd()] {
             let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
             if rc < 0 {
                 return Err(std::io::Error::last_os_error()).context("set FD_CLOEXEC on open fds");
@@ -304,9 +296,9 @@ impl PtyRegistry {
         let mut cmd = Command::new(&shell);
         cmd.env("TERM", TERM_NAME)
            .env_remove("TERM_PROGRAM")
-           .stdin(unsafe { Stdio::from_raw_fd(slave_fd) })
-           .stdout(unsafe { Stdio::from_raw_fd(slave_stdout) })
-           .stderr(unsafe { Stdio::from_raw_fd(slave_stderr) });
+           .stdin(Stdio::from(slave_fd))
+           .stdout(Stdio::from(slave_stdout))
+           .stderr(Stdio::from(slave_stderr));
         // pre_exec runs in child after fork, before exec.
         // At this point stdin/stdout/stderr are already the slave fd.
         unsafe {
@@ -365,7 +357,7 @@ impl PtyRegistry {
             rows: AtomicU32::new(rows),
             title: title.clone(),
             tx: tx.clone(),
-            writer: Mutex::new(unsafe { File::from_raw_fd(master_fd) }),
+            writer: Mutex::new(File::from(master)),
             refresh_tx,
             scrollback_tx,
             resize_tx,
@@ -377,7 +369,7 @@ impl PtyRegistry {
         });
 
         // Spawn dedicated reader thread — owns libghostty state and child process
-        let master_reader = unsafe { File::from_raw_fd(master_reader_fd) };
+        let master_reader = File::from(master_reader);
         let title_for_thread = title.clone();
         std::thread::Builder::new()
             .name(format!("pty-reader-{id}"))
@@ -421,6 +413,11 @@ impl PtyRegistry {
 
 impl Default for PtyRegistry {
     fn default() -> Self { Self::new() }
+}
+
+fn dup_fd(fd: std::os::unix::io::RawFd) -> std::io::Result<OwnedFd> {
+    let new = unsafe { libc::dup(fd) };
+    if new < 0 { Err(std::io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(new) }) }
 }
 
 // Note: on-demand refresh only renders the active screen at call time.  The screen-switch
