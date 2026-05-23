@@ -469,7 +469,6 @@ pub async fn run(
 
     let allow_upgrade = mode == RenderMode::Region;
     let mut dispatch_mode = mode;
-    let mut current_refresh_gen: u64 = 0;
     let mut stdout = tokio::io::stdout();
     let mut out = Vec::new();
 
@@ -498,7 +497,7 @@ pub async fn run(
                 (0, vec![], vec![])
             }
         };
-        current_refresh_gen = refresh_gen;
+        let mut current_refresh_gen = refresh_gen;
 
         let buffered: Vec<_> = buffered.into_iter()
             .filter(|(gen, _)| *gen > current_refresh_gen)

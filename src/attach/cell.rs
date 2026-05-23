@@ -181,7 +181,7 @@ fn render_dirty(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::{PtyEvent, EventResult, RenderMode, RenderModeHandler};
+    use super::super::{PtyEvent, EventResult, RenderModeHandler};
 
     #[test]
     fn render_dirty_produces_no_output_when_clean() {
