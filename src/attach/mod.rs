@@ -32,6 +32,43 @@ pub enum RenderMode {
     Region,
 }
 
+pub(super) enum PtyEvent<'a> {
+    Stream { gen: u64, data: &'a [u8] },
+    Refresh { gen: u64, cols: u32, rows: u32, data: &'a [u8] },
+    Resize { cols: u32, rows: u32 },
+    Closed,
+}
+
+pub(super) enum EventResult {
+    Continue,
+    ChangeRenderMode(RenderMode),
+    RequestRefresh,
+}
+
+pub(super) trait RenderModeHandler {
+    fn init(&mut self, refresh_data: &[u8], buffered: &[(u64, Vec<u8>)], out: &mut Vec<u8>) -> anyhow::Result<EventResult>;
+    fn on_pty_event(&mut self, event: PtyEvent, out: &mut Vec<u8>) -> anyhow::Result<EventResult>;
+    fn on_sigwinch(&mut self, cols: u32, rows: u32, out: &mut Vec<u8>) -> anyhow::Result<EventResult>;
+    fn cleanup(&mut self, _out: &mut Vec<u8>) {}
+}
+
+// Uncomment after handler types are defined in Tasks 2-4.
+// fn create_handler(
+//     mode: RenderMode,
+//     server_cols: u32,
+//     server_rows: u32,
+//     allow_upgrade: bool,
+// ) -> anyhow::Result<Box<dyn RenderModeHandler>> {
+//     Ok(match mode {
+//         RenderMode::Cell => Box::new(cell::CellHandler::new(server_cols, server_rows, allow_upgrade)?),
+//         RenderMode::Raw => Box::new(raw::RawHandler::new()),
+//         RenderMode::Region => {
+//             let (client_cols, client_rows) = get_terminal_size();
+//             Box::new(region::RegionHandler::new(server_rows, server_cols, client_rows, client_cols))
+//         }
+//     })
+// }
+
 pub(crate) struct RunContext {
     pub resp_rx:       tonic::Streaming<termd::proto::TerminalResponse>,
     pub cmd_tx:        tokio::sync::mpsc::Sender<TerminalCommand>,
