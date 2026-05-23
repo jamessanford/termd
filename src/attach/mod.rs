@@ -520,6 +520,7 @@ pub async fn run(
             };
             match result {
                 RunOutcome::ChangeRenderMode(new_mode, new_ctx) => {
+                    // TODO: We really should request a refresh when switching RenderModes (ideally we could keep stdin open and not have to redo the input loop)
                     dispatch_mode = new_mode;
                     dispatch_ctx = new_ctx;
                 }

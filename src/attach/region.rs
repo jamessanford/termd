@@ -385,7 +385,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                 }
                 client_cols = new_cols;
                 client_rows = new_rows;
-                // Placeholder: Trigger debounced SubscribeUpdate RPC here to inform new_rows new_cols
+                // TODO: Trigger debounced SubscribeUpdate RPC here to inform new_rows new_cols
                 filter.update_client_size(new_rows, new_cols);
                 filter.emit_region_setup(&mut out);
             }

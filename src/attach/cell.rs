@@ -133,7 +133,7 @@ pub(super) async fn run(ctx: super::RunContext, allow_upgrade: bool) -> Result<s
                         }
                     ));
                 }
-                // Placeholder: Trigger debounced SubscribeUpdate RPC here to inform new_rows new_cols
+                // TODO: Trigger debounced SubscribeUpdate RPC here to inform new_rows new_cols
                 render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
             }
         }
