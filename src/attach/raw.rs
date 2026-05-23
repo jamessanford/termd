@@ -31,19 +31,19 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
             msg = resp_rx.message() => {
                 match msg {
                     Ok(Some(r)) => match r.response {
-                        Some(Response::Stream(s)) => {
+                        Some(Response::Stream(s)) if s.pty_id == pty_id => {
                             if s.generation > refresh_gen {
                                 if stdout.write_all(&s.data).await.is_err() { break; }
                                 let _ = stdout.flush().await;
                             }
                         }
-                        Some(Response::Refresh(rf)) => {
+                        Some(Response::Refresh(rf)) if rf.pty_id == pty_id => {
                             // Response to a SIGWINCH-triggered refresh request
                             refresh_gen = rf.generation;
                             if stdout.write_all(&rf.data).await.is_err() { break; }
                             let _ = stdout.flush().await;
                         }
-                        Some(Response::Metadata(m)) => {
+                        Some(Response::Metadata(m)) if m.pty_id == pty_id => {
                             if m.reason == StreamMetadataReason::Resize as i32 {
                                 // Clear stale content; server will broadcast a Refresh next
                                 let _ = stdout.write_all(b"\x1b[2J").await;

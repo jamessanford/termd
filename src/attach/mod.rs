@@ -209,9 +209,9 @@ async fn subscribe(
         match resp_rx.message().await? {
             None => anyhow::bail!("server disconnected during subscribe"),
             Some(r) => match r.response {
-                Some(Response::Subscribe(c)) if c.success => return Ok(true),
-                Some(Response::Subscribe(c)) => {
-                    show_error("[subscribe failed: {}]", c.error.unwrap_or_default()).await;
+                Some(Response::Subscribe(c)) if c.pty_id == pty_id && c.success => return Ok(true),
+                Some(Response::Subscribe(c)) if c.pty_id == pty_id => {
+                    show_error(&format!("[subscribe failed: {}]", c.error.unwrap_or_default())).await;
                     return Ok(false);
                 }
                 _ => {}
@@ -235,9 +235,9 @@ async fn request_refresh(
         match resp_rx.message().await? {
             None => anyhow::bail!("server disconnected during refresh"),
             Some(r) => match r.response {
-                Some(Response::Refresh(rf)) => return Ok(Some((rf.generation, rf.data, buffered))),
-                Some(Response::Stream(s))   => buffered.push((s.generation, s.data)),
-                Some(Response::Command(c)) if !c.success => return Ok(None),
+                Some(Response::Refresh(rf)) if rf.pty_id == pty_id => return Ok(Some((rf.generation, rf.data, buffered))),
+                Some(Response::Stream(s))   if s.pty_id  == pty_id => buffered.push((s.generation, s.data)),
+                Some(Response::Command(c)) if c.pty_id == pty_id && !c.success => return Ok(None),
                 _ => {}
             }
         }
@@ -541,6 +541,7 @@ pub async fn run(
                             match resp_rx.message().await? {
                                 None => { eprintln!("[server disconnected]"); break 'session; }
                                 Some(r) => if let Some(Response::Command(c)) = r.response {
+                                    if c.pty_id != current_pty_id { continue; }
                                     if !c.success {
                                         show_error(&format!("[Failed to destroy PTY: {}]", c.error.unwrap_or_default())).await;
                                         continue 'session;

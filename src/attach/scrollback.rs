@@ -150,9 +150,9 @@ async fn fetch_scrollback(
         match resp_rx.message().await? {
             None => anyhow::bail!("server disconnected during scrollback fetch"),
             Some(r) => match r.response {
-                Some(Response::Scrollback(s)) => return Ok(s),
-                Some(Response::Stream(_)) => {}
-                Some(Response::Command(c)) if !c.success => {
+                Some(Response::Scrollback(s)) if s.pty_id == pty_id => return Ok(s),
+                Some(Response::Stream(s))     if s.pty_id == pty_id => {}
+                Some(Response::Command(c)) if c.pty_id == pty_id && !c.success => {
                     anyhow::bail!("scrollback error: {}", c.error.unwrap_or_default())
                 }
                 _ => {}

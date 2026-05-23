@@ -46,13 +46,13 @@ pub(super) async fn run(ctx: super::RunContext, allow_upgrade: bool) -> Result<s
             msg = resp_rx.message() => {
                 match msg {
                     Ok(Some(r)) => match r.response {
-                        Some(Response::Stream(s)) => {
+                        Some(Response::Stream(s)) if s.pty_id == pty_id => {
                             if s.generation > current_refresh_gen {
                                 lt.terminal.vt_write(&s.data);
                                 render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, false, &mut out)?;
                             }
                         }
-                        Some(Response::Refresh(rf)) => {
+                        Some(Response::Refresh(rf)) if rf.pty_id == pty_id => {
                             current_refresh_gen = rf.generation;
                             item.cols = rf.cols;
                             item.rows = rf.rows;
@@ -73,7 +73,7 @@ pub(super) async fn run(ctx: super::RunContext, allow_upgrade: bool) -> Result<s
                             lt.terminal.vt_write(&rf.data);
                             render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
                         }
-                        Some(Response::Metadata(m)) => {
+                        Some(Response::Metadata(m)) if m.pty_id == pty_id => {
                             if m.reason == StreamMetadataReason::Resize as i32 {
                                 if let Some(ref mi) = m.item {
                                     if mi.cols > 0 && mi.rows > 0 {

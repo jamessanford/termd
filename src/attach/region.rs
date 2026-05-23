@@ -313,10 +313,10 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
             msg = resp_rx.message() => {
                 match msg {
                     Ok(Some(r)) => match r.response {
-                        Some(Response::Stream(s)) if s.generation > current_refresh_gen => {
+                        Some(Response::Stream(s)) if s.pty_id == pty_id && s.generation > current_refresh_gen => {
                             filter.filter(&s.data, &mut out);
                         }
-                        Some(Response::Refresh(rf)) => {
+                        Some(Response::Refresh(rf)) if rf.pty_id == pty_id => {
                             current_refresh_gen = rf.generation;
                             item.cols = rf.cols;
                             item.rows = rf.rows;
@@ -333,7 +333,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                             filter.emit_region_setup(&mut out);
                             filter.filter(&rf.data, &mut out);
                         }
-                        Some(Response::Metadata(m)) => {
+                        Some(Response::Metadata(m)) if m.pty_id == pty_id => {
                             if m.reason == StreamMetadataReason::Resize as i32 {
                                 if let Some(ref mi) = m.item {
                                     if mi.cols > 0 && mi.rows > 0 {
