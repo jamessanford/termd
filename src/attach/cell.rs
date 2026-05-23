@@ -12,8 +12,8 @@ use termd::proto::{
     StreamMetadataReason,
 };
 
-pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
-    let super::RunContext { mut resp_rx, cmd_tx, pty_id, item, refresh_gen, refresh_bytes, buffered, mut action_rx } = ctx;
+pub(super) async fn run(ctx: super::RunContext, allow_upgrade: bool) -> Result<super::RunOutcome> {
+    let super::RunContext { mut resp_rx, cmd_tx, pty_id, mut item, refresh_gen, refresh_bytes, buffered, mut action_rx } = ctx;
 
     let mut lt = super::LocalTerminal::new(item.cols, item.rows)?;
     lt.terminal.vt_write(&refresh_bytes);
@@ -54,6 +54,21 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                         }
                         Some(Response::Refresh(rf)) => {
                             current_refresh_gen = rf.generation;
+                            item.cols = rf.cols;
+                            item.rows = rf.rows;
+                            let (client_cols, client_rows) = super::get_terminal_size();
+                            if allow_upgrade && super::server_fits_client(rf.cols, rf.rows, client_cols, client_rows) {
+                                return Ok(super::RunOutcome::ChangeRenderMode(
+                                    super::RenderMode::Region,
+                                    super::RunContext {
+                                        resp_rx, cmd_tx, pty_id, item,
+                                        refresh_gen: current_refresh_gen,
+                                        refresh_bytes: rf.data,
+                                        buffered: vec![],
+                                        action_rx,
+                                    }
+                                ));
+                            }
                             lt.resize(rf.cols, rf.rows)?;
                             lt.terminal.vt_write(&rf.data);
                             render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
@@ -62,6 +77,21 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                             if m.reason == StreamMetadataReason::Resize as i32 {
                                 if let Some(ref mi) = m.item {
                                     if mi.cols > 0 && mi.rows > 0 {
+                                        item.cols = mi.cols;
+                                        item.rows = mi.rows;
+                                        let (client_cols, client_rows) = super::get_terminal_size();
+                                        if allow_upgrade && super::server_fits_client(mi.cols, mi.rows, client_cols, client_rows) {
+                                            return Ok(super::RunOutcome::ChangeRenderMode(
+                                                super::RenderMode::Region,
+                                                super::RunContext {
+                                                    resp_rx, cmd_tx, pty_id, item,
+                                                    refresh_gen: 0,
+                                                    refresh_bytes: vec![],
+                                                    buffered: vec![],
+                                                    action_rx,
+                                                }
+                                            ));
+                                        }
                                         lt.resize(mi.cols, mi.rows)?;
                                         // No need to clear screen or re-render,
                                         // a full Refresh will be arriving soon.
@@ -90,6 +120,19 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                 }));
             }
             _ = sigwinch.recv() => {
+                let (client_cols, client_rows) = super::get_terminal_size();
+                if allow_upgrade && super::server_fits_client(item.cols, item.rows, client_cols, client_rows) {
+                    return Ok(super::RunOutcome::ChangeRenderMode(
+                        super::RenderMode::Region,
+                        super::RunContext {
+                            resp_rx, cmd_tx, pty_id, item,
+                            refresh_gen: current_refresh_gen,
+                            refresh_bytes: vec![],
+                            buffered: vec![],
+                            action_rx,
+                        }
+                    ));
+                }
                 // Placeholder: Trigger debounced SubscribeUpdate RPC here to inform new_rows new_cols
                 render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, true, &mut out)?;
             }

@@ -47,11 +47,11 @@ pub(crate) struct RunContext {
 pub(super) enum RunOutcome {
     /// The server PTY exited or closed.
     ServerClosed,
-    /// Region mode detected it can no longer handle current dimensions.
-    /// `refresh_bytes` is empty — this relies on the server sending a
-    /// refresh following a resize event. That holds for resize-triggered
-    /// fallbacks but would not hold for arbitrary render-mode changes.
-    FallbackToCell(RunContext),
+    /// The current render mode can no longer handle the current dimensions, or has detected
+    /// an opportunity to switch. The given mode should be started next.
+    /// `refresh_bytes` is empty when the caller relies on the server sending a Refresh
+    /// following a resize event; populated when the caller has Refresh data to hand off.
+    ChangeRenderMode(RenderMode, RunContext),
     /// An input action was received; the render mode returns the context
     /// so the outer session loop can handle PTY switching.
     Action(InputAction, RunContext),
@@ -146,6 +146,10 @@ pub(super) fn get_terminal_size() -> (u32, u32) {
     let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
     unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws); }
     (ws.ws_col as u32, ws.ws_row as u32)
+}
+
+pub(super) fn server_fits_client(server_cols: u32, server_rows: u32, client_cols: u32, client_rows: u32) -> bool {
+    client_cols >= server_cols && client_rows >= server_rows
 }
 
 // Disable any PTY-set terminal modes so client-side UI and new-PTY refreshes start clean.
@@ -466,6 +470,11 @@ pub async fn run(
     let mut previous_pty_id: Option<String> = None;
     let mut should_subscribe = true;
 
+    // Only allow cell→region upgrades if the user originally chose region mode.
+    // --render-mode=cell stays in cell.
+    let allow_upgrade = mode == RenderMode::Region;
+    let mut dispatch_mode = mode;
+
     'session: loop {
         if should_subscribe {
             subscribe(&cmd_tx, &mut resp_rx, &current_pty_id).await?;
@@ -502,18 +511,17 @@ pub async fn run(
             action_rx,
         };
 
-        let mut dispatch_mode = mode;
         let mut dispatch_ctx = ctx;
         let outcome = loop {
             let result = match dispatch_mode {
-                RenderMode::Cell   => cell::run(dispatch_ctx).await?,
+                RenderMode::Cell   => cell::run(dispatch_ctx, allow_upgrade).await?,
                 RenderMode::Raw    => raw::run(dispatch_ctx).await?,
-                RenderMode::Region    => region::run(dispatch_ctx).await?,
+                RenderMode::Region => region::run(dispatch_ctx).await?,
             };
             match result {
-                RunOutcome::FallbackToCell(fallback_ctx) => {
-                    dispatch_mode = RenderMode::Cell;
-                    dispatch_ctx = fallback_ctx;
+                RunOutcome::ChangeRenderMode(new_mode, new_ctx) => {
+                    dispatch_mode = new_mode;
+                    dispatch_ctx = new_ctx;
                 }
                 other => break other,
             }
@@ -529,7 +537,7 @@ pub async fn run(
                 eprintln!("[Connection closed]");
                 break 'session;
             }
-            RunOutcome::FallbackToCell(_) => unreachable!(),
+            RunOutcome::ChangeRenderMode(_, _) => unreachable!(),
             RunOutcome::Action(action, ctx) => {
                 resp_rx = ctx.resp_rx;
                 reset_terminal_modes();

@@ -262,17 +262,22 @@ impl VtFilter {
 
 // ── run() ────────────────────────────────────────────────────────────────────
 
+enum LoopExit {
+    ChangeRenderMode,
+    Action(super::InputAction),
+}
+
 pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
-    let (client_cols, client_rows) = super::get_terminal_size();
+    let (mut client_cols, mut client_rows) = super::get_terminal_size();
     let server_rows = ctx.item.rows;
     let server_cols = ctx.item.cols;
 
-    if client_rows < server_rows || client_cols < server_cols {
+    if !super::server_fits_client(server_cols, server_rows, client_cols, client_rows) {
         eprintln!(
             "[region: client ({client_cols}x{client_rows}) smaller than \
              server ({server_cols}x{server_rows}); switching to cell mode]"
         );
-        return super::cell::run(ctx).await;
+        return Ok(super::RunOutcome::ChangeRenderMode(super::RenderMode::Cell, ctx));
     }
 
     let super::RunContext {
@@ -299,8 +304,7 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
     stdout.flush().await?;
 
     let mut sigwinch = signal(SignalKind::window_change())?;
-    // Set to Some when region mode needs to hand off to cell mode.
-    let mut fallback_ctx: Option<super::RunContext> = None;
+    let mut loop_exit: Option<LoopExit> = None;
     let mut pty_closed = false;
 
     loop {
@@ -314,9 +318,17 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                         }
                         Some(Response::Refresh(rf)) => {
                             current_refresh_gen = rf.generation;
-                            // TODO: fallback_ctx if out of bounds
                             item.cols = rf.cols;
                             item.rows = rf.rows;
+                            if !super::server_fits_client(rf.cols, rf.rows, client_cols, client_rows) {
+                                eprintln!(
+                                    "[region: server refreshed at ({}x{}), larger than \
+                                     client ({}x{}); switching to cell mode]",
+                                    rf.cols, rf.rows, client_cols, client_rows
+                                );
+                                loop_exit = Some(LoopExit::ChangeRenderMode);
+                                break;
+                            }
                             filter.update_region(rf.rows, rf.cols);
                             filter.emit_region_setup(&mut out);
                             filter.filter(&rf.data, &mut out);
@@ -325,23 +337,15 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                             if m.reason == StreamMetadataReason::Resize as i32 {
                                 if let Some(ref mi) = m.item {
                                     if mi.cols > 0 && mi.rows > 0 {
-                                        // Keep item in sync so a subsequent fallback
-                                        // hands cell mode the current server dimensions.
                                         item.cols = mi.cols;
                                         item.rows = mi.rows;
-                                        if mi.cols > client_cols || mi.rows > client_rows {
+                                        if !super::server_fits_client(mi.cols, mi.rows, client_cols, client_rows) {
                                             eprintln!(
                                                 "[region: server resized to ({}x{}), larger than \
                                                  client ({}x{}); switching to cell mode]",
                                                 mi.cols, mi.rows, client_cols, client_rows
                                             );
-                                            fallback_ctx = Some(super::RunContext {
-                                                resp_rx, cmd_tx, pty_id, item,
-                                                refresh_gen: 0, // zero so cell mode accepts the server's next Refresh
-                                                refresh_bytes: vec![],
-                                                buffered: vec![],
-                                                action_rx,
-                                            });
+                                            loop_exit = Some(LoopExit::ChangeRenderMode);
                                             break;
                                         }
                                         filter.update_region(mi.rows, mi.cols);
@@ -365,43 +369,22 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
                 }
             }
             action = action_rx.recv() => {
-                // TODO: Consider changing this to a "next_action_ctx" and break out of the loop,
-                //       also have the "fallback_ctx" code set next_action instead.
-                //       That way we always get the correct cleanup code on exit (right now, just the margin restoration)
-                //  Also, we probably don't need to return a "ctx" at all, just the Outcome.  The existing code doesn't really need the ctx returned back.
-                let action = action.unwrap_or(super::InputAction::Detach);
-                // Restore client terminal margins before handing back context.
-                let _ = stdout.write_all(b"\x1b[r").await;
-                if filter.declrmm_active {
-                    let _ = stdout.write_all(b"\x1b[?69l").await;
-                }
-                let _ = stdout.flush().await;
-                return Ok(super::RunOutcome::Action(action, super::RunContext {
-                    resp_rx, cmd_tx, pty_id, item,
-                    refresh_gen: current_refresh_gen,
-                    refresh_bytes: vec![], buffered: vec![],
-                    action_rx,
-                }));
+                loop_exit = Some(LoopExit::Action(action.unwrap_or(super::InputAction::Detach)));
+                break;
             }
             _ = sigwinch.recv() => {
                 let (new_cols, new_rows) = super::get_terminal_size();
-                if new_rows < filter.server_rows || new_cols < filter.server_cols {
-                    // TODO: Move to consolidated upgrade/downgrade code that can dynamically switch, as long as we originally started in region mode.  The logic should remain in mod.rs.
+                if !super::server_fits_client(filter.server_cols, filter.server_rows, new_cols, new_rows) {
                     eprintln!(
                         "[region: client shrank to ({}x{}), smaller than server ({}x{}); \
                          switching to cell mode]",
                         new_cols, new_rows, filter.server_cols, filter.server_rows
                     );
-                    fallback_ctx = Some(super::RunContext {
-                        resp_rx, cmd_tx, pty_id, item,
-                        refresh_gen: 0, // zero so cell mode accepts the server's next Refresh
-                        refresh_bytes: vec![],
-                        buffered: vec![],
-                        action_rx,
-                    });
+                    loop_exit = Some(LoopExit::ChangeRenderMode);
                     break;
                 }
-
+                client_cols = new_cols;
+                client_rows = new_rows;
                 // Placeholder: Trigger debounced SubscribeUpdate RPC here to inform new_rows new_cols
                 filter.update_client_size(new_rows, new_cols);
                 filter.emit_region_setup(&mut out);
@@ -420,10 +403,28 @@ pub(super) async fn run(ctx: super::RunContext) -> Result<super::RunOutcome> {
     }
     let _ = stdout.flush().await;
 
-    if let Some(ctx) = fallback_ctx {
-        return Ok(super::RunOutcome::FallbackToCell(ctx));
+    match loop_exit {
+        None => Ok(super::RunOutcome::ServerClosed),
+        Some(LoopExit::ChangeRenderMode) => Ok(super::RunOutcome::ChangeRenderMode(
+            super::RenderMode::Cell,
+            super::RunContext {
+                resp_rx, cmd_tx, pty_id, item,
+                refresh_gen: 0,
+                refresh_bytes: vec![],
+                buffered: vec![],
+                action_rx,
+            },
+        )),
+        Some(LoopExit::Action(action)) => Ok(super::RunOutcome::Action(
+            action,
+            super::RunContext {
+                resp_rx, cmd_tx, pty_id, item,
+                refresh_gen: current_refresh_gen,
+                refresh_bytes: vec![], buffered: vec![],
+                action_rx,
+            },
+        )),
     }
-    Ok(super::RunOutcome::ServerClosed)
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
