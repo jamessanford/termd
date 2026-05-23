@@ -468,7 +468,7 @@ pub async fn run(
     let mut current_item = item;
     let mut pty_list: Vec<PtyItem> = Vec::new();
     let mut previous_pty_id: Option<String> = None;
-    let mut should_subscribe = true;
+    let mut subscribed_pty_id: Option<String> = None;
 
     // Only allow cell→region upgrades if the user originally chose region mode.
     // --render-mode=cell stays in cell.
@@ -476,10 +476,10 @@ pub async fn run(
     let mut dispatch_mode = mode;
 
     'session: loop {
-        if should_subscribe {
+        if subscribed_pty_id.as_deref() != Some(current_pty_id.as_str()) {
             subscribe(&cmd_tx, &mut resp_rx, &current_pty_id).await?;
+            subscribed_pty_id = Some(current_pty_id.clone());
         }
-        should_subscribe = true;
 
         let (refresh_gen, refresh_bytes, buffered) =
             match request_refresh(&cmd_tx, &mut resp_rx, &current_pty_id).await? {
@@ -563,9 +563,7 @@ pub async fn run(
                             }
                         }
                         pty_list.clear();
-                        if !switch_to_recent(&cmd_tx, &mut resp_rx, &mut pty_list, &mut current_pty_id, &mut current_item, &mut previous_pty_id).await {
-                            should_subscribe = false;
-                        }
+                        switch_to_recent(&cmd_tx, &mut resp_rx, &mut pty_list, &mut current_pty_id, &mut current_item, &mut previous_pty_id).await;
                     }
 
                     InputAction::ForceResize => {
@@ -575,7 +573,6 @@ pub async fn run(
                                 pty_id: current_pty_id.clone(), cols, rows,
                             })),
                         }).await;
-                        should_subscribe = false;
                     }
 
                     InputAction::ForceRefresh => {
@@ -584,7 +581,6 @@ pub async fn run(
                                 pty_id: current_pty_id.clone(),
                             })),
                         }).await;
-                        should_subscribe = false;
                     }
 
                     InputAction::Create => {
@@ -617,7 +613,6 @@ pub async fn run(
 
                     InputAction::SwitchNext => {
                         if !ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
-                            should_subscribe = false;
                             continue 'session;
                         }
                         if let Some(target) = next_pty(&pty_list, &current_pty_id).cloned() {
@@ -629,7 +624,6 @@ pub async fn run(
 
                     InputAction::SwitchPrevious => {
                         if !ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
-                            should_subscribe = false;
                             continue 'session;
                         }
                         if let Some(target) = prev_pty(&pty_list, &current_pty_id).cloned() {
@@ -640,14 +634,11 @@ pub async fn run(
                     }
 
                     InputAction::SwitchRecent => {
-                        if !switch_to_recent(&cmd_tx, &mut resp_rx, &mut pty_list, &mut current_pty_id, &mut current_item, &mut previous_pty_id).await {
-                            should_subscribe = false;
-                        }
+                        switch_to_recent(&cmd_tx, &mut resp_rx, &mut pty_list, &mut current_pty_id, &mut current_item, &mut previous_pty_id).await;
                     }
 
                     InputAction::SwitchIndex(n) => {
                         if !ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
-                            should_subscribe = false;
                             continue 'session;
                         }
                         if let Some(target) = pty_list.get(n as usize).cloned() {
@@ -666,10 +657,7 @@ pub async fn run(
                                     pty_list.clear();
                                 }
                             }
-                            _ => {
-                                // Cancel or selected same PTY — skip resubscribe, just refresh.
-                                should_subscribe = false;
-                            }
+                            _ => {}
                         }
                     }
 
@@ -677,7 +665,6 @@ pub async fn run(
                         show_error(&format!(
                             "requested={mode:?} actual={dispatch_mode:?} pty={current_pty_id}"
                         )).await;
-                        should_subscribe = false;
                     }
 
                     InputAction::ShowScrollback => {
@@ -687,7 +674,6 @@ pub async fn run(
                             &current_pty_id,
                             current_item.rows,
                         ).await?;
-                        should_subscribe = false;
                     }
                 }
             }
