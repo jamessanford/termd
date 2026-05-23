@@ -1,5 +1,6 @@
+use std::io::Write;
+
 use anyhow::Result;
-use tokio::io::AsyncWriteExt;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -440,7 +441,7 @@ pub async fn run(
 
     let allow_upgrade = mode == RenderMode::Region;
     let mut dispatch_mode = mode;
-    let mut stdout = tokio::io::stdout();
+    let mut stdout = std::io::stdout();
     let mut out = Vec::new();
 
     'session: loop {
@@ -483,7 +484,7 @@ pub async fn run(
         if let EventResult::ChangeRenderMode(new_mode) = handler.init(&refresh_bytes, &buffered, &mut out)? {
             handler.cleanup(&mut out);
             if !out.is_empty() {
-                stdout.write_all(&out).await?;
+                stdout.write_all(&out)?;
                 out.clear();
             }
             dispatch_mode = new_mode;
@@ -491,8 +492,8 @@ pub async fn run(
             handler.init(&refresh_bytes, &buffered, &mut out)?;
         }
         if !out.is_empty() {
-            stdout.write_all(&out).await?;
-            stdout.flush().await?;
+            stdout.write_all(&out)?;
+            stdout.flush()?;
         }
 
         // === Phase: Spawn Input Task ===
@@ -607,8 +608,8 @@ pub async fn run(
             }
 
             if !out.is_empty() {
-                if stdout.write_all(&out).await.is_err() { break RunOutcome::ServerClosed; }
-                let _ = stdout.flush().await;
+                if stdout.write_all(&out).is_err() { break RunOutcome::ServerClosed; }
+                let _ = stdout.flush();
             }
         };
 
