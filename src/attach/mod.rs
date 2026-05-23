@@ -1,6 +1,4 @@
 use anyhow::Result;
-use libghostty_vt::{Terminal, TerminalOptions, RenderState};
-use libghostty_vt::render::{RowIterator, CellIterator};
 use tokio::io::AsyncWriteExt;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
@@ -94,32 +92,6 @@ type AuthedClient = TerminalServiceClient<
         fn(Request<()>) -> Result<Request<()>, tonic::Status>,
     >,
 >;
-
-struct LocalTerminal {
-    terminal: Terminal<'static, 'static>,
-    render_state: RenderState<'static>,
-    row_iter: RowIterator<'static>,
-    cell_iter: CellIterator<'static>,
-}
-
-impl LocalTerminal {
-    fn new(cols: u32, rows: u32) -> Result<Self> {
-        Ok(Self {
-            terminal: Terminal::new(TerminalOptions {
-                cols: cols as u16,
-                rows: rows as u16,
-                max_scrollback: 0,
-            })?,
-            render_state: RenderState::new()?,
-            row_iter: RowIterator::new()?,
-            cell_iter: CellIterator::new()?,
-        })
-    }
-
-    fn resize(&mut self, cols: u32, rows: u32) -> Result<()> {
-        Ok(self.terminal.resize(cols as u16, rows as u16, 0, 0)?)
-    }
-}
 
 struct TerminalGuard {
     original: nix::sys::termios::Termios,
@@ -612,6 +584,7 @@ pub async fn run(
                 }
                 _ = &mut refresh_debounce, if debounce_active => {
                     debounce_active = false;
+                    // TODO: Send SubscribeUpdate with new cols/rows
                     let _ = cmd_tx.send(TerminalCommand {
                         command: Some(Command::Refresh(RefreshRequest {
                             pty_id: current_pty_id.clone(),

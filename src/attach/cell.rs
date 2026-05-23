@@ -1,11 +1,38 @@
 use std::io::Write as IoWrite;
 
 use anyhow::Result;
+use libghostty_vt::{Terminal, TerminalOptions, RenderState};
 use libghostty_vt::render::{Dirty, RowIterator, CellIterator};
 use libghostty_vt::style::Underline;
 
+struct LocalTerminal {
+    terminal: Terminal<'static, 'static>,
+    render_state: RenderState<'static>,
+    row_iter: RowIterator<'static>,
+    cell_iter: CellIterator<'static>,
+}
+
+impl LocalTerminal {
+    fn new(cols: u32, rows: u32) -> Result<Self> {
+        Ok(Self {
+            terminal: Terminal::new(TerminalOptions {
+                cols: cols as u16,
+                rows: rows as u16,
+                max_scrollback: 0,
+            })?,
+            render_state: RenderState::new()?,
+            row_iter: RowIterator::new()?,
+            cell_iter: CellIterator::new()?,
+        })
+    }
+
+    fn resize(&mut self, cols: u32, rows: u32) -> Result<()> {
+        Ok(self.terminal.resize(cols as u16, rows as u16, 0, 0)?)
+    }
+}
+
 pub(super) struct CellHandler {
-    lt: super::LocalTerminal,
+    lt: LocalTerminal,
     allow_upgrade: bool,
     server_cols: u32,
     server_rows: u32,
@@ -14,7 +41,7 @@ pub(super) struct CellHandler {
 impl CellHandler {
     pub(super) fn new(cols: u32, rows: u32, allow_upgrade: bool) -> Result<Self> {
         Ok(Self {
-            lt: super::LocalTerminal::new(cols, rows)?,
+            lt: LocalTerminal::new(cols, rows)?,
             allow_upgrade,
             server_cols: cols,
             server_rows: rows,
@@ -185,7 +212,7 @@ mod tests {
 
     #[test]
     fn render_dirty_produces_no_output_when_clean() {
-        let mut lt = super::super::LocalTerminal::new(80, 24).unwrap();
+        let mut lt = super::LocalTerminal::new(80, 24).unwrap();
         let mut out = Vec::new();
         render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, false, &mut out).unwrap();
         out.clear();
@@ -196,7 +223,7 @@ mod tests {
 
     #[test]
     fn render_dirty_emits_only_changed_rows() {
-        let mut lt = super::super::LocalTerminal::new(80, 24).unwrap();
+        let mut lt = super::LocalTerminal::new(80, 24).unwrap();
         let mut out = Vec::new();
         render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, false, &mut out).unwrap();
         out.clear();
@@ -212,7 +239,7 @@ mod tests {
 
     #[test]
     fn force_full_renders_all_rows() {
-        let mut lt = super::super::LocalTerminal::new(80, 24).unwrap();
+        let mut lt = super::LocalTerminal::new(80, 24).unwrap();
         let mut out = Vec::new();
         render_dirty(&lt.terminal, &mut lt.render_state, &mut lt.row_iter, &mut lt.cell_iter, false, &mut out).unwrap();
         out.clear();
