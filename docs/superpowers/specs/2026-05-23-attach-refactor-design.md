@@ -38,7 +38,9 @@ trait RenderModeHandler {
 }
 ```
 
-The hot path: the demux loop reads `Response::Stream`, constructs `PtyEvent::Stream` with a borrowed `&[u8]` to the data, calls `handler.on_pty_event()`, writes the resulting `out` bytes to stdout. No channel hop, no copy of the payload bytes.
+The hot path: the demux loop reads `Response::Stream`, checks `generation > current_refresh_gen` (this filtering moves from each render mode into the main loop), constructs `PtyEvent::Stream` with a borrowed `&[u8]` to the data, calls `handler.on_pty_event()`, writes the resulting `out` bytes to stdout. No channel hop, no copy of the payload bytes.
+
+The main loop also tracks `pty_closed` (currently duplicated in each render mode) to avoid duplicate "[PTY closed]" messages.
 
 Protobuf types are still used freely throughout the codebase — the abstraction is about who reads the gRPC stream and dispatches events, not about hiding protobufs.
 
@@ -78,9 +80,9 @@ run() {
 
 ### Control-Plane Operations
 
-Control-plane operations (subscribe, request_refresh, fetch_list, create, destroy, scrollback) become phases of the main loop. When the session loop needs to do a control-plane operation (e.g., during a PTY switch), it sends the command on `cmd_tx` and the main loop enters a temporary phase where it reads `resp_rx` looking for the matching response, discarding or buffering other events as appropriate.
+Control-plane operations (subscribe, request_refresh, fetch_list, create, destroy) become inline phases of the main loop. When a PTY switch or other action requires a control-plane request/response, the main loop sends the command on `cmd_tx` and enters a nested read loop on `resp_rx` — same pattern as today's standalone helpers (`subscribe()`, `request_refresh()`, etc.), but without borrowing `resp_rx` out of the function. During these phases, the active handler is not called; stream events for the old PTY are discarded.
 
-This is similar to how the current standalone helpers (`subscribe()`, `request_refresh()`, etc.) work, but they no longer borrow `resp_rx` — the main loop handles it inline.
+After subscribe + refresh complete, the main loop constructs the appropriate handler, calls `handler.init(refresh_data, buffered, out)` to produce the initial screen content, writes `out` to stdout, and enters the select loop.
 
 ### Render Mode Switches
 
@@ -124,6 +126,8 @@ Each termd server gets its own `resp_rx` stream. The main loop (or a coordinator
 - `subscribe()`, `request_refresh()`, `fetch_list()` become inline phases of the main loop
 - SIGWINCH debounce timer added to select loop
 - pty_id filtering consolidated into the main loop's dispatch
+- Generation filtering (`gen > current_refresh_gen`) consolidated into the main loop
+- `pty_closed` tracking consolidated into the main loop
 
 ### `cell.rs`:
 - `async fn run(ctx)` replaced by `CellHandler` struct implementing `RenderModeHandler`
