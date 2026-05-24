@@ -278,6 +278,29 @@ async fn ensure_list(
     true
 }
 
+async fn destroy_and_drain(
+    cmd_tx:  &mpsc::Sender<TerminalCommand>,
+    resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
+    pty_id:  &str,
+) -> anyhow::Result<()> {
+    cmd_tx.send(TerminalCommand {
+        command: Some(Command::Destroy(DestroyRequest { pty_id: pty_id.to_owned() })),
+    }).await?;
+    loop {
+        match resp_rx.message().await? {
+            None => anyhow::bail!("server disconnected"),
+            Some(r) => if let Some(Response::Command(c)) = r.response {
+                if c.pty_id != pty_id { continue; }
+                if !c.success {
+                    anyhow::bail!("Failed to destroy PTY: {}", c.error.unwrap_or_default());
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn recent_pty<'a>(list: &'a [PtyItem], previous_pty_id: &Option<String>) -> Option<&'a PtyItem> {
     let prev_id = previous_pty_id.as_deref()?;
     if let Some(item) = list.iter().find(|p| p.pty_id == prev_id) {
@@ -474,6 +497,7 @@ pub async fn run(
             None => {
                 subscribed_pty_id = None;
                 pty_list.clear();
+                let _ = destroy_and_drain(&cmd_tx, &mut resp_rx, &current_pty_id).await;
                 match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id).await? {
                     Some(new_id) => {
                         if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
@@ -636,6 +660,7 @@ pub async fn run(
                 reset_terminal_modes();
                 subscribed_pty_id = None;
                 pty_list.clear();
+                let _ = destroy_and_drain(&cmd_tx, &mut resp_rx, &current_pty_id).await;
                 match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id).await? {
                     Some(new_id) => {
                         if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
@@ -653,23 +678,9 @@ pub async fn run(
                     InputAction::Detach => break 'session,
 
                     InputAction::Destroy => {
-                        cmd_tx.send(TerminalCommand {
-                            command: Some(Command::Destroy(DestroyRequest {
-                                pty_id: current_pty_id.clone(),
-                            })),
-                        }).await?;
-                        loop {
-                            match resp_rx.message().await? {
-                                None => { eprintln!("[server disconnected]"); break 'session; }
-                                Some(r) => if let Some(Response::Command(c)) = r.response {
-                                    if c.pty_id != current_pty_id { continue; }
-                                    if !c.success {
-                                        show_error(&format!("[Failed to destroy PTY: {}]", c.error.unwrap_or_default())).await;
-                                        continue 'session;
-                                    }
-                                    break;
-                                }
-                            }
+                        if let Err(e) = destroy_and_drain(&cmd_tx, &mut resp_rx, &current_pty_id).await {
+                            show_error(&e.to_string()).await;
+                            continue 'session;
                         }
                         pty_list.clear();
                         if ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
