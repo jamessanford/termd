@@ -269,6 +269,16 @@ async fn ensure_list(
     true
 }
 
+fn recent_pty<'a>(list: &'a [PtyItem], previous_pty_id: &Option<String>) -> Option<&'a PtyItem> {
+    let prev_id = previous_pty_id.as_deref()?;
+    if let Some(item) = list.iter().find(|p| p.pty_id == prev_id) {
+        Some(item)
+    } else {
+        list.first()
+    }
+}
+
+
 fn next_pty<'a>(list: &'a [PtyItem], current_id: &str) -> Option<&'a PtyItem> {
     if list.is_empty() { return None; }
     let pos = list.iter().position(|p| p.pty_id == current_id).unwrap_or(0);
@@ -281,7 +291,7 @@ fn prev_pty<'a>(list: &'a [PtyItem], current_id: &str) -> Option<&'a PtyItem> {
     Some(&list[(pos + list.len() - 1) % list.len()])
 }
 
-// Unsubscribes from the current PTY, updates session state, and subscribes to new_item.
+// Unsubscribes from the current PTY, updates session state.
 async fn switch_pty(
     cmd_tx:          &mpsc::Sender<TerminalCommand>,
     current_pty_id:  &mut String,
@@ -296,15 +306,6 @@ async fn switch_pty(
     }).await;
     *previous_pty_id = Some(std::mem::replace(current_pty_id, new_item.pty_id.clone()));
     *current_item = new_item;
-}
-
-fn recent_pty<'a>(list: &'a [PtyItem], previous_pty_id: &Option<String>) -> Option<&'a PtyItem> {
-    let prev_id = previous_pty_id.as_deref()?;
-    if let Some(item) = list.iter().find(|p| p.pty_id == prev_id) {
-        Some(item)
-    } else {
-        list.first()
-    }
 }
 
 fn clear_screen() {
@@ -445,7 +446,6 @@ pub async fn run(
     let mut out = Vec::new();
 
     'session: loop {
-        // === Phase: Subscribe ===
         let subscribe_ok = if subscribed_pty_id.as_deref() != Some(current_pty_id.as_str()) {
             let ok = subscribe(&cmd_tx, &mut resp_rx, &current_pty_id).await?;
             if ok { subscribed_pty_id = Some(current_pty_id.clone()); }
@@ -454,7 +454,6 @@ pub async fn run(
             true
         };
 
-        // === Phase: Request Refresh ===
         let refresh_result = if subscribe_ok {
             request_refresh(&cmd_tx, &mut resp_rx, &current_pty_id).await?
         } else {
@@ -475,7 +474,6 @@ pub async fn run(
             .filter(|(gen, _)| *gen > current_refresh_gen)
             .collect();
 
-        // === Phase: Create Handler & Init ===
         let mut handler: Box<dyn RenderModeHandler> = create_handler(
             dispatch_mode, current_item.cols, current_item.rows, allow_upgrade,
         )?;
@@ -496,7 +494,6 @@ pub async fn run(
             stdout.flush()?;
         }
 
-        // === Phase: Spawn Input Task ===
         let (action_tx, mut action_rx) = mpsc::channel::<InputAction>(4);
         let input_task = tokio::spawn(input::run_stdin(
             cmd_tx.clone(),
@@ -504,7 +501,6 @@ pub async fn run(
             current_pty_id.clone(),
         ));
 
-        // === Phase: Event Loop ===
         let mut sigwinch = signal(SignalKind::window_change())?;
         let mut pty_closed = false;
         let mut refresh_debounce = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(86400)));
