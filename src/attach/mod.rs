@@ -389,7 +389,17 @@ async fn show_list(
     let mut selected = pty_list
         .iter()
         .position(|p| p.pty_id == current_pty_id)
-        .unwrap_or(0);
+        .unwrap_or_else(|| {
+            pty_list
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, p)| {
+                    let ts = p.last_subscribed_at.as_ref().or(p.created_at.as_ref());
+                    ts.map(|t| (t.seconds, t.nanos)).unwrap_or((0, 0))
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        });
 
     draw_list(pty_list, selected);
 
