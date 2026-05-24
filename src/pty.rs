@@ -458,12 +458,17 @@ fn do_refresh(
         screen: ffi::FormatterScreenExtra {
             size: std::mem::size_of::<ffi::FormatterScreenExtra>(),
             cursor: true,        // emit final cursor position at end of output
-            style: false,
+            style: true,         // restore SGR attributes at cursor so subsequent output is styled correctly
             hyperlink: false,
             protection: false,
             kitty_keyboard: false,
-            charsets: false,
+            charsets: true,      // restore G0-G3 charset designations (e.g. DEC line-drawing)
             saved_cursor: true,  // re-establish DECSC save slot for cursor restore
+            // TODO: pending_wrap is not restored — CUP clears it, so if the server
+            // cursor was at the last column with pending_wrap=true the client will
+            // overwrite instead of wrapping on the next print.  Fixing this likely
+            // requires a formatter-level mechanism (e.g. print+backspace at the last
+            // column) and careful testing.
         },
     };
 
