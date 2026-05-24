@@ -1,7 +1,6 @@
 use std::io::Write as IoWrite;
 
 use anyhow::Result;
-use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 use termd::proto::{
@@ -19,11 +18,12 @@ pub(super) async fn show_scrollback(
     resp_rx: &mut tonic::Streaming<TerminalResponse>,
     pty_id:  &str,
     rows:    u32,
+    stdin:   &mut tokio::io::Stdin,
 ) -> Result<()> {
     let _ = std::io::stdout().write_all(b"\x1b[?1049h");
     let _ = std::io::stdout().flush();
 
-    let result = run_scrollback(cmd_tx, resp_rx, pty_id, rows).await;
+    let result = run_scrollback(cmd_tx, resp_rx, pty_id, rows, stdin).await;
 
     let _ = std::io::stdout().write_all(b"\x1b[?1049l");
     let _ = std::io::stdout().flush();
@@ -39,9 +39,10 @@ async fn run_scrollback(
     resp_rx: &mut tonic::Streaming<TerminalResponse>,
     pty_id:  &str,
     rows:    u32,
+    stdin:   &mut tokio::io::Stdin,
 ) -> Result<()> {
+    use tokio::io::AsyncReadExt;
     let mut row_offset: u32 = 0;
-    let mut stdin = tokio::io::stdin();
     let mut buf = [0u8; 8];
 
     let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;

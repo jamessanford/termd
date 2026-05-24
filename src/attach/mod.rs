@@ -1,6 +1,7 @@
 use std::io::Write;
 
 use anyhow::Result;
+use tokio::io::AsyncReadExt;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -78,7 +79,7 @@ enum RunOutcome {
 use termd::proto::{
     terminal_command::Command, terminal_response::Response,
     CreateRequest, DestroyRequest, ListRequest, PtyItem, RefreshRequest, ResizeRequest,
-    SubscribeRequest, UnsubscribeRequest,
+    SubscribeRequest, UnsubscribeRequest, WriteRequest,
     TerminalCommand, StreamMetadataReason,
     terminal_service_client::TerminalServiceClient,
 };
@@ -373,10 +374,9 @@ async fn show_list(
     resp_rx:         &mut tonic::Streaming<termd::proto::TerminalResponse>,
     pty_list:        &mut Vec<PtyItem>,
     current_pty_id:  &str,
+    stdin:           &mut tokio::io::Stdin,
 ) -> anyhow::Result<Option<String>> {
     // Returns Some(new_pty_id) on selection, None on cancel.
-    use tokio::io::AsyncReadExt;
-
     if let Err(e) = fetch_list(cmd_tx, resp_rx, pty_list).await {
         show_error(&e.to_string()).await;
         return Ok(None);
@@ -393,7 +393,6 @@ async fn show_list(
 
     draw_list(pty_list, selected);
 
-    let mut stdin = tokio::io::stdin();
     let mut buf = [0u8; 8];
 
     loop {
@@ -475,6 +474,8 @@ pub async fn run(
     let allow_upgrade = mode == RenderMode::Region;
     let mut dispatch_mode = mode;
     let mut stdout = std::io::stdout();
+    let mut stdin = tokio::io::stdin();
+    let mut input_state = input::EscapeState::AfterNewline;
     let mut out = Vec::new();
 
     'session: loop {
@@ -498,7 +499,7 @@ pub async fn run(
                 subscribed_pty_id = None;
                 pty_list.clear();
                 let _ = destroy_and_drain(&cmd_tx, &mut resp_rx, &current_pty_id).await;
-                match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id).await? {
+                match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id, &mut stdin).await? {
                     Some(new_id) => {
                         if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
                             switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
@@ -536,16 +537,10 @@ pub async fn run(
             stdout.flush()?;
         }
 
-        let (action_tx, mut action_rx) = mpsc::channel::<InputAction>(4);
-        let input_task = tokio::spawn(input::run_stdin(
-            cmd_tx.clone(),
-            action_tx,
-            current_pty_id.clone(),
-        ));
-
         let mut sigwinch = signal(SignalKind::window_change())?;
         let mut refresh_debounce = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(86400)));
         let mut debounce_active = false;
+        let mut input_buf = [0u8; 256];
 
         let outcome: RunOutcome = loop {
             out.clear();
@@ -598,8 +593,30 @@ pub async fn run(
                         _ => { break RunOutcome::ServerClosed; }
                     }
                 }
-                action = action_rx.recv() => {
-                    break RunOutcome::Action(action.unwrap_or(InputAction::Detach));
+                result = stdin.read(&mut input_buf) => {
+                    let n = match result {
+                        Ok(0) | Err(_) => break RunOutcome::Action(InputAction::Detach),
+                        Ok(n) => n,
+                    };
+                    let mut to_send: Vec<u8> = Vec::new();
+                    let mut action = None;
+                    for &byte in &input_buf[..n] {
+                        if let Some(a) = input::process_byte(&mut input_state, byte, &mut to_send) {
+                            action = Some(a);
+                            break;
+                        }
+                    }
+                    if !to_send.is_empty() {
+                        let _ = cmd_tx.send(TerminalCommand {
+                            command: Some(Command::Write(WriteRequest {
+                                pty_id: current_pty_id.clone(),
+                                data: to_send,
+                            })),
+                        }).await;
+                    }
+                    if let Some(a) = action {
+                        break RunOutcome::Action(a);
+                    }
                 }
                 _ = sigwinch.recv() => {
                     let (cols, rows) = get_terminal_size();
@@ -646,9 +663,6 @@ pub async fn run(
             }
         };
 
-        input_task.abort();
-        let _ = input_task.await;
-
         match outcome {
             RunOutcome::ServerClosed => {
                 reset_terminal_modes();
@@ -661,7 +675,7 @@ pub async fn run(
                 subscribed_pty_id = None;
                 pty_list.clear();
                 let _ = destroy_and_drain(&cmd_tx, &mut resp_rx, &current_pty_id).await;
-                match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id).await? {
+                match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id, &mut stdin).await? {
                     Some(new_id) => {
                         if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
                             switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
@@ -781,7 +795,7 @@ pub async fn run(
                     }
 
                     InputAction::ShowList => {
-                        match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id).await? {
+                        match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id, &mut stdin).await? {
                             Some(new_id) if new_id != current_pty_id => {
                                 if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
                                     switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
@@ -804,6 +818,7 @@ pub async fn run(
                             &mut resp_rx,
                             &current_pty_id,
                             current_item.rows,
+                            &mut stdin,
                         ).await?;
                     }
                 }

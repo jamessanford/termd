@@ -1,6 +1,3 @@
-use tokio::sync::mpsc;
-use termd::proto::{terminal_command::Command, TerminalCommand, WriteRequest};
-
 #[derive(Clone, Copy)]
 pub(super) enum EscapeState {
     Normal,
@@ -64,49 +61,6 @@ pub(super) fn process_byte(
                 None
             }
         },
-    }
-}
-
-pub(super) async fn run_stdin(
-    cmd_tx:    mpsc::Sender<TerminalCommand>,
-    action_tx: mpsc::Sender<super::InputAction>,
-    pty_id:    String,
-) {
-    use tokio::io::AsyncReadExt;
-    let mut stdin = tokio::io::stdin();
-    let mut state = EscapeState::AfterNewline;
-    let mut buf = [0u8; 256];
-
-    loop {
-        let n = match stdin.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        let mut to_send: Vec<u8> = Vec::new();
-        for &byte in &buf[..n] {
-            if let Some(action) = process_byte(&mut state, byte, &mut to_send) {
-                if !to_send.is_empty() {
-                    let _ = cmd_tx.send(TerminalCommand {
-                        command: Some(Command::Write(WriteRequest {
-                            pty_id: pty_id.clone(),
-                            data: to_send,
-                        })),
-                    }).await;
-                }
-                let _ = action_tx.send(action).await;
-                return;
-            }
-        }
-        if !to_send.is_empty() {
-            if cmd_tx.send(TerminalCommand {
-                command: Some(Command::Write(WriteRequest {
-                    pty_id: pty_id.clone(),
-                    data: to_send,
-                })),
-            }).await.is_err() {
-                break;
-            }
-        }
     }
 }
 
