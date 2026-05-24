@@ -22,6 +22,10 @@ pub fn pty_info_to_item(info: PtyInfo) -> PtyItem {
             seconds: created.as_secs() as i64,
             nanos:   created.subsec_nanos() as i32,
         }),
+        last_subscribed_at: info.last_subscribed_at.map(|t| {
+            let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            Timestamp { seconds: d.as_secs() as i64, nanos: d.subsec_nanos() as i32 }
+        }),
         subscribers: info.subscribers.unwrap_or_default().into_iter().map(|(id, s)| {
             let sub_created = s.created_at
                 .duration_since(std::time::UNIX_EPOCH)
@@ -166,6 +170,7 @@ pub fn handle_subscribe(
             }
             // Upsert and broadcast unconditionally (covers both new and already-subscribed)
             handle.upsert_subscriber(subscriber_id, info);
+            handle.touch_last_subscribed();
             handle.broadcast_metadata(Arc::new(PtyMetadata {
                 reason:     MetadataReason::SubscribersChanged,
                 exit_code:  None,

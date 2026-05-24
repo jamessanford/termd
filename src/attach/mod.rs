@@ -71,6 +71,7 @@ fn create_handler(
 
 enum RunOutcome {
     ServerClosed,
+    PtyClosed,
     Action(InputAction),
 }
 
@@ -133,7 +134,7 @@ pub(super) async fn show_error(msg: &str) {
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 }
 
-pub(super) fn get_terminal_size() -> (u32, u32) {
+pub fn get_terminal_size() -> (u32, u32) {
     let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
     unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws); }
     (ws.ws_col as u32, ws.ws_row as u32)
@@ -471,9 +472,18 @@ pub async fn run(
         let (refresh_gen, refresh_bytes, buffered) = match refresh_result {
             Some(triple) => triple,
             None => {
-                clear_screen();
-                eprint!("\r\n[PTY closed]\r\n");
-                (0, vec![], vec![])
+                subscribed_pty_id = None;
+                pty_list.clear();
+                match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id).await? {
+                    Some(new_id) => {
+                        if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
+                            switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
+                            pty_list.clear();
+                        }
+                        continue 'session;
+                    }
+                    None => break 'session,
+                }
             }
         };
         let mut current_refresh_gen = refresh_gen;
@@ -510,7 +520,6 @@ pub async fn run(
         ));
 
         let mut sigwinch = signal(SignalKind::window_change())?;
-        let mut pty_closed = false;
         let mut refresh_debounce = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(86400)));
         let mut debounce_active = false;
 
@@ -556,12 +565,8 @@ pub async fn run(
                                         }
                                     }
                                 } else if m.reason == StreamMetadataReason::Closed as i32 {
-                                    if !pty_closed {
-                                        pty_closed = true;
-                                        handler.on_pty_event(PtyEvent::Closed, &mut out)?;
-                                        move_terminal_end();
-                                        eprint!("\r\n[PTY closed]\r\n");
-                                    }
+                                    handler.on_pty_event(PtyEvent::Closed, &mut out)?;
+                                    break RunOutcome::PtyClosed;
                                 }
                             }
                             _ => {}
@@ -626,6 +631,21 @@ pub async fn run(
                 move_terminal_end();
                 eprintln!("[Connection closed]");
                 break 'session;
+            }
+            RunOutcome::PtyClosed => {
+                reset_terminal_modes();
+                subscribed_pty_id = None;
+                pty_list.clear();
+                match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id).await? {
+                    Some(new_id) => {
+                        if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
+                            switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
+                            pty_list.clear();
+                        }
+                    }
+                    None => break 'session,
+                }
+                continue 'session;
             }
             RunOutcome::Action(action) => {
                 reset_terminal_modes();

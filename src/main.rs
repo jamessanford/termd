@@ -84,7 +84,7 @@ enum Cmd {
     /// Attach to a running PTY, streaming output to stdout and forwarding stdin
     Attach {
         /// PTY ID to attach to (from `termd list`)
-        pty_id: String,
+        pty_id: Option<String>,
         #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
         socket: Option<PathBuf>,
         /// Print message metadata to stderr instead of writing data to stdout
@@ -234,7 +234,10 @@ async fn main() -> Result<()> {
 
         Cmd::Attach { pty_id, socket, debug, render_mode } => {
             let mut client = connect_client(socket).await?;
-            let item = resolve_pty_item(&mut client, &pty_id).await?;
+            let item = match pty_id {
+                Some(prefix) => resolve_pty_item(&mut client, &prefix).await?,
+                None => auto_select_or_create(&mut client).await?,
+            };
             attach::run(&mut client, item, debug, render_mode).await?;
         }
     }
@@ -279,6 +282,33 @@ async fn resolve_pty_item(client: &mut AuthedClient, prefix: &str) -> Result<Pty
             prefix,
             matches.iter().map(|i| &i.pty_id[..8]).collect::<Vec<_>>().join(", ")
         )),
+    }
+}
+
+fn pick_best_pty(items: &[PtyItem]) -> Option<&PtyItem> {
+    items.iter().max_by_key(|p| {
+        let ts = p.last_subscribed_at.as_ref().or(p.created_at.as_ref());
+        ts.map(|t| (t.seconds, t.nanos)).unwrap_or((0, 0))
+    })
+}
+
+async fn auto_select_or_create(client: &mut AuthedClient) -> Result<PtyItem> {
+    let resp = send_recv(client, Command::List(ListRequest {})).await?;
+    let items = match resp.response {
+        Some(Response::List(l)) => l.items,
+        other => return Err(anyhow::anyhow!("unexpected list response: {other:?}")),
+    };
+    if let Some(best) = pick_best_pty(&items) {
+        return Ok(best.clone());
+    }
+    let (cols, rows) = attach::get_terminal_size();
+    let resp = send_recv(
+        client,
+        Command::Create(CreateRequest { cols, rows, command: None }),
+    ).await?;
+    match resp.response {
+        Some(Response::Create(c)) => c.item.ok_or_else(|| anyhow::anyhow!("server returned empty CreateResponse")),
+        other => Err(anyhow::anyhow!("unexpected create response: {other:?}")),
     }
 }
 

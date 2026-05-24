@@ -34,14 +34,15 @@ pub struct SubscriberInfo {
 
 #[derive(Clone, Debug)]
 pub struct PtyInfo {
-    pub id:          String,
-    pub hostname:    String,
-    pub pts_name:    String,
-    pub cols:        u32,
-    pub rows:        u32,
-    pub title:       String,
-    pub created_at:  SystemTime,
-    pub subscribers: Option<Vec<(String, SubscriberInfo)>>,
+    pub id:                String,
+    pub hostname:          String,
+    pub pts_name:          String,
+    pub cols:              u32,
+    pub rows:              u32,
+    pub title:             String,
+    pub created_at:        SystemTime,
+    pub last_subscribed_at: Option<SystemTime>,
+    pub subscribers:       Option<Vec<(String, SubscriberInfo)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +105,7 @@ pub struct PtyHandle {
     meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
     generation: Arc<AtomicU64>,
     subscribers: Arc<RwLock<HashMap<String, SubscriberInfo>>>,
+    last_subscribed_at: Mutex<Option<SystemTime>>,
     child_pid: Pid,
     wakeup_write: OwnedFd,
 }
@@ -118,14 +120,15 @@ impl PtyHandle {
             v
         };  // read-lock released here
         PtyInfo {
-            id:          self.id.clone(),
-            hostname:    self.hostname.clone(),
-            pts_name:    self.pts_name.clone(),
-            cols:        self.cols.load(Ordering::Relaxed),
-            rows:        self.rows.load(Ordering::Relaxed),
-            title:       self.title.lock().unwrap().clone(),
-            created_at:  self.created_at,
-            subscribers: Some(subscribers),
+            id:                self.id.clone(),
+            hostname:          self.hostname.clone(),
+            pts_name:          self.pts_name.clone(),
+            cols:              self.cols.load(Ordering::Relaxed),
+            rows:              self.rows.load(Ordering::Relaxed),
+            title:             self.title.lock().unwrap().clone(),
+            created_at:        self.created_at,
+            last_subscribed_at: *self.last_subscribed_at.lock().unwrap(),
+            subscribers:       Some(subscribers),
         }
     }
 
@@ -213,6 +216,10 @@ impl PtyHandle {
 
     pub fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    pub fn touch_last_subscribed(&self) {
+        *self.last_subscribed_at.lock().unwrap() = Some(SystemTime::now());
     }
 
     pub fn upsert_subscriber(&self, subscriber_id: &str, info: SubscriberInfo) {
@@ -364,6 +371,7 @@ impl PtyRegistry {
             meta_tx: meta_tx.clone(),
             generation: generation.clone(),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
+            last_subscribed_at: Mutex::new(None),
             child_pid,
             wakeup_write,
         });
@@ -770,6 +778,7 @@ fn reader_thread(
                     rows: current_rows,
                     title: current_title,
                     created_at,
+                    last_subscribed_at: None,
                     subscribers: None, // subscriber map lives on PtyHandle, unavailable here
                 },
             }));
@@ -819,6 +828,7 @@ fn reader_thread(
             rows: current_rows,
             title: title.lock().unwrap().clone(),
             created_at,
+            last_subscribed_at: None,
             subscribers: None, // subscriber map lives on PtyHandle, unavailable here
         },
     }));
