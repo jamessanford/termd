@@ -457,12 +457,13 @@ fn do_refresh(
         keyboard: false,
         screen: ffi::FormatterScreenExtra {
             size: std::mem::size_of::<ffi::FormatterScreenExtra>(),
-            cursor: true, // emit final cursor position at end of output
+            cursor: true,        // emit final cursor position at end of output
             style: false,
             hyperlink: false,
             protection: false,
             kitty_keyboard: false,
             charsets: false,
+            saved_cursor: true,  // re-establish DECSC save slot for cursor restore
         },
     };
 
@@ -540,6 +541,7 @@ fn do_scrollback(
             protection: false,
             kitty_keyboard: false,
             charsets: false,
+            saved_cursor: false,
         },
     };
 
