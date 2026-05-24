@@ -517,7 +517,7 @@ pub async fn run(
                         }
                         continue 'session;
                     }
-                    None => break 'session,
+                    None => (0, vec![], vec![]),  // Wait for user to tell us what to do next.
                 }
             }
         };
@@ -686,7 +686,7 @@ pub async fn run(
                             pty_list.clear();
                         }
                     }
-                    None => break 'session,
+                    None => {}
                 }
                 continue 'session;
             }
