@@ -1,12 +1,42 @@
 #[derive(Clone, Copy)]
-pub(super) enum EscapeState {
+enum EscapeState {
     Normal,
     AfterNewline,
     AfterTilde,
     AfterCtrlA,
 }
 
-pub(super) fn process_byte(
+pub(super) struct InputResult {
+    pub write: Vec<u8>,
+    pub action: Option<super::InputAction>,
+}
+
+pub(super) struct InputProcessor {
+    state: EscapeState,
+}
+
+impl InputProcessor {
+    pub fn new() -> Self {
+        Self { state: EscapeState::AfterNewline }
+    }
+
+    pub fn reset(&mut self) {
+        self.state = EscapeState::AfterNewline;
+    }
+
+    pub fn process(&mut self, buf: &[u8]) -> InputResult {
+        let mut write = Vec::new();
+        for &byte in buf {
+            if let Some(action) = process_byte(&mut self.state, byte, &mut write) {
+                self.state = EscapeState::AfterNewline;
+                return InputResult { write, action: Some(action) };
+            }
+        }
+        InputResult { write, action: None }
+    }
+}
+
+fn process_byte(
     state:   &mut EscapeState,
     byte:    u8,
     to_send: &mut Vec<u8>,
@@ -69,66 +99,56 @@ mod tests {
     use super::*;
     use super::super::InputAction;
 
-    fn run_from(initial: EscapeState, bytes: &[u8]) -> (EscapeState, Vec<u8>, Option<InputAction>) {
-        let mut state = initial;
-        let mut to_send = Vec::new();
-        let mut action = None;
-        for &byte in bytes {
-            if let Some(a) = process_byte(&mut state, byte, &mut to_send) {
-                action = Some(a);
-                break;
-            }
-        }
-        (state, to_send, action)
+    fn process(bytes: &[u8]) -> InputResult {
+        InputProcessor::new().process(bytes)
     }
 
     #[test]
     fn ctrl_a_c_creates() {
-        let (_, bytes, action) = run_from(EscapeState::Normal, &[0x01, b'c']);
-        assert!(matches!(action, Some(InputAction::Create)));
-        assert!(bytes.is_empty());
+        let r = process(&[0x01, b'c']);
+        assert!(matches!(r.action, Some(InputAction::Create)));
+        assert!(r.write.is_empty());
     }
 
     #[test]
     fn ctrl_a_ctrl_a_switches_recent() {
-        let (_, bytes, action) = run_from(EscapeState::Normal, &[0x01, 0x01]);
-        assert!(matches!(action, Some(InputAction::SwitchRecent)));
-        assert!(bytes.is_empty());
+        let r = process(&[0x01, 0x01]);
+        assert!(matches!(r.action, Some(InputAction::SwitchRecent)));
+        assert!(r.write.is_empty());
     }
 
     #[test]
     fn ctrl_a_a_sends_literal() {
-        let (state, bytes, action) = run_from(EscapeState::Normal, &[0x01, b'a']);
-        assert!(action.is_none());
-        assert_eq!(bytes, &[0x01]);
-        assert!(matches!(state, EscapeState::Normal));
+        let r = process(&[0x01, b'a']);
+        assert!(r.action.is_none());
+        assert_eq!(r.write, &[0x01]);
     }
 
     #[test]
     fn ctrl_a_d_detaches() {
-        let (_, _, action) = run_from(EscapeState::Normal, &[0x01, b'd']);
-        assert!(matches!(action, Some(InputAction::Detach)));
+        let r = process(&[0x01, b'd']);
+        assert!(matches!(r.action, Some(InputAction::Detach)));
     }
 
     #[test]
     fn ctrl_a_space_switches_next() {
-        let (_, _, action) = run_from(EscapeState::Normal, &[0x01, b' ']);
-        assert!(matches!(action, Some(InputAction::SwitchNext)));
+        let r = process(&[0x01, b' ']);
+        assert!(matches!(r.action, Some(InputAction::SwitchNext)));
     }
 
     #[test]
     fn ctrl_a_p_switches_previous() {
-        let (_, bytes, action) = run_from(EscapeState::Normal, &[0x01, b'p']);
-        assert!(matches!(action, Some(InputAction::SwitchPrevious)));
-        assert!(bytes.is_empty());
+        let r = process(&[0x01, b'p']);
+        assert!(matches!(r.action, Some(InputAction::SwitchPrevious)));
+        assert!(r.write.is_empty());
     }
 
     #[test]
     fn ctrl_a_digit_switches_index() {
         for n in 0u8..=9 {
-            let (_, _, action) = run_from(EscapeState::Normal, &[0x01, b'0' + n]);
+            let r = process(&[0x01, b'0' + n]);
             assert!(
-                matches!(action, Some(InputAction::SwitchIndex(i)) if i == n),
+                matches!(r.action, Some(InputAction::SwitchIndex(i)) if i == n),
                 "^A {} should produce SwitchIndex({})", n, n,
             );
         }
@@ -136,64 +156,73 @@ mod tests {
 
     #[test]
     fn ctrl_a_quote_shows_list() {
-        let (_, _, action) = run_from(EscapeState::Normal, &[0x01, b'"']);
-        assert!(matches!(action, Some(InputAction::ShowList)));
+        let r = process(&[0x01, b'"']);
+        assert!(matches!(r.action, Some(InputAction::ShowList)));
     }
 
     #[test]
     fn ctrl_a_shift_f_force_resize() {
-        let (_, bytes, action) = run_from(EscapeState::Normal, &[0x01, b'F']);
-        assert!(matches!(action, Some(InputAction::ForceResize)));
-        assert!(bytes.is_empty());
+        let r = process(&[0x01, b'F']);
+        assert!(matches!(r.action, Some(InputAction::ForceResize)));
+        assert!(r.write.is_empty());
     }
 
     #[test]
     fn ctrl_a_k_destroys() {
-        let (_, bytes, action) = run_from(EscapeState::Normal, &[0x01, b'k']);
-        assert!(matches!(action, Some(InputAction::Destroy)));
-        assert!(bytes.is_empty());
+        let r = process(&[0x01, b'k']);
+        assert!(matches!(r.action, Some(InputAction::Destroy)));
+        assert!(r.write.is_empty());
     }
 
     #[test]
     fn ctrl_a_s_shows_scrollback() {
-        let (_, bytes, action) = run_from(EscapeState::Normal, &[0x01, b's']);
-        assert!(matches!(action, Some(InputAction::ShowScrollback)));
-        assert!(bytes.is_empty());
+        let r = process(&[0x01, b's']);
+        assert!(matches!(r.action, Some(InputAction::ShowScrollback)));
+        assert!(r.write.is_empty());
     }
 
     #[test]
     fn ctrl_a_unknown_passes_through() {
-        let (state, bytes, action) = run_from(EscapeState::Normal, &[0x01, b'x']);
-        assert!(action.is_none());
-        assert_eq!(bytes, &[0x01, b'x']);
-        assert!(matches!(state, EscapeState::Normal));
+        let r = process(&[0x01, b'x']);
+        assert!(r.action.is_none());
+        assert_eq!(r.write, &[0x01, b'x']);
     }
 
     #[test]
     fn tilde_dot_detaches() {
-        let (_, bytes, action) = run_from(EscapeState::AfterNewline, &[b'~', b'.']);
-        assert!(matches!(action, Some(InputAction::Detach)));
-        assert!(bytes.is_empty());
+        let r = process(&[b'\r', b'~', b'.']);
+        assert!(matches!(r.action, Some(InputAction::Detach)));
+        assert_eq!(r.write, &[b'\r']);
     }
 
     #[test]
     fn tilde_other_passes_through() {
-        let (_, bytes, action) = run_from(EscapeState::AfterNewline, &[b'~', b'x']);
-        assert!(action.is_none());
-        assert_eq!(bytes, &[b'~', b'x']);
+        let r = process(&[b'\r', b'~', b'x']);
+        assert!(r.action.is_none());
+        assert_eq!(r.write, &[b'\r', b'~', b'x']);
     }
 
     #[test]
     fn ctrl_a_mid_stream_preserves_prior_bytes() {
-        // Bytes before ^A stay in to_send; only the action fires.
-        let (_, bytes, action) = run_from(EscapeState::Normal, &[b'h', b'i', 0x01, b'c']);
-        assert!(matches!(action, Some(InputAction::Create)));
-        assert_eq!(bytes, &[b'h', b'i']);
+        let r = process(&[b'h', b'i', 0x01, b'c']);
+        assert!(matches!(r.action, Some(InputAction::Create)));
+        assert_eq!(r.write, &[b'h', b'i']);
     }
 
     #[test]
     fn ctrl_a_works_from_after_newline_state() {
-        let (_, _, action) = run_from(EscapeState::AfterNewline, &[0x01, b'c']);
-        assert!(matches!(action, Some(InputAction::Create)));
+        let r = process(&[0x01, b'c']);
+        assert!(matches!(r.action, Some(InputAction::Create)));
+    }
+
+    #[test]
+    fn state_resets_after_action() {
+        let mut proc = InputProcessor::new();
+        let r = proc.process(&[0x01, b'"']);
+        assert!(matches!(r.action, Some(InputAction::ShowList)));
+        // Next input should not be in AfterCtrlA state
+        let r = proc.process(&[b'x']);
+        assert!(r.action.is_none());
+        assert_eq!(r.write, &[b'x']);
     }
 }

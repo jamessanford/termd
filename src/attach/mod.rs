@@ -475,7 +475,7 @@ pub async fn run(
     let mut dispatch_mode = mode;
     let mut stdout = std::io::stdout();
     let mut stdin = tokio::io::stdin();
-    let mut input_state = input::EscapeState::AfterNewline;
+    let mut input = input::InputProcessor::new();
     let mut out = Vec::new();
 
     'session: loop {
@@ -585,6 +585,7 @@ pub async fn run(
                                     }
                                 } else if m.reason == StreamMetadataReason::Closed as i32 {
                                     handler.on_pty_event(PtyEvent::Closed, &mut out)?;
+                                    input.reset();
                                     break RunOutcome::PtyClosed;
                                 }
                             }
@@ -598,23 +599,16 @@ pub async fn run(
                         Ok(0) | Err(_) => break RunOutcome::Action(InputAction::Detach),
                         Ok(n) => n,
                     };
-                    let mut to_send: Vec<u8> = Vec::new();
-                    let mut action = None;
-                    for &byte in &input_buf[..n] {
-                        if let Some(a) = input::process_byte(&mut input_state, byte, &mut to_send) {
-                            action = Some(a);
-                            break;
-                        }
-                    }
-                    if !to_send.is_empty() {
+                    let r = input.process(&input_buf[..n]);
+                    if !r.write.is_empty() {
                         let _ = cmd_tx.send(TerminalCommand {
                             command: Some(Command::Write(WriteRequest {
                                 pty_id: current_pty_id.clone(),
-                                data: to_send,
+                                data: r.write,
                             })),
                         }).await;
                     }
-                    if let Some(a) = action {
+                    if let Some(a) = r.action {
                         break RunOutcome::Action(a);
                     }
                 }
