@@ -158,7 +158,11 @@ fn reset_terminal_modes() {
         "\x1b[?1006l",  // disable SGR mouse extension
         "\x1b[?1016l",  // disable SGR-pixels mouse extension
         "\x1b[?1015l",  // disable urxvt mouse extension
+        "\x1b[?1004l",  // disable focus event reporting
         "\x1b[?2004l",  // disable bracketed paste
+        "\x1b[?6l",     // disable origin mode (DECOM)
+        "\x1b[?5l",     // disable reverse video (DECSCNM)
+        "\x1b[4l",      // disable insert mode (IRM)
         "\x1b[r",       // reset DECSTBM scroll region to full screen
         "\x1b[?69l",    // disable DECLRMM (horizontal margins)
         "\x1b[?7h",     // re-enable auto-wrap (DECAWM)
@@ -169,6 +173,10 @@ fn reset_terminal_modes() {
         "\x1b[?1l",     // DECCKM - normal cursor keys
         "\x1b>",        // DECNKM - normal keypad mode
         "\x1b(B",       // reset G0 character set to ASCII
+        "\x1b)B",       // reset G1 character set to ASCII
+        "\x1b*B",       // reset G2 character set to ASCII
+        "\x1b+B",       // reset G3 character set to ASCII
+        "\x0f",         // SI - shift in, invoke G0 into GL
     ).as_bytes());
     let _ = std::io::stdout().flush();
 }
