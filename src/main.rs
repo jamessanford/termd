@@ -32,9 +32,9 @@ enum Destination {
 
 #[derive(Args)]
 struct ConnectionArgs {
-    #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock]")]
-    socket: Option<PathBuf>,
-    #[arg(long, help = "Endpoint URI to connect to (e.g. http://127.0.0.1:7777 or https://host:7777)")]
+    #[arg(long, default_value_os_t = default_socket(), conflicts_with = "endpoint")]
+    socket: PathBuf,
+    #[arg(long, help = "Endpoint URI to connect to (e.g. http://127.0.0.1:7777 or https://host:7777)", conflicts_with = "socket")]
     endpoint: Option<String>,
 }
 
@@ -43,7 +43,7 @@ impl ConnectionArgs {
         if let Some(ep) = self.endpoint {
             Destination::Tcp(ep)
         } else {
-            Destination::Socket(self.socket.unwrap_or_else(default_socket))
+            Destination::Socket(self.socket)
         }
     }
 }
@@ -63,8 +63,8 @@ enum Cmd {
         log_grpc: bool,
         #[arg(long, default_value = "127.0.0.1:7777")]
         listen: SocketAddr,
-        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock]")]
-        socket: Option<PathBuf>,
+        #[arg(long, default_value_os_t = default_socket())]
+        socket: PathBuf,
     },
     /// Attach to a PTY and act as multiplexer
     Attach {
@@ -147,13 +147,12 @@ async fn main() -> Result<()> {
                 )
                 .init();
 
-            let socket_path = socket.unwrap_or_else(default_socket);
-            if let Some(parent) = socket_path.parent() {
+            if let Some(parent) = socket.parent() {
                 std::fs::create_dir_all(parent)?;
             }
 
             let registry = Arc::new(PtyRegistry::new());
-            server::serve(registry, &socket_path, listen, log_grpc).await?;
+            server::serve(registry, &socket, listen, log_grpc).await?;
         }
 
         Cmd::List { conn, verbose } => {
@@ -269,24 +268,7 @@ async fn main() -> Result<()> {
 }
 
 async fn resolve_pty_id(client: &mut AuthedClient, prefix: &str) -> Result<u64> {
-    use termd::proto::terminal_response::Response;
-
-    let resp = send_recv(client, Command::List(ListRequest {})).await?;
-    let ids = match resp.response {
-        Some(Response::List(l)) => l.items.into_iter().map(|i| i.pty_id).collect::<Vec<u64>>(),
-        other => return Err(anyhow::anyhow!("unexpected list response: {other:?}")),
-    };
-    let prefix_lower = prefix.to_ascii_lowercase();
-    let matches: Vec<_> = ids.iter().filter(|&&id| format!("{:016x}", id).starts_with(&prefix_lower)).collect();
-    match matches.len() {
-        1 => Ok(*matches[0]),
-        0 => Err(anyhow::anyhow!("no PTY matches prefix {:?}", prefix)),
-        _ => Err(anyhow::anyhow!(
-            "ambiguous prefix {:?} matches: {}",
-            prefix,
-            matches.iter().map(|&&id| format!("{:016x}", id)[..8].to_string()).collect::<Vec<_>>().join(", ")
-        )),
-    }
+    resolve_pty_item(client, prefix).await.map(|i| i.pty_id)
 }
 
 async fn resolve_pty_item(client: &mut AuthedClient, prefix: &str) -> Result<PtyItem> {
