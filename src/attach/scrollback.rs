@@ -16,7 +16,7 @@ use termd::proto::{
 pub(super) async fn show_scrollback(
     cmd_tx:  &mpsc::Sender<TerminalCommand>,
     resp_rx: &mut tonic::Streaming<TerminalResponse>,
-    pty_id:  &str,
+    pty_id:  u64,
     rows:    u32,
     stdin:   &mut tokio::io::Stdin,
 ) -> Result<()> {
@@ -37,7 +37,7 @@ pub(super) async fn show_scrollback(
 async fn run_scrollback(
     cmd_tx:  &mpsc::Sender<TerminalCommand>,
     resp_rx: &mut tonic::Streaming<TerminalResponse>,
-    pty_id:  &str,
+    pty_id:  u64,
     rows:    u32,
     stdin:   &mut tokio::io::Stdin,
 ) -> Result<()> {
@@ -136,13 +136,13 @@ async fn run_scrollback(
 async fn fetch_scrollback(
     cmd_tx:     &mpsc::Sender<TerminalCommand>,
     resp_rx:    &mut tonic::Streaming<TerminalResponse>,
-    pty_id:     &str,
+    pty_id:     u64,
     row_offset: u32,
     row_count:  u32,
 ) -> Result<ScrollbackResponse> {
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Scrollback(ScrollbackRequest {
-            pty_id: pty_id.to_owned(),
+            pty_id,
             row_offset,
             row_count,
         })),

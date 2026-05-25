@@ -140,10 +140,10 @@ async fn main() -> Result<()> {
                     if l.items.is_empty() {
                         println!("No active PTYs.");
                     } else {
-                        println!("{:<38} {:>5} {:>5}  {}", "ID", "COLS", "ROWS", "TITLE");
+                        println!("{:<16} {:>5} {:>5}  {}", "ID", "COLS", "ROWS", "TITLE");
                         for item in l.items {
                             println!(
-                                "{:<38} {:>5} {:>5}  {}",
+                                "{:016x} {:>5} {:>5}  {}",
                                 item.pty_id, item.cols, item.rows, item.title
                             );
                             if verbose {
@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
             .await?;
             match resp.response {
                 Some(Response::Create(c)) => {
-                    println!("{}", c.item.map(|i| i.pty_id).unwrap_or_default());
+                    println!("{}", c.item.map(|i| format!("{:016x}", i.pty_id)).unwrap_or_default());
                 }
                 other => eprintln!("unexpected response: {other:?}"),
             }
@@ -181,13 +181,13 @@ async fn main() -> Result<()> {
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             let resp = send_recv(
                 &mut client,
-                Command::Destroy(DestroyRequest { pty_id: pty_id.clone() }),
+                Command::Destroy(DestroyRequest { pty_id }),
             )
             .await?;
             match resp.response {
                 Some(Response::Command(c)) => {
                     if c.success {
-                        println!("destroyed {pty_id}");
+                        println!("destroyed {:016x}", pty_id);
                     } else {
                         eprintln!("error: {}", c.error.unwrap_or_default());
                         std::process::exit(1);
@@ -217,12 +217,12 @@ async fn main() -> Result<()> {
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             let resp = send_recv(
                 &mut client,
-                Command::Resize(ResizeRequest { pty_id: pty_id.clone(), cols, rows }),
+                Command::Resize(ResizeRequest { pty_id, cols, rows }),
             ).await?;
             match resp.response {
                 Some(Response::Command(c)) => {
                     if c.success {
-                        println!("resized {} to {}x{}", pty_id, cols, rows);
+                        println!("resized {:016x} to {}x{}", pty_id, cols, rows);
                     } else {
                         eprintln!("error: {}", c.error.unwrap_or_default());
                         std::process::exit(1);
@@ -245,22 +245,23 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn resolve_pty_id(client: &mut AuthedClient, prefix: &str) -> Result<String> {
+async fn resolve_pty_id(client: &mut AuthedClient, prefix: &str) -> Result<u64> {
     use termd::proto::terminal_response::Response;
 
     let resp = send_recv(client, Command::List(ListRequest {})).await?;
     let ids = match resp.response {
-        Some(Response::List(l)) => l.items.into_iter().map(|i| i.pty_id).collect::<Vec<_>>(),
+        Some(Response::List(l)) => l.items.into_iter().map(|i| i.pty_id).collect::<Vec<u64>>(),
         other => return Err(anyhow::anyhow!("unexpected list response: {other:?}")),
     };
-    let matches: Vec<_> = ids.iter().filter(|id| id.starts_with(prefix)).collect();
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let matches: Vec<_> = ids.iter().filter(|&&id| format!("{:016x}", id).starts_with(&prefix_lower)).collect();
     match matches.len() {
-        1 => Ok(matches[0].clone()),
+        1 => Ok(*matches[0]),
         0 => Err(anyhow::anyhow!("no PTY matches prefix {:?}", prefix)),
         _ => Err(anyhow::anyhow!(
             "ambiguous prefix {:?} matches: {}",
             prefix,
-            matches.iter().map(|s| &s[..8]).collect::<Vec<_>>().join(", ")
+            matches.iter().map(|&&id| format!("{:016x}", id)[..8].to_string()).collect::<Vec<_>>().join(", ")
         )),
     }
 }
@@ -273,14 +274,15 @@ async fn resolve_pty_item(client: &mut AuthedClient, prefix: &str) -> Result<Pty
         Some(Response::List(l)) => l.items,
         other => return Err(anyhow::anyhow!("unexpected list response: {other:?}")),
     };
-    let matches: Vec<_> = items.iter().filter(|i| i.pty_id.starts_with(prefix)).collect();
+    let prefix_lower = prefix.to_ascii_lowercase();
+    let matches: Vec<_> = items.iter().filter(|i| format!("{:016x}", i.pty_id).starts_with(&prefix_lower)).collect();
     match matches.len() {
         1 => Ok(matches[0].clone()),
         0 => Err(anyhow::anyhow!("no PTY matches prefix {:?}", prefix)),
         _ => Err(anyhow::anyhow!(
             "ambiguous prefix {:?} matches: {}",
             prefix,
-            matches.iter().map(|i| &i.pty_id[..8]).collect::<Vec<_>>().join(", ")
+            matches.iter().map(|i| format!("{:08x}", i.pty_id)).collect::<Vec<_>>().join(", ")
         )),
     }
 }

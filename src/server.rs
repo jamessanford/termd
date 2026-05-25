@@ -49,15 +49,15 @@ async fn dispatch_command(
     cmd:            proto::TerminalCommand,
     registry:       &Arc<PtyRegistry>,
     subscriber_id:  &str,
-    subscribed_ids: &mut std::collections::HashSet<String>,
-    sub_tasks:      &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
-    sub_tx:         &tokio::sync::mpsc::Sender<(String, PtyEvent)>,
+    subscribed_ids: &mut std::collections::HashSet<u64>,
+    sub_tasks:      &mut std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
+    sub_tx:         &tokio::sync::mpsc::Sender<(u64, PtyEvent)>,
 ) -> proto::TerminalResponse {
     use proto::terminal_command::Command;
     match cmd.command {
         None => proto::TerminalResponse {
             response: Some(proto::terminal_response::Response::Command(
-                proto::CommandResponse { pty_id: String::new(), success: false, error: Some("unknown command".into()) }
+                proto::CommandResponse { pty_id: 0, success: false, error: Some("unknown command".into()) }
             )),
         },
         Some(Command::List(_r))        => commands::handle_list(registry),
@@ -90,12 +90,12 @@ impl TerminalService for TerminalServiceImpl {
         let mut inbound = request.into_inner();
 
         let (resp_tx, resp_rx) = mpsc::channel::<Result<proto::TerminalResponse, Status>>(256);
-        let (sub_tx, mut sub_rx) = mpsc::channel::<(String, PtyEvent)>(1024);
+        let (sub_tx, mut sub_rx) = mpsc::channel::<(u64, PtyEvent)>(1024);
 
         tokio::spawn(async move {
             let subscriber_id = uuid::Uuid::new_v4().to_string();
-            let mut sub_tasks: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
-            let mut subscribed_ids: HashSet<String> = HashSet::new();
+            let mut sub_tasks: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
+            let mut subscribed_ids: HashSet<u64> = HashSet::new();
 
             loop {
                 tokio::select! {
@@ -161,7 +161,7 @@ impl TerminalService for TerminalServiceImpl {
             }
 
             // Disconnect cleanup: remove this client from every subscribed PTY
-            for pty_id in &subscribed_ids {
+            for &pty_id in &subscribed_ids {
                 if let Some(handle) = registry.get(pty_id) {
                     handle.remove_subscriber(&subscriber_id);
                     handle.broadcast_metadata(Arc::new(PtyMetadata {

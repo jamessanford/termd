@@ -34,7 +34,7 @@ pub struct SubscriberInfo {
 
 #[derive(Clone, Debug)]
 pub struct PtyInfo {
-    pub id:                String,
+    pub id:                u64,
     pub hostname:          String,
     pub pts_name:          String,
     pub cols:              u32,
@@ -90,7 +90,7 @@ pub struct ScrollbackData {
 }
 
 pub struct PtyHandle {
-    id: String,
+    id: u64,
     pts_name: String,
     created_at: SystemTime,
     hostname: String,
@@ -210,8 +210,8 @@ impl PtyHandle {
         rx.await.map_err(|_| anyhow!("PTY reader thread dropped scrollback response"))?
     }
 
-    pub fn id(&self) -> &str {
-        &self.id
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn current_generation(&self) -> u64 {
@@ -240,7 +240,7 @@ impl PtyHandle {
 }
 
 pub struct PtyRegistry {
-    ptys: RwLock<HashMap<String, Arc<PtyHandle>>>,
+    ptys: RwLock<HashMap<u64, Arc<PtyHandle>>>,
 }
 
 impl PtyRegistry {
@@ -249,7 +249,7 @@ impl PtyRegistry {
     }
 
     pub fn create(&self, cols: u32, rows: u32, command: Option<&str>) -> Result<Arc<PtyHandle>> {
-        let id = uuid::Uuid::new_v4().to_string();
+        let id: u64 = uuid::Uuid::new_v4().as_u64_pair().0;
         let hostname = hostname::get()
             .unwrap_or_default()
             .to_string_lossy()
@@ -352,7 +352,7 @@ impl PtyRegistry {
         let created_at = SystemTime::now();
         let title = Arc::new(Mutex::new(pts_name.clone()));
         let meta_tx_for_thread = meta_tx.clone();
-        let id_for_thread = id.clone();
+        let id_for_thread = id;
         let hostname_for_thread = hostname.clone();
         let pts_name_for_thread = pts_name.clone();
         let handle = Arc::new(PtyHandle {
@@ -380,7 +380,7 @@ impl PtyRegistry {
         let master_reader = File::from(master_reader);
         let title_for_thread = title.clone();
         std::thread::Builder::new()
-            .name(format!("pty-reader-{id}"))
+            .name(format!("pty-reader-{id:016x}"))
             .spawn(move || reader_thread(
                 master_reader, tx, generation, refresh_rx, scrollback_rx, resize_rx, wakeup_read,
                 child, title_for_thread, cols, rows,
@@ -393,9 +393,9 @@ impl PtyRegistry {
         Ok(handle)
     }
 
-    pub fn destroy(&self, id: &str) -> Result<()> {
-        let handle = self.ptys.write().unwrap().remove(id)
-            .ok_or_else(|| anyhow!("PTY {id} not found"))?;
+    pub fn destroy(&self, id: u64) -> Result<()> {
+        let handle = self.ptys.write().unwrap().remove(&id)
+            .ok_or_else(|| anyhow!("PTY {:016x} not found", id))?;
         let _ = kill(handle.child_pid, Signal::SIGHUP);
         // handle drops at end of scope: wakeup_write closes → reader sees POLLHUP and exits.
         // If callers hold Arc<PtyHandle> clones (e.g. an in-flight refresh), wakeup_write
@@ -404,14 +404,14 @@ impl PtyRegistry {
     }
 
     pub fn destroy_all(&self) {
-        let ids: Vec<String> = self.ptys.read().unwrap().keys().cloned().collect();
+        let ids: Vec<u64> = self.ptys.read().unwrap().keys().copied().collect();
         for id in ids {
-            let _ = self.destroy(&id);
+            let _ = self.destroy(id);
         }
     }
 
-    pub fn get(&self, id: &str) -> Option<Arc<PtyHandle>> {
-        self.ptys.read().unwrap().get(id).cloned()
+    pub fn get(&self, id: u64) -> Option<Arc<PtyHandle>> {
+        self.ptys.read().unwrap().get(&id).cloned()
     }
 
     pub fn list(&self) -> Vec<Arc<PtyHandle>> {
@@ -627,7 +627,7 @@ fn reader_thread(
     init_cols: u32,
     init_rows: u32,
     meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
-    pty_id: String,
+    pty_id: u64,
     hostname: String,
     pts_name: String,
     created_at: SystemTime,

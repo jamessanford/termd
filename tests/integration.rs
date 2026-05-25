@@ -127,9 +127,9 @@ async fn test_create_lists_one_pty() {
 async fn test_destroy_removes_pty() {
     let registry = PtyRegistry::new();
     let handle = registry.create(80, 24, None).unwrap();
-    let id = handle.info().id.clone();
-    registry.destroy(&id).unwrap();
-    assert!(registry.get(&id).is_none());
+    let id = handle.info().id;
+    registry.destroy(id).unwrap();
+    assert!(registry.get(id).is_none());
 }
 
 #[tokio::test]
@@ -139,9 +139,9 @@ async fn test_destroy_closes_broadcast() {
     let registry = PtyRegistry::new();
     let mut rx = {
         let handle = registry.create(80, 24, None).unwrap();
-        let id = handle.info().id.clone();
+        let id = handle.info().id;
         let rx = handle.subscribe();
-        registry.destroy(&id).unwrap();
+        registry.destroy(id).unwrap();
         // handle drops here; destroy has already removed it from the registry
         rx
     };
@@ -257,7 +257,7 @@ async fn test_create_and_list() {
         termd::proto::terminal_response::Response::Create(c) => c.item.unwrap().pty_id,
         other => panic!("unexpected: {other:?}"),
     };
-    assert!(!pty_id.is_empty());
+    assert!(pty_id != 0);
 
     let resp = send_recv(&mut client, terminal_command::Command::List(ListRequest {})).await;
     match resp.response.unwrap() {

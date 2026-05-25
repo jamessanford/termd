@@ -44,7 +44,7 @@ pub fn pty_info_to_item(info: PtyInfo) -> PtyItem {
     }
 }
 
-fn ok_response(pty_id: String) -> TerminalResponse {
+fn ok_response(pty_id: u64) -> TerminalResponse {
     TerminalResponse {
         response: Some(Response::Command(CommandResponse {
             pty_id,
@@ -54,7 +54,7 @@ fn ok_response(pty_id: String) -> TerminalResponse {
     }
 }
 
-fn err_response(pty_id: String, msg: String) -> TerminalResponse {
+fn err_response(pty_id: u64, msg: String) -> TerminalResponse {
     TerminalResponse {
         response: Some(Response::Command(CommandResponse {
             pty_id,
@@ -80,7 +80,7 @@ pub fn handle_create(registry: &PtyRegistry, req: CreateRequest) -> TerminalResp
                 item: Some(pty_info_to_item(h.info())),
             })),
         },
-        Err(e) => err_response(String::new(), e.to_string()),
+        Err(e) => err_response(0, e.to_string()),
     }
 }
 
@@ -88,21 +88,21 @@ pub fn handle_destroy(
     registry:       &PtyRegistry,
     req:            DestroyRequest,
     subscriber_id:  &str,
-    subscribed_ids: &mut HashSet<String>,
-    sub_tasks:      &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    subscribed_ids: &mut HashSet<u64>,
+    sub_tasks:      &mut std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
 ) -> TerminalResponse {
-    let id = req.pty_id.clone();
+    let id = req.pty_id;
     if let Some(task) = sub_tasks.remove(&id) {
         task.abort();
     }
     subscribed_ids.remove(&id);
-    if let Some(handle) = registry.get(&id) {
+    if let Some(handle) = registry.get(id) {
         handle.remove_subscriber(subscriber_id);
         // No SUBSCRIBERS_CHANGED broadcast here — CLOSED (emitted by reader_thread on child exit)
         // is the terminal event for subscribers. Broadcasting SUBSCRIBERS_CHANGED on destroy would
         // race with the CLOSED event and add no useful information.
     }
-    match registry.destroy(&req.pty_id) {
+    match registry.destroy(id) {
         Ok(_)  => ok_response(id),
         Err(e) => err_response(id, e.to_string()),
     }
@@ -112,12 +112,12 @@ pub fn handle_subscribe(
     registry:       &PtyRegistry,
     req:            SubscribeRequest,
     subscriber_id:  &str,
-    subscribed_ids: &mut HashSet<String>,
-    sub_tasks:      &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
-    sub_tx:         &tokio::sync::mpsc::Sender<(String, PtyEvent)>,
+    subscribed_ids: &mut HashSet<u64>,
+    sub_tasks:      &mut std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
+    sub_tx:         &tokio::sync::mpsc::Sender<(u64, PtyEvent)>,
 ) -> TerminalResponse {
-    let id = req.pty_id.clone();
-    match registry.get(&id) {
+    let id = req.pty_id;
+    match registry.get(id) {
         None => TerminalResponse {
             response: Some(Response::Subscribe(SubscribeResponse {
                 pty_id:        id,
@@ -137,7 +137,7 @@ pub fn handle_subscribe(
                 let data_rx = handle.subscribe();
                 let meta_rx = handle.meta_subscribe();
                 let tx = sub_tx.clone();
-                let pty_id_clone = id.clone();
+                let pty_id_clone = id;
                 let task = tokio::spawn(async move {
                     use tokio_stream::{StreamExt, wrappers::{BroadcastStream, errors::BroadcastStreamRecvError}};
                     let mut data_stream = BroadcastStream::new(data_rx);
@@ -146,27 +146,27 @@ pub fn handle_subscribe(
                         tokio::select! {
                             item = data_stream.next() => match item {
                                 Some(Ok(event)) => {
-                                    if tx.send((pty_id_clone.clone(), event)).await.is_err() { break; }
+                                    if tx.send((pty_id_clone, event)).await.is_err() { break; }
                                 }
                                 Some(Err(BroadcastStreamRecvError::Lagged(n))) => {
-                                    tracing::warn!(pty_id = %pty_id_clone, skipped = n, "data broadcast lagged");
+                                    tracing::warn!(pty_id = format!("{:016x}", pty_id_clone), skipped = n, "data broadcast lagged");
                                 }
                                 None => break,
                             },
                             item = meta_stream.next() => match item {
                                 Some(Ok(meta)) => {
-                                    if tx.send((pty_id_clone.clone(), PtyEvent::Metadata(meta))).await.is_err() { break; }
+                                    if tx.send((pty_id_clone, PtyEvent::Metadata(meta))).await.is_err() { break; }
                                 }
                                 Some(Err(BroadcastStreamRecvError::Lagged(n))) => {
-                                    tracing::warn!(pty_id = %pty_id_clone, skipped = n, "meta broadcast lagged");
+                                    tracing::warn!(pty_id = format!("{:016x}", pty_id_clone), skipped = n, "meta broadcast lagged");
                                 }
                                 None => break,
                             },
                         }
                     }
                 });
-                sub_tasks.insert(id.clone(), task);
-                subscribed_ids.insert(id.clone());
+                sub_tasks.insert(id, task);
+                subscribed_ids.insert(id);
             }
             // Upsert and broadcast unconditionally (covers both new and already-subscribed)
             handle.upsert_subscriber(subscriber_id, info);
@@ -193,15 +193,15 @@ pub fn handle_unsubscribe(
     registry:       &PtyRegistry,
     req:            UnsubscribeRequest,
     subscriber_id:  &str,
-    subscribed_ids: &mut HashSet<String>,
-    sub_tasks:      &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    subscribed_ids: &mut HashSet<u64>,
+    sub_tasks:      &mut std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
 ) -> TerminalResponse {
-    let id = req.pty_id.clone();
+    let id = req.pty_id;
     if let Some(task) = sub_tasks.remove(&id) {
         task.abort();
     }
     subscribed_ids.remove(&id);
-    if let Some(handle) = registry.get(&id) {
+    if let Some(handle) = registry.get(id) {
         handle.remove_subscriber(subscriber_id);
         handle.broadcast_metadata(Arc::new(PtyMetadata {
             reason:     MetadataReason::SubscribersChanged,
@@ -214,8 +214,8 @@ pub fn handle_unsubscribe(
 }
 
 pub fn handle_write(registry: &PtyRegistry, req: WriteRequest) -> TerminalResponse {
-    let id = req.pty_id.clone();
-    match registry.get(&id) {
+    let id = req.pty_id;
+    match registry.get(id) {
         None => err_response(id, "PTY not found".into()),
         Some(h) => match h.write(&req.data) {
             Ok(_) => ok_response(id),
@@ -225,8 +225,8 @@ pub fn handle_write(registry: &PtyRegistry, req: WriteRequest) -> TerminalRespon
 }
 
 pub fn handle_resize(registry: &PtyRegistry, req: ResizeRequest) -> TerminalResponse {
-    let id = req.pty_id.clone();
-    match registry.get(&id) {
+    let id = req.pty_id;
+    match registry.get(id) {
         None => err_response(id, "PTY not found".into()),
         Some(h) => match h.resize(req.cols, req.rows) {
             Ok(_) => ok_response(id),
@@ -236,8 +236,8 @@ pub fn handle_resize(registry: &PtyRegistry, req: ResizeRequest) -> TerminalResp
 }
 
 pub fn handle_set_title(registry: &PtyRegistry, req: SetTitleRequest) -> TerminalResponse {
-    let id = req.pty_id.clone();
-    match registry.get(&id) {
+    let id = req.pty_id;
+    match registry.get(id) {
         None => err_response(id, "PTY not found".into()),
         Some(h) => {
             h.set_title(&req.title);
@@ -247,8 +247,8 @@ pub fn handle_set_title(registry: &PtyRegistry, req: SetTitleRequest) -> Termina
 }
 
 pub async fn handle_refresh(registry: &PtyRegistry, req: RefreshRequest) -> TerminalResponse {
-    let id = req.pty_id.clone();
-    match registry.get(&id) {
+    let id = req.pty_id;
+    match registry.get(id) {
         None => err_response(id, "PTY not found".into()),
         Some(h) => match h.refresh().await {
             Ok(data) => TerminalResponse {
@@ -269,8 +269,8 @@ pub async fn handle_scrollback(
     registry: &PtyRegistry,
     req: ScrollbackRequest,
 ) -> TerminalResponse {
-    let id = req.pty_id.clone();
-    match registry.get(&id) {
+    let id = req.pty_id;
+    match registry.get(id) {
         None => err_response(id, "PTY not found".into()),
         Some(h) => match h.scrollback(req.row_offset, req.row_count).await {
             Ok(data) => TerminalResponse {

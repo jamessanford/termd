@@ -195,12 +195,12 @@ fn move_terminal_end() {
 async fn subscribe(
     cmd_tx:  &mpsc::Sender<TerminalCommand>,
     resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
-    pty_id:  &str,
+    pty_id:  u64,
 ) -> anyhow::Result<bool> {
     let (cols, rows) = get_terminal_size();
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Subscribe(SubscribeRequest {
-            pty_id:   pty_id.to_owned(),
+            pty_id,
             hostname: hostname::get().unwrap_or_default().to_string_lossy().into_owned(),
             cols,
             rows,
@@ -226,10 +226,10 @@ async fn subscribe(
 async fn request_refresh(
     cmd_tx:  &mpsc::Sender<TerminalCommand>,
     resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
-    pty_id:  &str,
+    pty_id:  u64,
 ) -> anyhow::Result<Option<(u64, Vec<u8>, Vec<(u64, Vec<u8>)>)>> {
     cmd_tx.send(TerminalCommand {
-        command: Some(Command::Refresh(RefreshRequest { pty_id: pty_id.to_owned() })),
+        command: Some(Command::Refresh(RefreshRequest { pty_id })),
     }).await?;
     let mut buffered: Vec<(u64, Vec<u8>)> = Vec::new();
     loop {
@@ -282,10 +282,10 @@ async fn ensure_list(
 async fn destroy_and_drain(
     cmd_tx:  &mpsc::Sender<TerminalCommand>,
     resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
-    pty_id:  &str,
+    pty_id:  u64,
 ) -> anyhow::Result<()> {
     cmd_tx.send(TerminalCommand {
-        command: Some(Command::Destroy(DestroyRequest { pty_id: pty_id.to_owned() })),
+        command: Some(Command::Destroy(DestroyRequest { pty_id })),
     }).await?;
     loop {
         match resp_rx.message().await? {
@@ -302,8 +302,8 @@ async fn destroy_and_drain(
     Ok(())
 }
 
-async fn recent_pty<'a>(list: &'a [PtyItem], previous_pty_id: &Option<String>, current_pty_id: &str) -> Option<&'a PtyItem> {
-    let prev_id = previous_pty_id.as_deref()?;
+async fn recent_pty<'a>(list: &'a [PtyItem], previous_pty_id: &Option<u64>, current_pty_id: u64) -> Option<&'a PtyItem> {
+    let prev_id = (*previous_pty_id)?;
     if let Some(item) = list.iter().find(|p| p.pty_id == prev_id) {
         Some(item)
     } else {
@@ -321,13 +321,13 @@ async fn recent_pty<'a>(list: &'a [PtyItem], previous_pty_id: &Option<String>, c
 }
 
 
-fn next_pty<'a>(list: &'a [PtyItem], current_id: &str) -> Option<&'a PtyItem> {
+fn next_pty<'a>(list: &'a [PtyItem], current_id: u64) -> Option<&'a PtyItem> {
     if list.is_empty() { return None; }
     let pos = list.iter().position(|p| p.pty_id == current_id).unwrap_or(0);
     Some(&list[(pos + 1) % list.len()])
 }
 
-fn prev_pty<'a>(list: &'a [PtyItem], current_id: &str) -> Option<&'a PtyItem> {
+fn prev_pty<'a>(list: &'a [PtyItem], current_id: u64) -> Option<&'a PtyItem> {
     if list.is_empty() { return None; }
     let pos = list.iter().position(|p| p.pty_id == current_id).unwrap_or(0);
     Some(&list[(pos + list.len() - 1) % list.len()])
@@ -336,17 +336,17 @@ fn prev_pty<'a>(list: &'a [PtyItem], current_id: &str) -> Option<&'a PtyItem> {
 // Unsubscribes from the current PTY, updates session state.
 async fn switch_pty(
     cmd_tx:          &mpsc::Sender<TerminalCommand>,
-    current_pty_id:  &mut String,
+    current_pty_id:  &mut u64,
     current_item:    &mut PtyItem,
-    previous_pty_id: &mut Option<String>,
+    previous_pty_id: &mut Option<u64>,
     new_item:        PtyItem,
 ) {
     let _ = cmd_tx.send(TerminalCommand {
         command: Some(Command::Unsubscribe(UnsubscribeRequest {
-            pty_id: current_pty_id.clone(),
+            pty_id: *current_pty_id,
         })),
     }).await;
-    *previous_pty_id = Some(std::mem::replace(current_pty_id, new_item.pty_id.clone()));
+    *previous_pty_id = Some(std::mem::replace(current_pty_id, new_item.pty_id));
     *current_item = new_item;
 }
 
@@ -363,11 +363,11 @@ fn draw_list(items: &[PtyItem], selected: usize) {
     for (i, item) in items.iter().enumerate() {
         if i == selected { out.extend_from_slice(b"\x1b[7m"); }
         let title = if item.title.is_empty() { &item.pts_name } else { &item.title };
-        let pty_id_trunc: String = item.pty_id.chars().take(16).collect();
+        let pty_id_hex = format!("{:016x}", item.pty_id);
         let title_trunc: String = title.chars().take(32).collect();
         let line = format!(
             " {:<16}  {:<32}  {}x{}\r\n",
-            pty_id_trunc,
+            pty_id_hex,
             title_trunc,
             item.cols, item.rows,
         );
@@ -382,9 +382,9 @@ async fn show_list(
     cmd_tx:          &mpsc::Sender<TerminalCommand>,
     resp_rx:         &mut tonic::Streaming<termd::proto::TerminalResponse>,
     pty_list:        &mut Vec<PtyItem>,
-    current_pty_id:  &str,
+    current_pty_id:  u64,
     stdin:           &mut tokio::io::Stdin,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<u64>> {
     // Returns Some(new_pty_id) on selection, None on cancel.
     if let Err(e) = fetch_list(cmd_tx, resp_rx, pty_list).await {
         show_error(&e.to_string()).await;
@@ -424,7 +424,7 @@ async fn show_list(
             // Enter — select
             [b'\r'] | [b'\n'] => {
                 clear_screen();
-                return Ok(Some(pty_list[selected].pty_id.clone()));
+                return Ok(Some(pty_list[selected].pty_id));
             }
             // Arrow keys arrive as 3-byte ESC sequences; match the whole read
             [0x1b, b'[', b'A', ..] => {
@@ -484,11 +484,11 @@ pub async fn run(
 
     let _guard = setup_raw_mode()?;
 
-    let mut current_pty_id = item.pty_id.clone();
+    let mut current_pty_id = item.pty_id;
     let mut current_item = item;
     let mut pty_list: Vec<PtyItem> = Vec::new();
-    let mut previous_pty_id: Option<String> = None;
-    let mut subscribed_pty_id: Option<String> = None;
+    let mut previous_pty_id: Option<u64> = None;
+    let mut subscribed_pty_id: Option<u64> = None;
 
     let allow_upgrade = mode == RenderMode::Region;
     let mut dispatch_mode = mode;
@@ -505,16 +505,16 @@ pub async fn run(
             break 'refresh (0, vec![], vec![]);
         }
 
-        let subscribe_ok = if subscribed_pty_id.as_deref() != Some(current_pty_id.as_str()) {
-            let ok = subscribe(&cmd_tx, &mut resp_rx, &current_pty_id).await?;
-            if ok { subscribed_pty_id = Some(current_pty_id.clone()); }
+        let subscribe_ok = if subscribed_pty_id != Some(current_pty_id) {
+            let ok = subscribe(&cmd_tx, &mut resp_rx, current_pty_id).await?;
+            if ok { subscribed_pty_id = Some(current_pty_id); }
             ok
         } else {
             true
         };
 
         let refresh_result = if subscribe_ok {
-            request_refresh(&cmd_tx, &mut resp_rx, &current_pty_id).await?
+            request_refresh(&cmd_tx, &mut resp_rx, current_pty_id).await?
         } else {
             None
         };
@@ -524,8 +524,8 @@ pub async fn run(
             None => {
                 subscribed_pty_id = None;
                 pty_list.clear();
-                let _ = destroy_and_drain(&cmd_tx, &mut resp_rx, &current_pty_id).await;
-                match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id, &mut stdin).await? {
+                let _ = destroy_and_drain(&cmd_tx, &mut resp_rx, current_pty_id).await;
+                match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, current_pty_id, &mut stdin).await? {
                     Some(new_id) => {
                         if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
                             switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
@@ -630,7 +630,7 @@ pub async fn run(
                     if !r.write.is_empty() {
                         let _ = cmd_tx.send(TerminalCommand {
                             command: Some(Command::Write(WriteRequest {
-                                pty_id: current_pty_id.clone(),
+                                pty_id: current_pty_id,
                                 data: r.write,
                             })),
                         }).await;
@@ -659,7 +659,7 @@ pub async fn run(
                     // TODO: Send SubscribeUpdate with new cols/rows
                     let _ = cmd_tx.send(TerminalCommand {
                         command: Some(Command::Refresh(RefreshRequest {
-                            pty_id: current_pty_id.clone(),
+                            pty_id: current_pty_id,
                         })),
                     }).await;
                 }
@@ -695,8 +695,8 @@ pub async fn run(
                 reset_terminal_modes();
                 subscribed_pty_id = None;
                 pty_list.clear();
-                let _ = destroy_and_drain(&cmd_tx, &mut resp_rx, &current_pty_id).await;
-                match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id, &mut stdin).await? {
+                let _ = destroy_and_drain(&cmd_tx, &mut resp_rx, current_pty_id).await;
+                match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, current_pty_id, &mut stdin).await? {
                     Some(new_id) => {
                         if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
                             switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
@@ -713,14 +713,14 @@ pub async fn run(
                     InputAction::Detach => break 'session,
 
                     InputAction::Destroy => {
-                        if let Err(e) = destroy_and_drain(&cmd_tx, &mut resp_rx, &current_pty_id).await {
+                        if let Err(e) = destroy_and_drain(&cmd_tx, &mut resp_rx, current_pty_id).await {
                             show_error(&e.to_string()).await;
                             continue 'session;
                         }
                         subscribed_pty_id = None;
                         pty_list.clear();
                         let auto_target = if ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
-                            recent_pty(&pty_list, &previous_pty_id, &current_pty_id).await.cloned()
+                            recent_pty(&pty_list, &previous_pty_id, current_pty_id).await.cloned()
                         } else {
                             None
                         };
@@ -737,7 +737,7 @@ pub async fn run(
                         let (cols, rows) = get_terminal_size();
                         let _ = cmd_tx.send(TerminalCommand {
                             command: Some(Command::Resize(ResizeRequest {
-                                pty_id: current_pty_id.clone(), cols, rows,
+                                pty_id: current_pty_id, cols, rows,
                             })),
                         }).await;
                     }
@@ -745,7 +745,7 @@ pub async fn run(
                     InputAction::ForceRefresh => {
                         let _ = cmd_tx.send(TerminalCommand {
                             command: Some(Command::Refresh(RefreshRequest {
-                                pty_id: current_pty_id.clone(),
+                                pty_id: current_pty_id,
                             })),
                         }).await;
                     }
@@ -782,7 +782,7 @@ pub async fn run(
                         if !ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
                             continue 'session;
                         }
-                        if let Some(target) = next_pty(&pty_list, &current_pty_id).cloned() {
+                        if let Some(target) = next_pty(&pty_list, current_pty_id).cloned() {
                             if target.pty_id != current_pty_id {
                                 switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
                             }
@@ -793,7 +793,7 @@ pub async fn run(
                         if !ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
                             continue 'session;
                         }
-                        if let Some(target) = prev_pty(&pty_list, &current_pty_id).cloned() {
+                        if let Some(target) = prev_pty(&pty_list, current_pty_id).cloned() {
                             if target.pty_id != current_pty_id {
                                 switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
                             }
@@ -802,7 +802,7 @@ pub async fn run(
 
                     InputAction::SwitchRecent => {
                         if ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
-                            if let Some(target) = recent_pty(&pty_list, &previous_pty_id, &current_pty_id).await.cloned() {
+                            if let Some(target) = recent_pty(&pty_list, &previous_pty_id, current_pty_id).await.cloned() {
                                 if target.pty_id != current_pty_id {
                                     switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
                                 }
@@ -822,7 +822,7 @@ pub async fn run(
                     }
 
                     InputAction::ShowList => {
-                        match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, &current_pty_id, &mut stdin).await? {
+                        match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, current_pty_id, &mut stdin).await? {
                             Some(new_id) if new_id != current_pty_id => {
                                 if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
                                     switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
@@ -835,7 +835,7 @@ pub async fn run(
 
                     InputAction::ShowInfo => {
                         show_error(&format!(
-                            "requested={mode:?} actual={dispatch_mode:?} pty={current_pty_id}"
+                            "requested={mode:?} actual={dispatch_mode:?} pty={current_pty_id:016x}"
                         )).await;
                     }
 
@@ -843,7 +843,7 @@ pub async fn run(
                         scrollback::show_scrollback(
                             &cmd_tx,
                             &mut resp_rx,
-                            &current_pty_id,
+                            current_pty_id,
                             current_item.rows,
                             &mut stdin,
                         ).await?;
@@ -858,7 +858,7 @@ pub async fn run(
     Ok(())
 }
 
-async fn run_debug(client: &mut AuthedClient, pty_id: String) -> Result<()> {
+async fn run_debug(client: &mut AuthedClient, pty_id: u64) -> Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<TerminalCommand>(64);
     let mut resp_rx = client
         .stream(ReceiverStream::new(cmd_rx))
@@ -869,7 +869,7 @@ async fn run_debug(client: &mut AuthedClient, pty_id: String) -> Result<()> {
     let (cols, rows) = get_terminal_size();
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Subscribe(SubscribeRequest {
-            pty_id:   pty_id.clone(),
+            pty_id,
             hostname: hostname::get().unwrap_or_default().to_string_lossy().into_owned(),
             cols,
             rows,
@@ -882,7 +882,7 @@ async fn run_debug(client: &mut AuthedClient, pty_id: String) -> Result<()> {
             Some(r) => match r.response {
                 Some(Response::Subscribe(s)) => {
                     if s.success {
-                        eprintln!("[Subscribe pty_id={} subscriber_id={}]", s.pty_id, s.subscriber_id);
+                        eprintln!("[Subscribe pty_id={:016x} subscriber_id={}]", s.pty_id, s.subscriber_id);
                     } else {
                         eprintln!("subscribe failed: {}", s.error.unwrap_or_default());
                         return Ok(());
@@ -896,7 +896,7 @@ async fn run_debug(client: &mut AuthedClient, pty_id: String) -> Result<()> {
 
     // Request refresh
     cmd_tx.send(TerminalCommand {
-        command: Some(Command::Refresh(RefreshRequest { pty_id: pty_id.clone() })),
+        command: Some(Command::Refresh(RefreshRequest { pty_id })),
     }).await?;
 
     // Main debug receive loop — print events to stderr, no rendering
@@ -910,7 +910,7 @@ async fn run_debug(client: &mut AuthedClient, pty_id: String) -> Result<()> {
                     eprintln!("[Refresh gen={} len={}]", rf.generation, rf.data.len());
                 }
                 Some(Response::Metadata(m)) => {
-                    eprintln!("[Metadata reason={} gen={} pty_id={}]", m.reason, m.generation, m.pty_id);
+                    eprintln!("[Metadata reason={} gen={} pty_id={:016x}]", m.reason, m.generation, m.pty_id);
                     if m.reason == StreamMetadataReason::Closed as i32 {
                         eprintln!("[Connection closed]");
                         break;

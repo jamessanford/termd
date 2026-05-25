@@ -24,15 +24,15 @@ message TerminalCommand {
 
 message ListRequest        {}
 message CreateRequest      { uint32 cols = 1; uint32 rows = 2; optional string command = 3; }
-message DestroyRequest     { string pty_id = 1; }
-message SubscribeRequest   { string pty_id = 1; string hostname = 2; uint32 cols = 3; uint32 rows = 4; }
-message UnsubscribeRequest { string pty_id = 1; }
-message WriteRequest       { string pty_id = 1; bytes data = 2; }
-message ResizeRequest      { string pty_id = 1; uint32 cols = 2; uint32 rows = 3; }
-message SetTitleRequest    { string pty_id = 1; string title = 2; }
-message RefreshRequest     { string pty_id = 1; }
+message DestroyRequest     { uint64 pty_id = 1; }
+message SubscribeRequest   { uint64 pty_id = 1; string hostname = 2; uint32 cols = 3; uint32 rows = 4; }
+message UnsubscribeRequest { uint64 pty_id = 1; }
+message WriteRequest       { uint64 pty_id = 1; bytes data = 2; }
+message ResizeRequest      { uint64 pty_id = 1; uint32 cols = 2; uint32 rows = 3; }
+message SetTitleRequest    { uint64 pty_id = 1; string title = 2; }
+message RefreshRequest     { uint64 pty_id = 1; }
 message ScrollbackRequest {
-  string pty_id     = 1;
+  uint64 pty_id     = 1;
   // Distance from the active-screen edge, in rows.
   // 0 = the bottom of the active screen
   uint32 row_offset = 2;
@@ -54,7 +54,7 @@ message TerminalResponse {
 }
 
 message PtyItem {
-  string                    pty_id      = 1;
+  uint64                    pty_id      = 1;
   string                    hostname    = 2;
   string                    pts_name    = 3;
   uint32                    cols        = 4;
@@ -68,10 +68,10 @@ message PtyItem {
 
 message ListResponse    { repeated PtyItem items = 1; }
 message CreateResponse  { PtyItem item = 1; }
-message CommandResponse { string pty_id = 1; bool success = 2; optional string error = 3; }
-message StreamData      { string pty_id = 1; uint64 generation = 2; bytes data = 3; }
+message CommandResponse { uint64 pty_id = 1; bool success = 2; optional string error = 3; }
+message StreamData      { uint64 pty_id = 1; uint64 generation = 2; bytes data = 3; }
 message RefreshResponse {
-  string pty_id     = 1;
+  uint64 pty_id     = 1;
   uint64 generation = 2;
   bytes  data       = 3;
   reserved            4;
@@ -81,7 +81,7 @@ message RefreshResponse {
 }
 
 message ScrollbackResponse {
-  string pty_id                = 1;
+  uint64 pty_id                = 1;
   uint64 generation            = 2;
   bytes  data                  = 3;
   uint32 total_scrollback_rows = 4;
@@ -96,7 +96,7 @@ message SubscriberInfo {
 }
 
 message SubscribeResponse {
-  string          pty_id        = 1;
+  uint64          pty_id        = 1;
   bool            success       = 2;
   optional string error         = 3;
   string          subscriber_id = 4;
@@ -110,7 +110,7 @@ enum StreamMetadataReason {
 }
 
 message StreamMetadata {
-  string               pty_id      = 1;
+  uint64               pty_id      = 1;
   PtyItem              item        = 2;
   StreamMetadataReason reason      = 3;
   optional int32       exit_code   = 4;
