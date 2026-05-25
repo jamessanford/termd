@@ -2,6 +2,8 @@
 
 termd is a terminal multiplexer experiment.  The daemon renders PTYs internally to libghostty instances and serves them over [gRPC](proto/terminal.proto).  Clients attach from anywhere — ssh in and run `termd attach`, or forward the gRPC port over SSH and run the client locally.  The included client displays one PTY at a time (no splits/panes yet).
 
+termd is written using Claude Sonnet 4.6, Claude Opus 4.7, and Claude Code.
+
 ### Build/Run
 
 Try [`cargo release-static`](.cargo/config.toml) to build a version with a static libghostty linked in.  You need Zig 0.15 installed.
