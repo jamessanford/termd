@@ -487,8 +487,15 @@ pub async fn run(
     let mut stdin = tokio::io::stdin();
     let mut input = input::InputProcessor::new();
     let mut out = Vec::new();
+    let mut skip_subscribe = false;
 
     'session: loop {
+        let (refresh_gen, refresh_bytes, buffered): (u64, Vec<u8>, Vec<(u64, Vec<u8>)>) = 'refresh: {
+        if skip_subscribe {
+            skip_subscribe = false;
+            break 'refresh (0, vec![], vec![]);
+        }
+
         let subscribe_ok = if subscribed_pty_id.as_deref() != Some(current_pty_id.as_str()) {
             let ok = subscribe(&cmd_tx, &mut resp_rx, &current_pty_id).await?;
             if ok { subscribed_pty_id = Some(current_pty_id.clone()); }
@@ -503,7 +510,7 @@ pub async fn run(
             None
         };
 
-        let (refresh_gen, refresh_bytes, buffered) = match refresh_result {
+        match refresh_result {
             Some(triple) => triple,
             None => {
                 subscribed_pty_id = None;
@@ -520,6 +527,7 @@ pub async fn run(
                     None => (0, vec![], vec![]),  // Wait for user to tell us what to do next.
                 }
             }
+        }
         };
         let mut current_refresh_gen = refresh_gen;
 
@@ -686,7 +694,7 @@ pub async fn run(
                             pty_list.clear();
                         }
                     }
-                    None => {}
+                    None => { skip_subscribe = true; }
                 }
                 continue 'session;
             }
