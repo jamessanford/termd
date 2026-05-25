@@ -62,7 +62,7 @@ enum Cmd {
         #[arg(long)]
         log_grpc: bool,
         #[arg(long, default_value = "127.0.0.1:7777")]
-        tcp_addr: SocketAddr,
+        listen: SocketAddr,
         #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock]")]
         socket: Option<PathBuf>,
     },
@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Cmd::Start { log_grpc, tcp_addr, socket } => {
+        Cmd::Start { log_grpc, listen, socket } => {
             let level = if log_grpc { "debug" } else { "info" };
             tracing_subscriber::fmt()
                 .with_env_filter(
@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
             }
 
             let registry = Arc::new(PtyRegistry::new());
-            server::serve(registry, &socket_path, tcp_addr, log_grpc).await?;
+            server::serve(registry, &socket_path, listen, log_grpc).await?;
         }
 
         Cmd::List { conn, verbose } => {
