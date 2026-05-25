@@ -42,6 +42,19 @@ enum Cmd {
         #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
         socket: Option<PathBuf>,
     },
+    /// Attach to a PTY and act as multiplexer
+    Attach {
+        /// PTY ID to attach to (from `termd list`)
+        pty_id: Option<String>,
+        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
+        socket: Option<PathBuf>,
+        /// Print message metadata to stderr instead of writing data to stdout
+        #[arg(long)]
+        debug: bool,
+        /// Rendering strategy for terminal output
+        #[arg(long, value_enum, default_value_t = attach::RenderMode::Region)]
+        render_mode: attach::RenderMode,
+    },
     /// List active PTYs
     List {
         #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
@@ -66,13 +79,6 @@ enum Cmd {
         #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
         socket: Option<PathBuf>,
     },
-    /// Write text to a PTY (appends newline)
-    Send {
-        pty_id: String,
-        text: String,
-        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
-        socket: Option<PathBuf>,
-    },
     /// Resize a PTY's columns and rows on the server
     Resize {
         pty_id: String,
@@ -81,18 +87,12 @@ enum Cmd {
         #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
         socket: Option<PathBuf>,
     },
-    /// Attach to a running PTY, streaming output to stdout and forwarding stdin
-    Attach {
-        /// PTY ID to attach to (from `termd list`)
-        pty_id: Option<String>,
+    /// Inject text to a PTY
+    Send {
+        pty_id: String,
+        text: String,
         #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
         socket: Option<PathBuf>,
-        /// Print message metadata to stderr instead of writing data to stdout
-        #[arg(long)]
-        debug: bool,
-        /// Rendering strategy for terminal output
-        #[arg(long, value_enum, default_value_t = attach::RenderMode::Region)]
-        render_mode: attach::RenderMode,
     },
 }
 
@@ -200,8 +200,7 @@ async fn main() -> Result<()> {
         Cmd::Send { pty_id, text, socket } => {
             let mut client = connect_client(socket).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
-            let mut data = text.into_bytes();
-            data.push(b'\n');
+            let data = text.into_bytes();
             let resp = send_recv(&mut client, Command::Write(WriteRequest { pty_id, data })).await?;
             match resp.response {
                 Some(Response::Command(c)) if !c.success => {
