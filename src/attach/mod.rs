@@ -22,6 +22,7 @@ pub(super) enum InputAction {
     ShowList,
     ShowInfo,
     ShowScrollback,
+    ShowHelp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -85,6 +86,7 @@ use termd::proto::{
 };
 
 mod cell;
+mod help;
 mod raw;
 mod region;
 mod scrollback;
@@ -851,6 +853,10 @@ pub async fn run(
                             current_item.rows,
                             &mut stdin,
                         ).await?;
+                    }
+
+                    InputAction::ShowHelp => {
+                        help::show_help(&mut stdin).await;
                     }
                 }
             }

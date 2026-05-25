@@ -80,6 +80,7 @@ fn process_byte(
             b'i'     => Some(InputAction::ShowInfo),
             b'k'     => Some(InputAction::Destroy),
             b's'     => Some(InputAction::ShowScrollback),
+            b'?'     => Some(InputAction::ShowHelp),
             b' '     => Some(InputAction::SwitchNext),
             b'p'     => Some(InputAction::SwitchPrevious),
             b'd'     => Some(InputAction::Detach),
