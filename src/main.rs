@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use tonic::Request;
 
 use termd::{
@@ -25,6 +25,29 @@ fn default_socket() -> PathBuf {
     base.join("termd.sock")
 }
 
+enum Destination {
+    Socket(PathBuf),
+    Tcp(String),
+}
+
+#[derive(Args)]
+struct ConnectionArgs {
+    #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock]")]
+    socket: Option<PathBuf>,
+    #[arg(long, help = "TCP address to connect to (e.g. 127.0.0.1:7777)")]
+    host: Option<String>,
+}
+
+impl ConnectionArgs {
+    fn destination(self) -> Destination {
+        if let Some(h) = self.host {
+            Destination::Tcp(h)
+        } else {
+            Destination::Socket(self.socket.unwrap_or_else(default_socket))
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "termd", about = "PTY daemon with gRPC streaming API")]
 struct Cli {
@@ -40,15 +63,15 @@ enum Cmd {
         log_grpc: bool,
         #[arg(long, default_value = "127.0.0.1:7777")]
         tcp_addr: SocketAddr,
-        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
+        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock]")]
         socket: Option<PathBuf>,
     },
     /// Attach to a PTY and act as multiplexer
     Attach {
         /// PTY ID to attach to (from `termd list`)
         pty_id: Option<String>,
-        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
-        socket: Option<PathBuf>,
+        #[command(flatten)]
+        conn: ConnectionArgs,
         /// Print message metadata to stderr instead of writing data to stdout
         #[arg(long)]
         debug: bool,
@@ -58,8 +81,8 @@ enum Cmd {
     },
     /// List active PTYs
     List {
-        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
-        socket: Option<PathBuf>,
+        #[command(flatten)]
+        conn: ConnectionArgs,
         #[arg(long, help = "Show subscribers for each PTY")]
         verbose: bool,
     },
@@ -71,29 +94,29 @@ enum Cmd {
         rows: u32,
         #[arg(long)]
         cmd: Option<String>,
-        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
-        socket: Option<PathBuf>,
+        #[command(flatten)]
+        conn: ConnectionArgs,
     },
     /// Destroy a PTY
     Destroy {
         pty_id: String,
-        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
-        socket: Option<PathBuf>,
+        #[command(flatten)]
+        conn: ConnectionArgs,
     },
     /// Resize a PTY's columns and rows on the server
     Resize {
         pty_id: String,
         cols: u32,
         rows: u32,
-        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
-        socket: Option<PathBuf>,
+        #[command(flatten)]
+        conn: ConnectionArgs,
     },
     /// Inject text to a PTY
     Send {
         pty_id: String,
         text: String,
-        #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock or /run/termd/termd.sock]")]
-        socket: Option<PathBuf>,
+        #[command(flatten)]
+        conn: ConnectionArgs,
     },
 }
 
@@ -133,8 +156,8 @@ async fn main() -> Result<()> {
             server::serve(registry, &socket_path, tcp_addr, log_grpc).await?;
         }
 
-        Cmd::List { socket, verbose } => {
-            let mut client = connect_client(socket).await?;
+        Cmd::List { conn, verbose } => {
+            let mut client = connect_client(conn.destination()).await?;
             let resp = send_recv(&mut client, Command::List(ListRequest {})).await?;
             match resp.response {
                 Some(Response::List(l)) => {
@@ -162,8 +185,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Create { cols, rows, cmd, socket } => {
-            let mut client = connect_client(socket).await?;
+        Cmd::Create { cols, rows, cmd, conn } => {
+            let mut client = connect_client(conn.destination()).await?;
             let resp = send_recv(
                 &mut client,
                 Command::Create(CreateRequest { cols, rows, command: cmd }),
@@ -177,8 +200,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Destroy { pty_id, socket } => {
-            let mut client = connect_client(socket).await?;
+        Cmd::Destroy { pty_id, conn } => {
+            let mut client = connect_client(conn.destination()).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             let resp = send_recv(
                 &mut client,
@@ -198,8 +221,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Send { pty_id, text, socket } => {
-            let mut client = connect_client(socket).await?;
+        Cmd::Send { pty_id, text, conn } => {
+            let mut client = connect_client(conn.destination()).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             let data = text.into_bytes();
             let resp = send_recv(&mut client, Command::Write(WriteRequest { pty_id, data })).await?;
@@ -212,8 +235,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Resize { pty_id, cols, rows, socket } => {
-            let mut client = connect_client(socket).await?;
+        Cmd::Resize { pty_id, cols, rows, conn } => {
+            let mut client = connect_client(conn.destination()).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             let resp = send_recv(
                 &mut client,
@@ -232,8 +255,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Attach { pty_id, socket, debug, render_mode } => {
-            let mut client = connect_client(socket).await?;
+        Cmd::Attach { pty_id, conn, debug, render_mode } => {
+            let mut client = connect_client(conn.destination()).await?;
             let item = match pty_id {
                 Some(prefix) => resolve_pty_item(&mut client, &prefix).await?,
                 None => auto_select_or_create(&mut client).await?,
@@ -314,19 +337,25 @@ async fn auto_select_or_create(client: &mut AuthedClient) -> Result<PtyItem> {
     }
 }
 
-async fn connect_client(socket: Option<PathBuf>) -> Result<AuthedClient> {
-    use hyper_util::rt::TokioIo;
-    use tonic::transport::Endpoint;
-    use tower::service_fn;
-
-    let path = socket.unwrap_or_else(default_socket);
-    let channel = Endpoint::try_from("http://[::]:1")?
-        .connect_with_connector(service_fn(move |_| {
-            let path = path.clone();
-            async move { tokio::net::UnixStream::connect(path).await.map(TokioIo::new) }
-        }))
-        .await?;
-
+async fn connect_client(dest: Destination) -> Result<AuthedClient> {
+    let channel = match dest {
+        Destination::Socket(path) => {
+            use hyper_util::rt::TokioIo;
+            use tonic::transport::Endpoint;
+            use tower::service_fn;
+            Endpoint::try_from("http://[::]:1")?
+                .connect_with_connector(service_fn(move |_| {
+                    let path = path.clone();
+                    async move { tokio::net::UnixStream::connect(path).await.map(TokioIo::new) }
+                }))
+                .await?
+        }
+        Destination::Tcp(addr) => {
+            tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+                .connect()
+                .await?
+        }
+    };
     Ok(TerminalServiceClient::with_interceptor(
         channel,
         auth_interceptor as fn(Request<()>) -> Result<Request<()>, tonic::Status>,
