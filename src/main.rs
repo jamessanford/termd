@@ -19,8 +19,9 @@ mod attach;
 
 fn default_socket() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR")
+        .or_else(|_| std::env::var("TMPDIR"))
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/run/termd"));
+        .unwrap_or_else(|_| PathBuf::from("/tmp"));
     base.join("termd.sock")
 }
 
