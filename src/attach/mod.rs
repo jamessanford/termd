@@ -127,12 +127,16 @@ fn setup_raw_mode() -> Result<TerminalGuard> {
 }
 
 
-pub(super) async fn show_error(msg: &str) {
+pub(super) async fn show_info(msg: &str) {
     clear_screen();
     use std::io::Write;
-    let _ = std::io::stderr().write_all(format!("\r\n[Error: {msg}]\r\n").as_bytes());
+    let _ = std::io::stderr().write_all(format!("\r\n[{msg}]\r\n").as_bytes());
     let _ = std::io::stderr().flush();
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+}
+
+pub(super) async fn show_error(msg: &str) {
+    show_info(&format!("Error: {}", msg)).await;
 }
 
 pub fn get_terminal_size() -> (u32, u32) {
@@ -212,7 +216,7 @@ async fn subscribe(
             Some(r) => match r.response {
                 Some(Response::Subscribe(c)) if c.pty_id == pty_id && c.success => return Ok(true),
                 Some(Response::Subscribe(c)) if c.pty_id == pty_id => {
-                    show_error(&format!("[subscribe failed: {}]", c.error.unwrap_or_default())).await;
+                    show_error(&format!("subscribe failed: {}", c.error.unwrap_or_default())).await;
                     return Ok(false);
                 }
                 _ => {}
@@ -314,7 +318,7 @@ async fn recent_pty<'a>(list: &'a [PtyItem], previous_pty_id: &Option<u64>, curr
                 ts.map(|t| (t.seconds, t.nanos)).unwrap_or((0, 0))
             });
         if best.is_none() {
-            show_error("No other PTYs").await;
+            show_info("No other PTYs").await;
         }
         best.or_else(|| list.first())
     }
@@ -391,7 +395,7 @@ async fn show_list(
         return Ok(None);
     }
     if pty_list.is_empty() {
-        show_error("[No PTYs available]").await;
+        show_info("No PTYs in this session").await;
         return Ok(None);
     }
 
@@ -759,7 +763,7 @@ pub async fn run(
                         }).await?;
                         'create: loop {
                             match resp_rx.message().await? {
-                                None => { move_terminal_end(); eprintln!("[server disconnected]"); break 'session; }
+                                None => { move_terminal_end(); eprintln!("[Server disconnected]"); break 'session; }
                                 Some(r) => if let Some(Response::Create(cr)) = r.response {
                                     match cr.item {
                                         Some(new_item) => {
@@ -767,7 +771,7 @@ pub async fn run(
                                             break 'create;
                                         }
                                         None => {
-                                            show_error("[Failed to create new PTY]").await;
+                                            show_error("Failed to create new PTY").await;
                                             pty_list.clear();
                                             continue 'session;
                                         }
@@ -834,7 +838,7 @@ pub async fn run(
                     }
 
                     InputAction::ShowInfo => {
-                        show_error(&format!(
+                        show_info(&format!(
                             "requested={mode:?} actual={dispatch_mode:?} pty={current_pty_id:016x}"
                         )).await;
                     }
