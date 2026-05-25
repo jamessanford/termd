@@ -717,13 +717,19 @@ pub async fn run(
                             show_error(&e.to_string()).await;
                             continue 'session;
                         }
+                        subscribed_pty_id = None;
                         pty_list.clear();
-                        if ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
-                            if let Some(target) = recent_pty(&pty_list, &previous_pty_id, &current_pty_id).await.cloned() {
-                                if target.pty_id != current_pty_id {
-                                    switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
-                                }
+                        let auto_target = if ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                            recent_pty(&pty_list, &previous_pty_id, &current_pty_id).await.cloned()
+                        } else {
+                            None
+                        };
+                        match auto_target {
+                            Some(target) if target.pty_id != current_pty_id => {
+                                switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
+                                pty_list.clear();
                             }
+                            _ => { skip_subscribe = true; }
                         }
                     }
 
