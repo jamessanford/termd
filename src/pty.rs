@@ -267,11 +267,14 @@ impl PtyRegistry {
         let master = pty.master; // OwnedFd — closed automatically on any error return below
         let slave_fd = pty.slave;   // OwnedFd
 
-        // Get slave device name (/dev/pts/N) using thread-safe ptsname_r
+        // Get slave device name (/dev/pts/N); ptsname_r is Linux-only, macOS only has ptsname
         let pts_name = unsafe {
             let borrowed = std::os::unix::io::BorrowedFd::borrow_raw(master.as_raw_fd());
-            let owned = borrowed.try_clone_to_owned().context("clone master fd for ptsname_r")?;
-            nix::pty::ptsname_r(&nix::pty::PtyMaster::from_owned_fd(owned))
+            let owned = borrowed.try_clone_to_owned().context("clone master fd for ptsname")?;
+            #[cfg(not(target_os = "macos"))]
+            { nix::pty::ptsname_r(&nix::pty::PtyMaster::from_owned_fd(owned)) }
+            #[cfg(target_os = "macos")]
+            { nix::pty::ptsname(&nix::pty::PtyMaster::from_owned_fd(owned)) }
         }.unwrap_or_else(|_| String::from("unknown"));
 
         // Dup master for the reader thread before transferring ownership to File
@@ -315,7 +318,12 @@ impl PtyRegistry {
                     return Err(std::io::Error::last_os_error());
                 }
                 // fd 0 is already the slave; set it as controlling terminal
-                if libc::ioctl(0, libc::TIOCSCTTY, 0i32) < 0 {
+                // macOS ioctl takes c_ulong for the request; Linux takes c_int
+                #[cfg(target_os = "macos")]
+                let tiocsctty: libc::c_ulong = libc::TIOCSCTTY.into();
+                #[cfg(not(target_os = "macos"))]
+                let tiocsctty = libc::TIOCSCTTY;
+                if libc::ioctl(0, tiocsctty, 0i32) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 // TODO: systemd-logind session registration (Linux)
@@ -332,17 +340,10 @@ impl PtyRegistry {
         let (resize_tx, resize_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(8);
         let generation = Arc::new(AtomicU64::new(0));
 
-        // Create wakeup pipe before spawning the child so that a pipe2 failure doesn't
-        // leave a zombie process behind.  O_CLOEXEC ensures the child won't inherit these fds.
-        // O_NONBLOCK is required so that the unconditional drain-read at the top of the
-        // reader loop returns EAGAIN immediately when the pipe is empty.
-        let mut pipe_fds = [0i32; 2];
-        let rc = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
-        if rc < 0 {
-            return Err(std::io::Error::last_os_error()).context("pipe2 for wakeup");
-        }
-        let wakeup_read = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
-        let wakeup_write = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+        // Create wakeup pipe before spawning the child so that a failure here doesn't
+        // leave a zombie process behind.  O_CLOEXEC and O_NONBLOCK are set atomically
+        // (Linux) or via fcntl fallback (macOS) inside wakeup_pipe().
+        let (wakeup_read, wakeup_write) = wakeup_pipe().context("wakeup pipe")?;
 
         let child = cmd.spawn().context("spawn shell")?;
         // slave fds are owned by the Stdio objects passed to Command and closed after fork;
@@ -426,6 +427,43 @@ impl Default for PtyRegistry {
 fn dup_fd(fd: std::os::unix::io::RawFd) -> std::io::Result<OwnedFd> {
     let new = unsafe { libc::dup(fd) };
     if new < 0 { Err(std::io::Error::last_os_error()) } else { Ok(unsafe { OwnedFd::from_raw_fd(new) }) }
+}
+
+// Creates a pipe with O_CLOEXEC and O_NONBLOCK set on both ends.
+// pipe2 is Linux-only; on macOS we fall back to pipe + fcntl.
+fn wakeup_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0i32; 2];
+    #[cfg(not(target_os = "macos"))]
+    let ok = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) == 0 };
+    #[cfg(target_os = "macos")]
+    let ok = unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            false
+        } else {
+            let mut success = true;
+            for &fd in &fds {
+                let fl = libc::fcntl(fd, libc::F_GETFL);
+                let dfl = libc::fcntl(fd, libc::F_GETFD);
+                if fl < 0 || dfl < 0
+                    || libc::fcntl(fd, libc::F_SETFD, dfl | libc::FD_CLOEXEC) < 0
+                    || libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0
+                {
+                    success = false;
+                    break;
+                }
+            }
+            if !success {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            success
+        }
+    };
+    if ok {
+        Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 // Note: on-demand refresh only renders the active screen at call time.  The screen-switch
