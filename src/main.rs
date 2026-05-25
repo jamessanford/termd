@@ -34,14 +34,14 @@ enum Destination {
 struct ConnectionArgs {
     #[arg(long, help = "Unix socket path [default: $XDG_RUNTIME_DIR/termd.sock]")]
     socket: Option<PathBuf>,
-    #[arg(long, help = "TCP address to connect to (e.g. 127.0.0.1:7777)")]
-    host: Option<String>,
+    #[arg(long, help = "Endpoint URI to connect to (e.g. http://127.0.0.1:7777 or https://host:7777)")]
+    endpoint: Option<String>,
 }
 
 impl ConnectionArgs {
     fn destination(self) -> Destination {
-        if let Some(h) = self.host {
-            Destination::Tcp(h)
+        if let Some(ep) = self.endpoint {
+            Destination::Tcp(ep)
         } else {
             Destination::Socket(self.socket.unwrap_or_else(default_socket))
         }
@@ -350,8 +350,8 @@ async fn connect_client(dest: Destination) -> Result<AuthedClient> {
                 }))
                 .await?
         }
-        Destination::Tcp(addr) => {
-            tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        Destination::Tcp(uri) => {
+            tonic::transport::Channel::from_shared(uri)?
                 .connect()
                 .await?
         }
