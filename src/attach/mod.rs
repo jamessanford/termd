@@ -302,12 +302,21 @@ async fn destroy_and_drain(
     Ok(())
 }
 
-fn recent_pty<'a>(list: &'a [PtyItem], previous_pty_id: &Option<String>) -> Option<&'a PtyItem> {
+async fn recent_pty<'a>(list: &'a [PtyItem], previous_pty_id: &Option<String>, current_pty_id: &str) -> Option<&'a PtyItem> {
     let prev_id = previous_pty_id.as_deref()?;
     if let Some(item) = list.iter().find(|p| p.pty_id == prev_id) {
         Some(item)
     } else {
-        list.first()
+        let best = list.iter()
+            .filter(|p| p.pty_id != current_pty_id)
+            .max_by_key(|p| {
+                let ts = p.last_subscribed_at.as_ref().or(p.created_at.as_ref());
+                ts.map(|t| (t.seconds, t.nanos)).unwrap_or((0, 0))
+            });
+        if best.is_none() {
+            show_error("No other PTYs").await;
+        }
+        best.or_else(|| list.first())
     }
 }
 
@@ -710,7 +719,7 @@ pub async fn run(
                         }
                         pty_list.clear();
                         if ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
-                            if let Some(target) = recent_pty(&pty_list, &previous_pty_id).cloned() {
+                            if let Some(target) = recent_pty(&pty_list, &previous_pty_id, &current_pty_id).await.cloned() {
                                 if target.pty_id != current_pty_id {
                                     switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
                                 }
@@ -787,7 +796,7 @@ pub async fn run(
 
                     InputAction::SwitchRecent => {
                         if ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
-                            if let Some(target) = recent_pty(&pty_list, &previous_pty_id).cloned() {
+                            if let Some(target) = recent_pty(&pty_list, &previous_pty_id, &current_pty_id).await.cloned() {
                                 if target.pty_id != current_pty_id {
                                     switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
                                 }
