@@ -9,7 +9,7 @@ use crate::commands;
 
 pub use crate::proto::terminal_service_server::{TerminalService, TerminalServiceServer};
 
-pub const AUTH_TOKEN: &str = "termd-dev-secret";
+pub const AUTH_TOKEN: &str = "termd-dev-secret"; // NOTE: local development testing
 
 pub fn auth_interceptor(req: Request<()>) -> Result<Request<()>, Status> {
     match req.metadata().get("x-auth-token") {
