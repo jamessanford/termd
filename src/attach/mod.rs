@@ -267,14 +267,13 @@ async fn fetch_list(
     }
 }
 
-// Ensures pty_list is populated, fetching if needed. Returns false and shows
-// an error message if the fetch fails; the caller should continue 'session.
+// Fetches updated pty_list. Returns false and shows an error message
+// if the fetch fails; the caller should continue 'session.
 async fn ensure_list(
     cmd_tx:   &mpsc::Sender<TerminalCommand>,
     resp_rx:  &mut tonic::Streaming<termd::proto::TerminalResponse>,
     pty_list: &mut Vec<PtyItem>,
 ) -> bool {
-    if !pty_list.is_empty() { return true; }
     if let Err(e) = fetch_list(cmd_tx, resp_rx, pty_list).await {
         show_error(&e.to_string()).await;
         return false;
