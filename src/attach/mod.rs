@@ -469,6 +469,58 @@ async fn show_list(
     }
 }
 
+fn draw_idle() {
+    use std::io::Write;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"\x1b[2J\x1b[H");
+    out.extend_from_slice(b"Not attached to a terminal.\r\n\r\n");
+    out.extend_from_slice(b"  ^A \"   list terminals\r\n");
+    out.extend_from_slice(b"  ^A c   create a terminal\r\n");
+    out.extend_from_slice(b"  ^A ?   help\r\n");
+    out.extend_from_slice(b"  ^A d   detach\r\n");
+    let _ = std::io::stdout().write_all(&out);
+    let _ = std::io::stdout().flush();
+}
+
+// Wait state: no PTY is attached. Draw an idle screen and wait for the user to
+// act. Input runs through the same InputProcessor as the render loop, so ^A
+// bindings (create, list, switch, detach, …) work here too — unlike the modal
+// screens (show_list/help/scrollback), which read stdin raw and can't trigger
+// them. Returns a RunOutcome for the shared dispatch in `run`.
+async fn run_idle(
+    resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
+    stdin:   &mut tokio::io::Stdin,
+    input:   &mut input::InputProcessor,
+) -> anyhow::Result<RunOutcome> {
+    draw_idle();
+    let mut sigwinch = signal(SignalKind::window_change())?;
+    let mut input_buf = [0u8; 256];
+    loop {
+        tokio::select! {
+            msg = resp_rx.message() => {
+                // No subscription here, so any PTY traffic is stale — ignore it.
+                // Only a closed/errored stream matters.
+                if !matches!(msg, Ok(Some(_))) {
+                    return Ok(RunOutcome::ServerClosed);
+                }
+            }
+            result = stdin.read(&mut input_buf) => {
+                let n = match result {
+                    Ok(0) | Err(_) => return Ok(RunOutcome::Action(InputAction::Detach)),
+                    Ok(n) => n,
+                };
+                // Drop r.write: with no PTY there's nowhere to send keystrokes.
+                if let Some(a) = input.process(&input_buf[..n]).action {
+                    return Ok(RunOutcome::Action(a));
+                }
+            }
+            _ = sigwinch.recv() => {
+                draw_idle();
+            }
+        }
+    }
+}
+
 pub async fn run(
     client: &mut AuthedClient,
     item: PtyItem,
@@ -541,178 +593,183 @@ pub async fn run(
             }
         }
         };
-        let mut current_refresh_gen = refresh_gen;
+        // Without a live subscription there's no PTY to render: show the idle
+        // screen and wait for the user to act. run_idle routes input through the
+        // same InputProcessor/InputAction path as the render loop, so the shared
+        // dispatch below handles either outcome identically.
+        let outcome: RunOutcome = if subscribed_pty_id != Some(current_pty_id) {
+            run_idle(&mut resp_rx, &mut stdin, &mut input).await?
+        } else {
+            let mut current_refresh_gen = refresh_gen;
 
-        let buffered: Vec<_> = buffered.into_iter()
-            .filter(|(gen, _)| *gen > current_refresh_gen)
-            .collect();
+            let buffered: Vec<_> = buffered.into_iter()
+                .filter(|(gen, _)| *gen > current_refresh_gen)
+                .collect();
 
-        let mut handler: Box<dyn RenderModeHandler> = create_handler(
-            dispatch_mode, current_item.cols, current_item.rows, allow_upgrade,
-        )?;
+            let mut handler: Box<dyn RenderModeHandler> = create_handler(
+                dispatch_mode, current_item.cols, current_item.rows, allow_upgrade,
+            )?;
 
-        out.clear();
-        if let EventResult::ChangeRenderMode(new_mode) = handler.init(&refresh_bytes, &buffered, &mut out)? {
-            handler.cleanup(&mut out);
+            out.clear();
+            if let EventResult::ChangeRenderMode(new_mode) = handler.init(&refresh_bytes, &buffered, &mut out)? {
+                handler.cleanup(&mut out);
+                if !out.is_empty() {
+                    stdout.write_all(&out)?;
+                    out.clear();
+                }
+                dispatch_mode = new_mode;
+                handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, allow_upgrade)?;
+                handler.init(&refresh_bytes, &buffered, &mut out)?;
+            }
             if !out.is_empty() {
                 stdout.write_all(&out)?;
-                out.clear();
+                stdout.flush()?;
             }
-            dispatch_mode = new_mode;
-            handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, allow_upgrade)?;
-            handler.init(&refresh_bytes, &buffered, &mut out)?;
-        }
-        if !out.is_empty() {
-            stdout.write_all(&out)?;
-            stdout.flush()?;
-        }
 
-        let mut sigwinch = signal(SignalKind::window_change())?;
-        let mut refresh_debounce = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(86400)));
-        let mut debounce_active = false;
-        let mut input_buf = [0u8; 256];
+            let mut sigwinch = signal(SignalKind::window_change())?;
+            let mut refresh_debounce = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(86400)));
+            let mut debounce_active = false;
+            let mut input_buf = [0u8; 256];
 
-        let outcome: RunOutcome = loop {
-            out.clear();
-            let mut change_mode: Option<(RenderMode, Vec<u8>)> = None;
+            loop {
+                out.clear();
+                let mut change_mode: Option<(RenderMode, Vec<u8>)> = None;
 
-            tokio::select! {
-                msg = resp_rx.message() => {
-                    match msg {
-                        Ok(Some(r)) => match r.response {
-                            Some(Response::Stream(s)) if s.pty_id == current_pty_id && s.generation > current_refresh_gen => {
-                                let result = handler.on_pty_event(PtyEvent::Stream { data: &s.data }, &mut out)?;
-                                if let EventResult::ChangeRenderMode(m) = result {
-                                    change_mode = Some((m, vec![]));
+                tokio::select! {
+                    msg = resp_rx.message() => {
+                        match msg {
+                            Ok(Some(r)) => match r.response {
+                                Some(Response::Stream(s)) if s.pty_id == current_pty_id && s.generation > current_refresh_gen => {
+                                    let result = handler.on_pty_event(PtyEvent::Stream { data: &s.data }, &mut out)?;
+                                    if let EventResult::ChangeRenderMode(m) = result {
+                                        change_mode = Some((m, vec![]));
+                                    }
                                 }
-                            }
-                            Some(Response::Refresh(rf)) if rf.pty_id == current_pty_id => {
-                                current_refresh_gen = rf.generation;
-                                current_item.cols = rf.cols;
-                                current_item.rows = rf.rows;
-                                let result = handler.on_pty_event(
-                                    PtyEvent::Refresh { cols: rf.cols, rows: rf.rows, data: &rf.data },
-                                    &mut out,
-                                )?;
-                                if let EventResult::ChangeRenderMode(m) = result {
-                                    change_mode = Some((m, rf.data));
+                                Some(Response::Refresh(rf)) if rf.pty_id == current_pty_id => {
+                                    current_refresh_gen = rf.generation;
+                                    current_item.cols = rf.cols;
+                                    current_item.rows = rf.rows;
+                                    let result = handler.on_pty_event(
+                                        PtyEvent::Refresh { cols: rf.cols, rows: rf.rows, data: &rf.data },
+                                        &mut out,
+                                    )?;
+                                    if let EventResult::ChangeRenderMode(m) = result {
+                                        change_mode = Some((m, rf.data));
+                                    }
                                 }
-                            }
-                            Some(Response::Metadata(m)) if m.pty_id == current_pty_id => {
-                                if m.reason == StreamMetadataReason::Resize as i32 {
-                                    if let Some(ref mi) = m.item {
-                                        if mi.cols > 0 && mi.rows > 0 {
-                                            current_item.cols = mi.cols;
-                                            current_item.rows = mi.rows;
-                                            let result = handler.on_pty_event(
-                                                PtyEvent::Resize { cols: mi.cols, rows: mi.rows },
-                                                &mut out,
-                                            )?;
-                                            if let EventResult::ChangeRenderMode(m) = result {
-                                                change_mode = Some((m, vec![]));
+                                Some(Response::Metadata(m)) if m.pty_id == current_pty_id => {
+                                    if m.reason == StreamMetadataReason::Resize as i32 {
+                                        if let Some(ref mi) = m.item {
+                                            if mi.cols > 0 && mi.rows > 0 {
+                                                current_item.cols = mi.cols;
+                                                current_item.rows = mi.rows;
+                                                let result = handler.on_pty_event(
+                                                    PtyEvent::Resize { cols: mi.cols, rows: mi.rows },
+                                                    &mut out,
+                                                )?;
+                                                if let EventResult::ChangeRenderMode(m) = result {
+                                                    change_mode = Some((m, vec![]));
+                                                }
                                             }
                                         }
+                                    } else if m.reason == StreamMetadataReason::Closed as i32 {
+                                        handler.on_pty_event(PtyEvent::Closed, &mut out)?;
+                                        input.reset();
+                                        break RunOutcome::PtyClosed;
                                     }
-                                } else if m.reason == StreamMetadataReason::Closed as i32 {
-                                    handler.on_pty_event(PtyEvent::Closed, &mut out)?;
-                                    input.reset();
-                                    break RunOutcome::PtyClosed;
                                 }
-                            }
-                            _ => {}
-                        },
-                        _ => { break RunOutcome::ServerClosed; }
+                                _ => {}
+                            },
+                            _ => { break RunOutcome::ServerClosed; }
+                        }
                     }
-                }
-                result = stdin.read(&mut input_buf) => {
-                    let n = match result {
-                        Ok(0) | Err(_) => break RunOutcome::Action(InputAction::Detach),
-                        Ok(n) => n,
-                    };
-                    let r = input.process(&input_buf[..n]);
-                    if !r.write.is_empty() {
+                    result = stdin.read(&mut input_buf) => {
+                        let n = match result {
+                            Ok(0) | Err(_) => break RunOutcome::Action(InputAction::Detach),
+                            Ok(n) => n,
+                        };
+                        let r = input.process(&input_buf[..n]);
+                        if !r.write.is_empty() {
+                            let _ = cmd_tx.send(TerminalCommand {
+                                command: Some(Command::Write(WriteRequest {
+                                    pty_id: current_pty_id,
+                                    data: r.write,
+                                })),
+                            }).await;
+                        }
+                        if let Some(a) = r.action {
+                            break RunOutcome::Action(a);
+                        }
+                    }
+                    _ = sigwinch.recv() => {
+                        let (cols, rows) = get_terminal_size();
+                        match handler.on_sigwinch(cols, rows, &mut out)? {
+                            EventResult::ChangeRenderMode(m) => {
+                                change_mode = Some((m, vec![]));
+                            }
+                            EventResult::RequestRefresh => {
+                                refresh_debounce.as_mut().reset(
+                                    tokio::time::Instant::now() + std::time::Duration::from_secs(1)
+                                );
+                                debounce_active = true;
+                            }
+                            EventResult::Continue => {}
+                        }
+                    }
+                    _ = &mut refresh_debounce, if debounce_active => {
+                        debounce_active = false;
+                        // Re-subscribe with the current size so the server can refit the PTY
+                        // to all subscribers. handle_subscribe upserts (it's idempotent for an
+                        // already-subscribed client) and recomputes best-fit; if it resizes, the
+                        // resulting Resize broadcast re-renders us.
+                        let (cols, rows) = get_terminal_size();
                         let _ = cmd_tx.send(TerminalCommand {
-                            command: Some(Command::Write(WriteRequest {
+                            command: Some(Command::Subscribe(SubscribeRequest {
                                 pty_id: current_pty_id,
-                                data: r.write,
+                                hostname: hostname::get().unwrap_or_default().to_string_lossy().into_owned(),
+                                cols,
+                                rows,
+                            })),
+                        }).await;
+                        // Always refresh regardless of whether the size changed: a SIGWINCH storm
+                        // can leave the user's terminal visually garbled even when it settles back
+                        // to the same dimensions, so we repaint unconditionally.
+                        let _ = cmd_tx.send(TerminalCommand {
+                            command: Some(Command::Refresh(RefreshRequest {
+                                pty_id: current_pty_id,
                             })),
                         }).await;
                     }
-                    if let Some(a) = r.action {
-                        break RunOutcome::Action(a);
-                    }
                 }
-                _ = sigwinch.recv() => {
-                    let (cols, rows) = get_terminal_size();
-                    match handler.on_sigwinch(cols, rows, &mut out)? {
-                        EventResult::ChangeRenderMode(m) => {
-                            change_mode = Some((m, vec![]));
-                        }
-                        EventResult::RequestRefresh => {
-                            refresh_debounce.as_mut().reset(
-                                tokio::time::Instant::now() + std::time::Duration::from_secs(1)
-                            );
-                            debounce_active = true;
-                        }
-                        EventResult::Continue => {}
-                    }
-                }
-                _ = &mut refresh_debounce, if debounce_active => {
-                    debounce_active = false;
-                    // Re-subscribe with the current size so the server can refit the PTY
-                    // to all subscribers. handle_subscribe upserts (it's idempotent for an
-                    // already-subscribed client) and recomputes best-fit; if it resizes, the
-                    // resulting Resize broadcast re-renders us.
-                    let (cols, rows) = get_terminal_size();
-                    let _ = cmd_tx.send(TerminalCommand {
-                        command: Some(Command::Subscribe(SubscribeRequest {
-                            pty_id: current_pty_id,
-                            hostname: hostname::get().unwrap_or_default().to_string_lossy().into_owned(),
-                            cols,
-                            rows,
-                        })),
-                    }).await;
-                    // Always refresh regardless of whether the size changed: a SIGWINCH storm
-                    // can leave the user's terminal visually garbled even when it settles back
-                    // to the same dimensions, so we repaint unconditionally.
-                    let _ = cmd_tx.send(TerminalCommand {
-                        command: Some(Command::Refresh(RefreshRequest {
-                            pty_id: current_pty_id,
-                        })),
-                    }).await;
-                }
-            }
 
-            if let Some((new_mode, refresh_data)) = change_mode {
-                handler.cleanup(&mut out);
-                dispatch_mode = new_mode;
-                handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, allow_upgrade)?;
-                let init_result = handler.init(&refresh_data, &[], &mut out)?;
-                if let EventResult::ChangeRenderMode(fallback) = init_result {
+                if let Some((new_mode, refresh_data)) = change_mode {
                     handler.cleanup(&mut out);
-                    dispatch_mode = fallback;
+                    dispatch_mode = new_mode;
                     handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, allow_upgrade)?;
-                    handler.init(&refresh_data, &[], &mut out)?;
+                    let init_result = handler.init(&refresh_data, &[], &mut out)?;
+                    if let EventResult::ChangeRenderMode(fallback) = init_result {
+                        handler.cleanup(&mut out);
+                        dispatch_mode = fallback;
+                        handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, allow_upgrade)?;
+                        handler.init(&refresh_data, &[], &mut out)?;
+                    }
+                    // A SIGWINCH-driven switch hands off empty data and doesn't resize the
+                    // server, so no Refresh follows on its own — the new handler would paint
+                    // a stale/blank screen. Request one so a full repaint comes down the pipe.
+                    // (Resize-driven switches are also empty but already get a server Refresh;
+                    // an extra request there is a harmless idempotent repaint.) We only reach
+                    // this branch with a live subscription, so the PTY is always there to ask.
+                    if refresh_data.is_empty() {
+                        let _ = cmd_tx.send(TerminalCommand {
+                            command: Some(Command::Refresh(RefreshRequest { pty_id: current_pty_id })),
+                        }).await;
+                    }
                 }
-                // A SIGWINCH-driven switch hands off empty data and doesn't resize the
-                // server, so no Refresh follows on its own — the new handler would paint
-                // a stale/blank screen. Request one so a full repaint comes down the pipe.
-                // (Resize-driven switches are also empty but already get a server Refresh;
-                // an extra request there is a harmless idempotent repaint.)
-                //
-                // Only when we hold a live subscription: in the no-PTY wait state
-                // subscribed_pty_id is None, and refreshing a destroyed PTY is pointless
-                // (the server just replies with an ignored Command error).
-                if refresh_data.is_empty() && subscribed_pty_id == Some(current_pty_id) {
-                    let _ = cmd_tx.send(TerminalCommand {
-                        command: Some(Command::Refresh(RefreshRequest { pty_id: current_pty_id })),
-                    }).await;
-                }
-            }
 
-            if !out.is_empty() {
-                if stdout.write_all(&out).is_err() { break RunOutcome::ServerClosed; }
-                let _ = stdout.flush();
+                if !out.is_empty() {
+                    if stdout.write_all(&out).is_err() { break RunOutcome::ServerClosed; }
+                    let _ = stdout.flush();
+                }
             }
         };
 
