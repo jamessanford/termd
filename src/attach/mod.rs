@@ -695,6 +695,16 @@ pub async fn run(
                     handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, allow_upgrade)?;
                     handler.init(&refresh_data, &[], &mut out)?;
                 }
+                // A SIGWINCH-driven switch hands off empty data and doesn't resize the
+                // server, so no Refresh follows on its own — the new handler would paint
+                // a stale/blank screen. Request one so a full repaint comes down the pipe.
+                // (Resize-driven switches are also empty but already get a server Refresh;
+                // an extra request there is a harmless idempotent repaint.)
+                if refresh_data.is_empty() {
+                    let _ = cmd_tx.send(TerminalCommand {
+                        command: Some(Command::Refresh(RefreshRequest { pty_id: current_pty_id })),
+                    }).await;
+                }
             }
 
             if !out.is_empty() {
