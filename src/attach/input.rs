@@ -2,7 +2,6 @@
 enum EscapeState {
     Normal,
     AfterNewline,
-    AfterTilde,
     AfterCtrlA,
     Escape,
     InCsi,
@@ -18,6 +17,8 @@ pub(super) struct InputProcessor {
     seq_buf: Vec<u8>,
 }
 
+// InputProcessor is a naive work in process to help parse CSI-u inputs
+// until we can use eg crossterm to trap certain events.
 impl InputProcessor {
     pub fn new() -> Self {
         Self {
@@ -70,29 +71,8 @@ impl InputProcessor {
             EscapeState::AfterNewline => match byte {
                 0x01 => { self.state = EscapeState::AfterCtrlA; None }
                 0x1B => { self.state = EscapeState::Escape; None }
-                b'~' => { self.state = EscapeState::AfterTilde; None }
                 b'\r' | b'\n' => { to_send.push(byte); None }
                 _ => { to_send.push(byte); self.state = EscapeState::Normal; None }
-            },
-            EscapeState::AfterTilde => match byte {
-                b'.' => Some(InputAction::Detach),
-                0x1B => {
-                    to_send.push(b'~');
-                    self.state = EscapeState::Escape;
-                    None
-                }
-                b'\r' | b'\n' => {
-                    to_send.push(b'~');
-                    to_send.push(byte);
-                    self.state = EscapeState::AfterNewline;
-                    None
-                }
-                _ => {
-                    to_send.push(b'~');
-                    to_send.push(byte);
-                    self.state = EscapeState::Normal;
-                    None
-                }
             },
             EscapeState::AfterCtrlA => match byte {
                 0x00     => Some(InputAction::SwitchNext),
@@ -142,7 +122,7 @@ impl InputProcessor {
             EscapeState::InCsi => match byte {
                 0x20..=0x3F => {
                     self.seq_buf.push(byte);
-                    if self.seq_buf.len() > 256 {
+                    if self.seq_buf.len() > 32 {
                         self.flush_csi(to_send);
                         self.state = EscapeState::Normal;
                     }
