@@ -165,6 +165,15 @@ impl VtFilter {
             (CsiMode::Normal, b'p') if self.buf.get(2) == Some(&b'!') => {
                 // DECSTR (Soft Terminal Reset, ESC [ ! p): pass through, then re-establish
                 // our margins — DECSTR disables DECLRMM and resets DECSLRM to full width.
+                //
+                // Caveat: emit_region_setup re-emits DECSTBM, which homes the cursor, and
+                // most terminals (xterm) do *not* move the cursor on DECSTR — so this can
+                // reposition the cursor with no repaint behind it (unlike init/Refresh,
+                // and unlike RIS which clears + homes anyway). We accept it because DECSTR
+                // is virtually always an app-init sequence immediately followed by a full
+                // redraw. If that assumption ever breaks, mirror the SIGWINCH-crossing fix:
+                // flag a refresh rather than re-emit inline. (Alt-screen exit has the same
+                // shape but is backstopped by a server-side refresh — see pty.rs ~825.)
                 out.extend_from_slice(&self.buf);
                 self.emit_region_setup(out);
             }
@@ -297,8 +306,12 @@ impl super::RenderModeHandler for RegionHandler {
                 if !super::server_fits_client(cols, rows, self.filter.client_cols, self.filter.client_rows) {
                     return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
                 }
+                // Just record the new dimensions. A Resize carries no repaint data,
+                // so re-emitting region setup here would only reset the cursor with
+                // nothing to follow. The server processes its own SIGWINCH and sends a
+                // Refresh shortly after, and that path re-emits the setup alongside the
+                // repaint.
                 self.filter.update_region(rows, cols);
-                self.filter.emit_region_setup(out);
             }
             super::PtyEvent::Closed => {}
         }
@@ -309,8 +322,24 @@ impl super::RenderModeHandler for RegionHandler {
         if !super::server_fits_client(self.filter.server_cols, self.filter.server_rows, cols, rows) {
             return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
         }
+        // The server PTY size is unchanged, so effective_rows/cols (clamped to the
+        // server) don't change and the DECSTBM region stays the same. The one thing
+        // that can change is whether DECLRMM should be active — that flips when the
+        // client width crosses the server width.
+        //
+        // When it flips we can't fix it inline: emitting DECSTBM/DECSLRM homes the
+        // cursor, and unlike init/Refresh there's no repaint behind it to put things
+        // back, so the live stream would resume from the wrong spot. Instead request a
+        // refresh; the Refresh arm re-emits the setup *and* repaints, landing the
+        // cursor correctly. We deliberately don't touch the terminal or flip
+        // declrmm_active here — the Refresh path does that when it actually emits
+        // ?69h/?69l, keeping the filter's DECSLRM-vs-save-cursor decision consistent
+        // with the terminal's real mode.
+        let declrmm_was = self.filter.declrmm_active;
         self.filter.update_client_size(rows, cols);
-        self.filter.emit_region_setup(out);
+        if (cols > self.filter.server_cols) != declrmm_was {
+            return Ok(super::EventResult::RequestRefresh);
+        }
         Ok(super::EventResult::Continue)
     }
 
@@ -646,7 +675,10 @@ mod tests {
     }
 
     #[test]
-    fn region_sigwinch_ok_updates_client_size() {
+    fn region_sigwinch_same_side_no_re_emit() {
+        // Client stays wider than the server across the resize: the region is
+        // unchanged and DECLRMM stays active, so nothing should be re-emitted
+        // (re-emitting would needlessly reset the cursor).
         let mut h = RegionHandler::new(24, 80, 40, 120);
         let mut out = Vec::new();
         h.init(b"", &[], &mut out).unwrap();
@@ -654,8 +686,39 @@ mod tests {
 
         let result = h.on_sigwinch(200, 50, &mut out).unwrap();
         assert!(matches!(result, EventResult::Continue));
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("\x1b[1;24r"), "should re-emit DECSTBM on resize");
+        assert!(out.is_empty(), "no re-emit when DECLRMM state is unchanged");
+    }
+
+    #[test]
+    fn region_sigwinch_shrink_to_server_width_requests_refresh() {
+        // Client starts wider than the server (DECLRMM active) and shrinks to exactly
+        // the server width: DECLRMM must flip off. We don't emit inline (that would
+        // home the cursor with no repaint) — we request a refresh, which re-emits the
+        // setup and repaints. The terminal is left untouched here.
+        let mut h = RegionHandler::new(24, 80, 40, 120);
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+
+        let result = h.on_sigwinch(80, 40, &mut out).unwrap();
+        assert!(matches!(result, EventResult::RequestRefresh));
+        assert!(out.is_empty(), "must not emit inline on the crossing");
+        assert!(h.filter.declrmm_active, "declrmm_active stays until the Refresh path flips it");
+    }
+
+    #[test]
+    fn region_sigwinch_grow_past_server_width_requests_refresh() {
+        // Client starts at the server width (DECLRMM inactive) and grows wider:
+        // DECLRMM must flip on. Same as above — request a refresh, emit nothing inline.
+        let mut h = RegionHandler::new(24, 80, 40, 80);
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+
+        let result = h.on_sigwinch(120, 40, &mut out).unwrap();
+        assert!(matches!(result, EventResult::RequestRefresh));
+        assert!(out.is_empty(), "must not emit inline on the crossing");
+        assert!(!h.filter.declrmm_active, "declrmm_active stays until the Refresh path flips it");
     }
 
     #[test]
