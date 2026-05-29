@@ -66,22 +66,20 @@ async fn run_scrollback(
         };
 
         match &buf[..n] {
-            [0x1b, b'[', b'A', ..] => {
-                if row_offset < max_row_offset(total, rows) {
+            [0x1b, b'[', b'A', ..]
+                if row_offset < max_row_offset(total, rows) => {
                     row_offset += 1;
                     let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
                     total = resp.total_scrollback_rows;
                     display_page(&resp.data, row_offset, total, rows);
                 }
-            }
-            [0x1b, b'[', b'B', ..] => {
-                if row_offset > 0 {
+            [0x1b, b'[', b'B', ..]
+                if row_offset > 0 => {
                     row_offset -= 1;
                     let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
                     total = resp.total_scrollback_rows;
                     display_page(&resp.data, row_offset, total, rows);
                 }
-            }
             [0x02] => {  // Ctrl-B: page back (further into history)
                 let max = max_row_offset(total, rows);
                 if row_offset < max {
@@ -91,14 +89,13 @@ async fn run_scrollback(
                     display_page(&resp.data, row_offset, total, rows);
                 }
             }
-            [0x06] => {  // Ctrl-F: page forward (towards active screen)
-                if row_offset > 0 {
+            [0x06]  // Ctrl-F: page forward (towards active screen)
+                if row_offset > 0 => {
                     row_offset = row_offset.saturating_sub(rows);
                     let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
                     total = resp.total_scrollback_rows;
                     display_page(&resp.data, row_offset, total, rows);
                 }
-            }
             [b'q'] => break,
             [0x1b] => {
                 let mut rest = [0u8; 2];

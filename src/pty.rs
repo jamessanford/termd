@@ -125,7 +125,7 @@ impl PtyHandle {
             v
         };  // read-lock released here
         PtyInfo {
-            id:                self.id.clone(),
+            id:                self.id,
             hostname:          self.hostname.clone(),
             pts_name:          self.pts_name.clone(),
             cols:              self.cols.load(Ordering::Relaxed),
@@ -363,7 +363,7 @@ impl PtyRegistry {
         let hostname_for_thread = hostname.clone();
         let pts_name_for_thread = pts_name.clone();
         let handle = Arc::new(PtyHandle {
-            id: id.clone(),
+            id,
             pts_name,
             created_at,
             hostname,
@@ -566,8 +566,8 @@ fn do_refresh(
     Ok(RefreshData {
         generation,
         data: Bytes::from(out),
-        cols: cols,
-        rows: rows,
+        cols,
+        rows,
     })
 }
 
@@ -826,7 +826,7 @@ fn reader_thread(
                 exit_code: None,
                 generation: gen,
                 info: PtyInfo {
-                    id: pty_id.clone(),
+                    id: pty_id,
                     hostname: hostname.clone(),
                     pts_name: pts_name.clone(),
                     cols: current_cols,
@@ -877,7 +877,7 @@ fn reader_thread(
         exit_code,
         generation: generation.load(Ordering::Relaxed),
         info: PtyInfo {
-            id: pty_id.clone(),
+            id: pty_id,
             hostname: hostname.clone(),
             pts_name: pts_name.clone(),
             cols: current_cols,

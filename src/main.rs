@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
                     } else {
                         let mut items = l.items;
                         items.sort_by_key(|p| p.sort_order);
-                        println!("{:>3} {:<16} {:>5} {:>5}  {}", "#", "ID", "COLS", "ROWS", "TITLE");
+                        println!("{:>3} {:<16} {:>5} {:>5}  TITLE", "#", "ID", "COLS", "ROWS");
                         for item in items {
                             println!(
                                 "{:>3} {:016x} {:>5} {:>5}  {}",

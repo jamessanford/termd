@@ -115,8 +115,8 @@ fn setup_raw_mode() -> Result<TerminalGuard> {
         InputFlags::IXON | InputFlags::ICRNL | InputFlags::BRKINT
             | InputFlags::INPCK | InputFlags::ISTRIP,
     );
-    raw.control_chars[libc::VMIN as usize] = 1;
-    raw.control_chars[libc::VTIME as usize] = 0;
+    raw.control_chars[libc::VMIN] = 1;
+    raw.control_chars[libc::VTIME] = 0;
     tcsetattr(fd, SetArg::TCSAFLUSH, &raw)?;
     Ok(TerminalGuard { original })
 }
@@ -220,17 +220,24 @@ async fn subscribe(
     }
 }
 
+/// A PTY event buffered after the refresh snapshot: its generation and raw bytes.
+type BufferedEvent = (u64, Vec<u8>);
+
+/// Result of a refresh: the refresh generation, the rendered screen bytes, and
+/// any events that arrived (and were buffered) after that snapshot.
+type RefreshSnapshot = (u64, Vec<u8>, Vec<BufferedEvent>);
+
 // Returns Ok(None) if the server returned an error for this PTY (e.g. reader thread dead).
 // Returns Ok(Some(...)) on success. Returns Err on transport failure.
 async fn request_refresh(
     cmd_tx:  &mpsc::Sender<TerminalCommand>,
     resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
     pty_id:  u64,
-) -> anyhow::Result<Option<(u64, Vec<u8>, Vec<(u64, Vec<u8>)>)>> {
+) -> anyhow::Result<Option<RefreshSnapshot>> {
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Refresh(RefreshRequest { pty_id })),
     }).await?;
-    let mut buffered: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut buffered: Vec<BufferedEvent> = Vec::new();
     loop {
         match resp_rx.message().await? {
             None => anyhow::bail!("server disconnected during refresh"),
@@ -255,13 +262,10 @@ async fn fetch_list(
     loop {
         match resp_rx.message().await? {
             None => anyhow::bail!("server disconnected during list"),
-            Some(r) => match r.response {
-                Some(Response::List(lr)) => {
-                    *pty_list = lr.items;
-                    pty_list.sort_by_key(|p| p.sort_order);
-                    return Ok(());
-                }
-                _ => {}
+            Some(r) => if let Some(Response::List(lr)) = r.response {
+                *pty_list = lr.items;
+                pty_list.sort_by_key(|p| p.sort_order);
+                return Ok(());
             }
         }
     }
@@ -323,13 +327,13 @@ async fn recent_pty<'a>(list: &'a [PtyItem], previous_pty_id: &Option<u64>, curr
 }
 
 
-fn next_pty<'a>(list: &'a [PtyItem], current_id: u64) -> Option<&'a PtyItem> {
+fn next_pty(list: &[PtyItem], current_id: u64) -> Option<&PtyItem> {
     if list.is_empty() { return None; }
     let pos = list.iter().position(|p| p.pty_id == current_id).unwrap_or(0);
     Some(&list[(pos + 1) % list.len()])
 }
 
-fn prev_pty<'a>(list: &'a [PtyItem], current_id: u64) -> Option<&'a PtyItem> {
+fn prev_pty(list: &[PtyItem], current_id: u64) -> Option<&PtyItem> {
     if list.is_empty() { return None; }
     let pos = list.iter().position(|p| p.pty_id == current_id).unwrap_or(0);
     Some(&list[(pos + list.len() - 1) % list.len()])
@@ -431,7 +435,7 @@ async fn show_list(
             }
             // Arrow keys arrive as 3-byte ESC sequences; match the whole read
             [0x1b, b'[', b'A', ..] => {
-                if selected > 0 { selected -= 1; }
+                selected = selected.saturating_sub(1);
                 draw_list(pty_list, selected);
             }
             [0x1b, b'[', b'B', ..] => {
@@ -453,7 +457,7 @@ async fn show_list(
 
                 if is_arrow {
                     if rest[1] == b'A' {
-                        if selected > 0 { selected -= 1; }
+                        selected = selected.saturating_sub(1);
                     } else {
                         if selected + 1 < pty_list.len() { selected += 1; }
                     }
@@ -554,7 +558,7 @@ pub async fn run(
     let mut skip_subscribe = false;
 
     'session: loop {
-        let (refresh_gen, refresh_bytes, buffered): (u64, Vec<u8>, Vec<(u64, Vec<u8>)>) = 'refresh: {
+        let (refresh_gen, refresh_bytes, buffered): RefreshSnapshot = 'refresh: {
         if skip_subscribe {
             skip_subscribe = false;
             break 'refresh (0, vec![], vec![]);
@@ -972,17 +976,14 @@ async fn run_debug(client: &mut AuthedClient, pty_id: u64) -> Result<()> {
     loop {
         match resp_rx.message().await? {
             None => { eprintln!("server disconnected during subscribe"); return Ok(()); }
-            Some(r) => match r.response {
-                Some(Response::Subscribe(s)) => {
-                    if s.success {
-                        eprintln!("[Subscribe pty_id={:016x} subscriber_id={}]", s.pty_id, s.subscriber_id);
-                    } else {
-                        eprintln!("subscribe failed: {}", s.error.unwrap_or_default());
-                        return Ok(());
-                    }
-                    break;
+            Some(r) => if let Some(Response::Subscribe(s)) = r.response {
+                if s.success {
+                    eprintln!("[Subscribe pty_id={:016x} subscriber_id={}]", s.pty_id, s.subscriber_id);
+                } else {
+                    eprintln!("subscribe failed: {}", s.error.unwrap_or_default());
+                    return Ok(());
                 }
-                _ => {}
+                break;
             }
         }
     }
