@@ -318,7 +318,7 @@ impl super::RenderModeHandler for RegionHandler {
         Ok(super::EventResult::Continue)
     }
 
-    fn on_sigwinch(&mut self, cols: u32, rows: u32, out: &mut Vec<u8>) -> Result<super::EventResult> {
+    fn on_sigwinch(&mut self, cols: u32, rows: u32, _out: &mut Vec<u8>) -> Result<super::EventResult> {
         if !super::server_fits_client(self.filter.server_cols, self.filter.server_rows, cols, rows) {
             return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
         }
