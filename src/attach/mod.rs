@@ -473,17 +473,17 @@ fn draw_idle() {
     use std::io::Write;
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[2J\x1b[H");
-    out.extend_from_slice(b"Not attached to a terminal.\r\n\r\n");
-    out.extend_from_slice(b"  ^A \"   list terminals\r\n");
-    out.extend_from_slice(b"  ^A c   create a terminal\r\n");
-    out.extend_from_slice(b"  ^A ?   help\r\n");
-    out.extend_from_slice(b"  ^A d   detach\r\n");
+    out.extend_from_slice(b"Not attached to a PTY.\r\n\r\n");
+    out.extend_from_slice(b"  C-a \"      show list of PTYs\r\n");
+    out.extend_from_slice(b"  C-a c      create new PTY\r\n");
+    out.extend_from_slice(b"  C-a ?      show keybindings\r\n");
+    out.extend_from_slice(b"  C-a d      detach from termd\r\n");
     let _ = std::io::stdout().write_all(&out);
     let _ = std::io::stdout().flush();
 }
 
 // Wait state: no PTY is attached. Draw an idle screen and wait for the user to
-// act. Input runs through the same InputProcessor as the render loop, so ^A
+// act. Input runs through the same InputProcessor as the render loop, so C-a
 // bindings (create, list, switch, detach, …) work here too — unlike the modal
 // screens (show_list/help/scrollback), which read stdin raw and can't trigger
 // them. Returns a RunOutcome for the shared dispatch in `run`.
