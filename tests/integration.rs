@@ -804,7 +804,7 @@ async fn test_scrollback_via_grpc() {
 }
 
 #[tokio::test]
-async fn test_subscribe_refits_pty_to_smaller_client() {
+async fn test_subscribe_grows_pty_to_larger_client() {
     use termd::proto::{
         terminal_command::Command, terminal_response::Response,
         TerminalCommand, SubscribeRequest, StreamMetadataReason,
@@ -821,8 +821,65 @@ async fn test_subscribe_refits_pty_to_smaller_client() {
         other => panic!("expected Create, got {other:?}"),
     };
 
-    // Subscribe with a smaller terminal than the PTY. handle_subscribe should refit the
-    // PTY down to the subscriber's size and broadcast a Resize to the (now-)subscriber.
+    // Subscribe with a larger terminal than the PTY. handle_subscribe should grow the
+    // PTY to the subscriber's size and broadcast a Resize to the (now-)subscriber.
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
+    let mut resp_stream = client
+        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx))
+        .await.unwrap().into_inner();
+
+    cmd_tx.send(TerminalCommand {
+        command: Some(Command::Subscribe(SubscribeRequest {
+            pty_id:   pty_id.clone(),
+            hostname: "tester".into(),
+            cols:     100,
+            rows:     40,
+        })),
+    }).await.unwrap();
+
+    // Expect a StreamMetadata::Resize carrying the grown dimensions.
+    let found = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match resp_stream.message().await {
+                Ok(Some(resp)) => match resp.response.unwrap() {
+                    Response::Metadata(m)
+                        if m.reason == StreamMetadataReason::Resize as i32 => {
+                            let item = m.item.unwrap();
+                            assert_eq!(item.cols, 100);
+                            assert_eq!(item.rows, 40);
+                            return true;
+                        }
+                    _ => continue,
+                },
+                _ => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(found, "subscribing with a larger client should grow the PTY and broadcast Resize");
+}
+
+#[tokio::test]
+async fn test_subscribe_does_not_shrink_pty_for_smaller_client() {
+    use termd::proto::{
+        terminal_command::Command, terminal_response::Response,
+        TerminalCommand, SubscribeRequest,
+    };
+
+    let (_dir, mut client) = test_server().await;
+
+    // Create a PTY at 80x24.
+    let resp = send_recv(&mut client, Command::Create(CreateRequest {
+        cols: 80, rows: 24, command: None,
+    })).await;
+    let pty_id = match resp.response.unwrap() {
+        Response::Create(c) => c.item.unwrap().pty_id,
+        other => panic!("expected Create, got {other:?}"),
+    };
+
+    // Subscribe with a smaller terminal. The grow-only policy must leave the PTY at 80x24.
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
     let mut resp_stream = client
         .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx))
@@ -837,26 +894,20 @@ async fn test_subscribe_refits_pty_to_smaller_client() {
         })),
     }).await.unwrap();
 
-    // Expect a StreamMetadata::Resize carrying the refit (smaller) dimensions.
-    let found = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match resp_stream.message().await {
-                Ok(Some(resp)) => match resp.response.unwrap() {
-                    Response::Metadata(m)
-                        if m.reason == StreamMetadataReason::Resize as i32 => {
-                            let item = m.item.unwrap();
-                            assert_eq!(item.cols, 70);
-                            assert_eq!(item.rows, 20);
-                            return true;
-                        }
-                    _ => continue,
-                },
-                _ => return false,
-            }
+    // Wait for the subscribe ack so the refit has been attempted.
+    loop {
+        match resp_stream.message().await.unwrap().unwrap().response.unwrap() {
+            Response::Subscribe(s) if s.success => break,
+            _ => {}
         }
-    })
-    .await
-    .unwrap_or(false);
+    }
 
-    assert!(found, "subscribing with a smaller client should refit the PTY and broadcast Resize");
+    // The PTY size must be unchanged. (cmd_tx stays alive so the subscriber is still attached.)
+    let resp = send_recv(&mut client, Command::List(ListRequest {})).await;
+    let item = match resp.response.unwrap() {
+        Response::List(l) => l.items.into_iter().find(|i| i.pty_id == pty_id).expect("PTY in list"),
+        other => panic!("expected List, got {other:?}"),
+    };
+    assert_eq!((item.cols, item.rows), (80, 24), "a smaller client must not shrink the PTY");
+    drop(cmd_tx);
 }

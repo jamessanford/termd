@@ -17,6 +17,22 @@ fn best_fit_size(subscribers: &[(String, SubscriberInfo)]) -> Option<(u32, u32)>
         .reduce(|(ac, ar), (c, r)| (ac.min(c), ar.min(r)))
 }
 
+/// Given the current PTY size and the best-fit box across subscribers, returns the
+/// size to resize to, or None to leave the PTY alone. We only ever grow: the PTY
+/// expands only when every subscriber can accommodate a larger box (neither
+/// dimension would shrink). A smaller client never shrinks the PTY out from under
+/// the others — it letterboxes via region/cell mode instead. Auto-shrinking is
+/// disorienting (the shell reflows and content jumps), so we don't do it.
+fn refit_target(current: (u32, u32), best_fit: (u32, u32)) -> Option<(u32, u32)> {
+    let (cur_cols, cur_rows) = current;
+    let (fit_cols, fit_rows) = best_fit;
+    if fit_cols >= cur_cols && fit_rows >= cur_rows && best_fit != current {
+        Some(best_fit)
+    } else {
+        None
+    }
+}
+
 pub fn pty_info_to_item(info: PtyInfo) -> PtyItem {
     let created = info.created_at
         .duration_since(std::time::UNIX_EPOCH)
@@ -182,13 +198,14 @@ pub fn handle_subscribe(
             // Upsert and broadcast unconditionally (covers both new and already-subscribed)
             handle.upsert_subscriber(subscriber_id, info);
             handle.touch_last_subscribed();
-            // Refit the PTY to the smallest size that fits every subscriber, so no
-            // client has content clipped. Recomputed on every subscribe, including the
-            // re-subscribes a client sends (debounced) on its own SIGWINCH. resize()
-            // broadcasts a Resize event of its own, so subscribers re-render.
+            // Grow the PTY to fit every subscriber when they can all accommodate a
+            // larger box; never shrink it for a smaller client (see refit_target).
+            // Recomputed on every subscribe, including the re-subscribes a client
+            // sends (debounced) on its own SIGWINCH. resize() broadcasts a Resize
+            // event of its own, so subscribers re-render.
             let snapshot = handle.info();
-            if let Some((cols, rows)) = best_fit_size(snapshot.subscribers.as_deref().unwrap_or(&[])) {
-                if (cols, rows) != (snapshot.cols, snapshot.rows) {
+            if let Some(best) = best_fit_size(snapshot.subscribers.as_deref().unwrap_or(&[])) {
+                if let Some((cols, rows)) = refit_target((snapshot.cols, snapshot.rows), best) {
                     let _ = handle.resize(cols, rows);
                 }
             }
@@ -345,5 +362,33 @@ mod tests {
     #[test]
     fn best_fit_none_when_all_sizes_unknown() {
         assert_eq!(best_fit_size(&[sub(0, 24), sub(80, 0)]), None);
+    }
+
+    #[test]
+    fn refit_grows_when_both_dimensions_larger() {
+        assert_eq!(refit_target((80, 24), (100, 40)), Some((100, 40)));
+    }
+
+    #[test]
+    fn refit_grows_when_one_dimension_larger_other_equal() {
+        assert_eq!(refit_target((80, 24), (100, 24)), Some((100, 24)));
+    }
+
+    #[test]
+    fn refit_none_when_equal() {
+        assert_eq!(refit_target((80, 24), (80, 24)), None);
+    }
+
+    #[test]
+    fn refit_none_when_smaller() {
+        // A smaller client must not shrink the PTY out from under the others.
+        assert_eq!(refit_target((80, 24), (70, 20)), None);
+    }
+
+    #[test]
+    fn refit_none_when_one_grows_one_shrinks() {
+        // Mixed: width would grow but height would shrink — leave it alone rather
+        // than shrink either dimension.
+        assert_eq!(refit_target((80, 24), (100, 20)), None);
     }
 }
