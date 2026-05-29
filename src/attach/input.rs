@@ -191,23 +191,23 @@ mod tests {
 
     #[test]
     fn tilde_dot_detaches() {
-        let r = process(&[b'\r', b'~', b'.']);
+        let r = process(b"\r~.");
         assert!(matches!(r.action, Some(InputAction::Detach)));
-        assert_eq!(r.write, &[b'\r']);
+        assert_eq!(r.write, b"\r");
     }
 
     #[test]
     fn tilde_other_passes_through() {
-        let r = process(&[b'\r', b'~', b'x']);
+        let r = process(b"\r~x");
         assert!(r.action.is_none());
-        assert_eq!(r.write, &[b'\r', b'~', b'x']);
+        assert_eq!(r.write, b"\r~x");
     }
 
     #[test]
     fn ctrl_a_mid_stream_preserves_prior_bytes() {
         let r = process(&[b'h', b'i', 0x01, b'c']);
         assert!(matches!(r.action, Some(InputAction::Create)));
-        assert_eq!(r.write, &[b'h', b'i']);
+        assert_eq!(r.write, b"hi");
     }
 
     #[test]
@@ -222,8 +222,8 @@ mod tests {
         let r = proc.process(&[0x01, b'"']);
         assert!(matches!(r.action, Some(InputAction::ShowList)));
         // Next input should not be in AfterCtrlA state
-        let r = proc.process(&[b'x']);
+        let r = proc.process(b"x");
         assert!(r.action.is_none());
-        assert_eq!(r.write, &[b'x']);
+        assert_eq!(r.write, b"x");
     }
 }
