@@ -12,7 +12,8 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use libghostty_vt::{Terminal, TerminalOptions, RenderState, ffi};
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
-use libghostty_vt::screen::{Screen, Selection};
+use libghostty_vt::screen::Screen;
+use libghostty_vt::selection::Selection;
 use libghostty_vt::terminal::{Point, PointCoordinate};
 use nix::{
     pty::openpty,
@@ -491,7 +492,7 @@ fn do_refresh(
         x: cols.saturating_sub(1) as u16,
         y: rows.saturating_sub(1),
     }))?;
-    let selection = Selection { start: top_left, end: bottom_right, rectangle: false };
+    let selection = Selection::new(top_left, bottom_right, false);
 
     let extra = ffi::FormatterTerminalExtra {
         size: std::mem::size_of::<ffi::FormatterTerminalExtra>(),
@@ -607,7 +608,7 @@ fn do_scrollback(
             x: cols.saturating_sub(1) as u16,
             y: total - 1,
         }))?;
-        let selection = Selection { start: top_left, end: bot_right, rectangle: false };
+        let selection = Selection::new(top_left, bot_right, false);
         let mut fmt = Formatter::new(terminal, FormatterOptions {
             format: Format::Vt,
             trim: false,
@@ -634,7 +635,7 @@ fn do_scrollback(
         x: cols.saturating_sub(1) as u16,
         y: end_y,
     }))?;
-    let selection = Selection { start: top_left, end: bot_right, rectangle: false };
+    let selection = Selection::new(top_left, bot_right, false);
 
     let mut fmt = Formatter::new(terminal, FormatterOptions {
         format: Format::Vt,
