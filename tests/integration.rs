@@ -284,7 +284,7 @@ async fn test_destroy() {
     };
 
     let resp = send_recv(&mut client, terminal_command::Command::Destroy(
-        DestroyRequest { pty_id: pty_id },
+        DestroyRequest { pty_id },
     )).await;
     match resp.response.unwrap() {
         termd::proto::terminal_response::Response::Command(c) => {
@@ -492,7 +492,7 @@ async fn test_subscribe_receives_closed_metadata() {
         .into_inner();
 
     cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id, ..Default::default() })),
+        command: Some(Command::Subscribe(SubscribeRequest { pty_id, ..Default::default() })),
     }).await.unwrap();
 
     // Wait for subscribe ack
@@ -506,7 +506,7 @@ async fn test_subscribe_receives_closed_metadata() {
     // Trigger PTY exit
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Write(WriteRequest {
-            pty_id: pty_id,
+            pty_id,
             data: b"exit\n".to_vec(),
         })),
     }).await.unwrap();
@@ -557,7 +557,7 @@ async fn test_resize_via_grpc_delivers_metadata() {
         .into_inner();
 
     cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest { pty_id: pty_id, ..Default::default() })),
+        command: Some(Command::Subscribe(SubscribeRequest { pty_id, ..Default::default() })),
     }).await.unwrap();
 
     // Drain until subscribe ack
@@ -571,7 +571,7 @@ async fn test_resize_via_grpc_delivers_metadata() {
     // Send resize
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Resize(ResizeRequest {
-            pty_id: pty_id,
+            pty_id,
             cols: 120,
             rows: 40,
         })),
@@ -625,7 +625,7 @@ async fn test_subscribe_returns_subscriber_id() {
 
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Subscribe(SubscribeRequest {
-            pty_id:   pty_id,
+            pty_id,
             hostname: "tester".into(),
             cols:     80,
             rows:     24,
@@ -667,7 +667,7 @@ async fn test_list_shows_subscribers() {
 
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Subscribe(SubscribeRequest {
-            pty_id:   pty_id,
+            pty_id,
             hostname: "tester".into(),
             cols:     80,
             rows:     24,
@@ -725,7 +725,7 @@ async fn test_disconnect_removes_subscriber() {
 
         sub_tx.send(TerminalCommand {
             command: Some(Command::Subscribe(SubscribeRequest {
-                pty_id:   pty_id,
+                pty_id,
                 hostname: "subscriber".into(),
                 cols:     80,
                 rows:     24,
@@ -782,7 +782,7 @@ async fn test_scrollback_via_grpc() {
     let resp = send_recv(
         &mut client,
         terminal_command::Command::Scrollback(termd::proto::ScrollbackRequest {
-            pty_id: pty_id,
+            pty_id,
             row_offset: 0,
             row_count: 24,
         }),
@@ -827,7 +827,7 @@ async fn test_subscribe_grows_pty_to_larger_client() {
 
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Subscribe(SubscribeRequest {
-            pty_id:   pty_id,
+            pty_id,
             hostname: "tester".into(),
             cols:     100,
             rows:     40,
@@ -884,7 +884,7 @@ async fn test_subscribe_does_not_shrink_pty_for_smaller_client() {
 
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Subscribe(SubscribeRequest {
-            pty_id:   pty_id,
+            pty_id,
             hostname: "tester".into(),
             cols:     70,
             rows:     20,
