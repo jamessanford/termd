@@ -13,6 +13,8 @@ use termd::proto::terminal_service_client::TerminalServiceClient;
 use termd::proto::{TerminalCommand, terminal_command};
 use termd::proto::{ListRequest, CreateRequest, DestroyRequest};
 
+const TEST_TOKEN: &str = "test-token";
+
 async fn send_recv<T>(
     client: &mut TerminalServiceClient<T>,
     cmd: terminal_command::Command,
@@ -41,7 +43,7 @@ async fn test_server() -> (tempfile::TempDir, TerminalServiceClient<tonic::servi
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("termd.sock");
     let registry = Arc::new(PtyRegistry::new());
-    let svc = make_service(registry, false);
+    let svc = make_service(registry, false, TEST_TOKEN.to_string());
     let socket_path = socket.clone();
     tokio::spawn(async move {
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -67,7 +69,7 @@ async fn test_server() -> (tempfile::TempDir, TerminalServiceClient<tonic::servi
     let client = TerminalServiceClient::with_interceptor(channel, |mut req: Request<()>| {
         req.metadata_mut().insert(
             "x-auth-token",
-            termd::server::AUTH_TOKEN.parse().unwrap(),
+            TEST_TOKEN.parse().unwrap(),
         );
         Ok(req)
     });
@@ -79,7 +81,7 @@ async fn test_auth_rejects_missing_token() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("termd.sock");
     let registry = Arc::new(PtyRegistry::new());
-    let svc = make_service(registry, false);
+    let svc = make_service(registry, false, TEST_TOKEN.to_string());
     let socket_path = socket.clone();
     tokio::spawn(async move {
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -303,7 +305,7 @@ async fn test_destroy() {
 #[tokio::test]
 async fn test_tcp_transport_accepts_list() {
     let registry = Arc::new(PtyRegistry::new());
-    let svc = termd::server::make_service(registry, false);
+    let svc = termd::server::make_service(registry, false, TEST_TOKEN.to_string());
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -333,7 +335,7 @@ async fn test_tcp_transport_accepts_list() {
     let mut client = TerminalServiceClient::with_interceptor(channel, |mut req: Request<()>| {
         req.metadata_mut().insert(
             "x-auth-token",
-            termd::server::AUTH_TOKEN.parse().unwrap(),
+            TEST_TOKEN.parse().unwrap(),
         );
         Ok(req)
     });

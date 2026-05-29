@@ -72,6 +72,9 @@ enum Cmd {
         pty_id: Option<String>,
         #[command(flatten)]
         conn: ConnectionArgs,
+        /// Auth token (required when connecting over TCP)
+        #[arg(long)]
+        token: Option<String>,
         /// Print message metadata to stderr instead of writing data to stdout
         #[arg(long)]
         debug: bool,
@@ -120,17 +123,11 @@ enum Cmd {
     },
 }
 
-fn auth_interceptor(mut req: Request<()>) -> Result<Request<()>, tonic::Status> {
-    req.metadata_mut()
-        .insert("x-auth-token", server::AUTH_TOKEN.parse().unwrap());
-    Ok(req)
-}
+pub(crate) type ClientInterceptor =
+    Box<dyn FnMut(Request<()>) -> Result<Request<()>, tonic::Status> + Send>;
 
-type AuthedClient = TerminalServiceClient<
-    tonic::service::interceptor::InterceptedService<
-        tonic::transport::Channel,
-        fn(Request<()>) -> Result<Request<()>, tonic::Status>,
-    >,
+pub(crate) type AuthedClient = TerminalServiceClient<
+    tonic::service::interceptor::InterceptedService<tonic::transport::Channel, ClientInterceptor>,
 >;
 
 #[tokio::main(flavor = "current_thread")]
@@ -151,12 +148,15 @@ async fn main() -> Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
 
+            let token = server::generate_token();
+            println!("token={token}");
+
             let registry = Arc::new(PtyRegistry::new());
-            server::serve(registry, &socket, listen, log_grpc).await?;
+            server::serve(registry, &socket, listen, token, log_grpc).await?;
         }
 
         Cmd::List { conn, verbose } => {
-            let mut client = connect_client(conn.destination()).await?;
+            let mut client = connect_client(conn.destination(), None).await?;
             let resp = send_recv(&mut client, Command::List(ListRequest {})).await?;
             match resp.response {
                 Some(Response::List(l)) => {
@@ -185,7 +185,7 @@ async fn main() -> Result<()> {
         }
 
         Cmd::Create { cols, rows, cmd, conn } => {
-            let mut client = connect_client(conn.destination()).await?;
+            let mut client = connect_client(conn.destination(), None).await?;
             let resp = send_recv(
                 &mut client,
                 Command::Create(CreateRequest { cols, rows, command: cmd }),
@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
         }
 
         Cmd::Destroy { pty_id, conn } => {
-            let mut client = connect_client(conn.destination()).await?;
+            let mut client = connect_client(conn.destination(), None).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             let resp = send_recv(
                 &mut client,
@@ -221,7 +221,7 @@ async fn main() -> Result<()> {
         }
 
         Cmd::Send { pty_id, text, conn } => {
-            let mut client = connect_client(conn.destination()).await?;
+            let mut client = connect_client(conn.destination(), None).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             let data = text.into_bytes();
             let resp = send_recv(&mut client, Command::Write(WriteRequest { pty_id, data })).await?;
@@ -235,7 +235,7 @@ async fn main() -> Result<()> {
         }
 
         Cmd::Resize { pty_id, cols, rows, conn } => {
-            let mut client = connect_client(conn.destination()).await?;
+            let mut client = connect_client(conn.destination(), None).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             let resp = send_recv(
                 &mut client,
@@ -254,8 +254,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Attach { pty_id, conn, debug, render_mode } => {
-            let mut client = connect_client(conn.destination()).await?;
+        Cmd::Attach { pty_id, conn, token, debug, render_mode } => {
+            let mut client = connect_client(conn.destination(), token).await?;
             let item = match pty_id {
                 Some(prefix) => resolve_pty_item(&mut client, &prefix).await?,
                 None => auto_select_or_create(&mut client).await?,
@@ -319,7 +319,7 @@ async fn auto_select_or_create(client: &mut AuthedClient) -> Result<PtyItem> {
     }
 }
 
-async fn connect_client(dest: Destination) -> Result<AuthedClient> {
+async fn connect_client(dest: Destination, token: Option<String>) -> Result<AuthedClient> {
     let channel = match dest {
         Destination::Socket(path) => {
             use hyper_util::rt::TokioIo;
@@ -338,10 +338,14 @@ async fn connect_client(dest: Destination) -> Result<AuthedClient> {
                 .await?
         }
     };
-    Ok(TerminalServiceClient::with_interceptor(
-        channel,
-        auth_interceptor as fn(Request<()>) -> Result<Request<()>, tonic::Status>,
-    ))
+    let interceptor: ClientInterceptor = match token {
+        Some(token) => Box::new(move |mut req: Request<()>| {
+            req.metadata_mut().insert("x-auth-token", token.parse().unwrap());
+            Ok(req)
+        }),
+        None => Box::new(|req: Request<()>| Ok(req)),
+    };
+    Ok(TerminalServiceClient::with_interceptor(channel, interceptor))
 }
 
 async fn send_recv(

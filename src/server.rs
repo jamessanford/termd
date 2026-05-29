@@ -9,11 +9,18 @@ use crate::commands;
 
 pub use crate::proto::terminal_service_server::{TerminalService, TerminalServiceServer};
 
-pub const AUTH_TOKEN: &str = "termd-dev-secret"; // NOTE: local development testing
+/// Generate a fresh random auth token for a daemon instance, formatted as
+/// 16 hex digits like a PTY id.
+pub fn generate_token() -> String {
+    format!("{:016x}", uuid::Uuid::new_v4().as_u64_pair().0)
+}
 
-pub fn auth_interceptor(req: Request<()>) -> Result<Request<()>, Status> {
-    match req.metadata().get("x-auth-token") {
-        Some(v) if v.as_bytes() == AUTH_TOKEN.as_bytes() => Ok(req),
+/// Build an auth interceptor that accepts requests carrying the given token.
+pub fn auth_interceptor(
+    token: String,
+) -> impl Fn(Request<()>) -> Result<Request<()>, Status> + Clone {
+    move |req: Request<()>| match req.metadata().get("x-auth-token") {
+        Some(v) if v.as_bytes() == token.as_bytes() => Ok(req),
         _ => Err(Status::unauthenticated("invalid or missing x-auth-token")),
     }
 }
@@ -30,18 +37,18 @@ impl TerminalServiceImpl {
     }
 }
 
-type AuthedTerminalService = InterceptedService<
-    TerminalServiceServer<TerminalServiceImpl>,
-    fn(Request<()>) -> Result<Request<()>, Status>,
->;
-
+/// Build a token-authenticated service (used for the TCP listener and tests).
 pub fn make_service(
     registry: Arc<PtyRegistry>,
     log_grpc: bool,
-) -> AuthedTerminalService {
+    token: String,
+) -> InterceptedService<
+    TerminalServiceServer<TerminalServiceImpl>,
+    impl tonic::service::Interceptor + Clone,
+> {
     TerminalServiceServer::with_interceptor(
         TerminalServiceImpl::new(registry, log_grpc),
-        auth_interceptor as fn(Request<()>) -> Result<Request<()>, Status>,
+        auth_interceptor(token),
     )
 }
 
@@ -183,6 +190,7 @@ pub async fn serve(
     registry: Arc<PtyRegistry>,
     unix_path: &std::path::Path,
     tcp_addr: std::net::SocketAddr,
+    token: String,
     log_grpc: bool,
 ) -> anyhow::Result<()> {
     use tokio::net::UnixListener;
@@ -226,8 +234,10 @@ pub async fn serve(
         let _ = drain_tx.send(());
     });
 
-    let svc_unix = make_service(registry.clone(), log_grpc);
-    let svc_tcp  = make_service(registry, log_grpc);
+    // Domain-socket clients are trusted by virtue of filesystem access, so the
+    // unix listener runs without auth. The TCP listener requires the token.
+    let svc_unix = TerminalServiceServer::new(TerminalServiceImpl::new(registry.clone(), log_grpc));
+    let svc_tcp  = make_service(registry, log_grpc, token);
 
     let servers = async move {
         let _ = tokio::try_join!(

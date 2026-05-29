@@ -5,7 +5,6 @@ use tokio::io::AsyncReadExt;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::Request;
 
 mod input;
 
@@ -82,7 +81,6 @@ use termd::proto::{
     CreateRequest, DestroyRequest, ListRequest, PtyItem, RefreshRequest, ResizeRequest,
     SubscribeRequest, UnsubscribeRequest, WriteRequest,
     TerminalCommand, StreamMetadataReason,
-    terminal_service_client::TerminalServiceClient,
 };
 
 mod cell;
@@ -91,12 +89,7 @@ mod raw;
 mod region;
 mod scrollback;
 
-type AuthedClient = TerminalServiceClient<
-    tonic::service::interceptor::InterceptedService<
-        tonic::transport::Channel,
-        fn(Request<()>) -> Result<Request<()>, tonic::Status>,
-    >,
->;
+use crate::AuthedClient;
 
 struct TerminalGuard {
     original: nix::sys::termios::Termios,
