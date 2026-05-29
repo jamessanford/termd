@@ -669,6 +669,7 @@ fn do_scrollback(
 }
 
 // Reader thread — owns libghostty Terminal state (not Send + Sync).
+#[allow(clippy::too_many_arguments)]
 fn reader_thread(
     mut master: File,
     tx: broadcast::Sender<PtyEvent>,
