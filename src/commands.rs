@@ -4,8 +4,18 @@ use prost_types::Timestamp;
 
 use crate::{
     proto::{self, terminal_response::Response, *},
-    pty::{MetadataReason, PtyEvent, PtyInfo, PtyMetadata, PtyRegistry},
+    pty::{MetadataReason, PtyEvent, PtyInfo, PtyMetadata, PtyRegistry, SubscriberInfo},
 };
+
+/// Smallest bounding box that fits every subscriber, so no client has its
+/// content clipped. Subscribers that report an unknown (zero) size are ignored.
+/// Returns None when no subscriber reports a usable size.
+fn best_fit_size(subscribers: &[(String, SubscriberInfo)]) -> Option<(u32, u32)> {
+    subscribers.iter()
+        .filter(|(_, s)| s.cols > 0 && s.rows > 0)
+        .map(|(_, s)| (s.cols, s.rows))
+        .reduce(|(ac, ar), (c, r)| (ac.min(c), ar.min(r)))
+}
 
 pub fn pty_info_to_item(info: PtyInfo) -> PtyItem {
     let created = info.created_at
@@ -172,6 +182,16 @@ pub fn handle_subscribe(
             // Upsert and broadcast unconditionally (covers both new and already-subscribed)
             handle.upsert_subscriber(subscriber_id, info);
             handle.touch_last_subscribed();
+            // Refit the PTY to the smallest size that fits every subscriber, so no
+            // client has content clipped. Recomputed on every subscribe, including the
+            // re-subscribes a client sends (debounced) on its own SIGWINCH. resize()
+            // broadcasts a Resize event of its own, so subscribers re-render.
+            let snapshot = handle.info();
+            if let Some((cols, rows)) = best_fit_size(snapshot.subscribers.as_deref().unwrap_or(&[])) {
+                if (cols, rows) != (snapshot.cols, snapshot.rows) {
+                    let _ = handle.resize(cols, rows);
+                }
+            }
             handle.broadcast_metadata(Arc::new(PtyMetadata {
                 reason:     MetadataReason::SubscribersChanged,
                 exit_code:  None,
@@ -284,5 +304,46 @@ pub async fn handle_scrollback(
             },
             Err(e) => err_response(id, e.to_string()),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub(cols: u32, rows: u32) -> (String, SubscriberInfo) {
+        ("s".into(), SubscriberInfo {
+            hostname:   String::new(),
+            cols,
+            rows,
+            created_at: std::time::SystemTime::now(),
+        })
+    }
+
+    #[test]
+    fn best_fit_none_when_empty() {
+        assert_eq!(best_fit_size(&[]), None);
+    }
+
+    #[test]
+    fn best_fit_single_subscriber_is_its_own_size() {
+        assert_eq!(best_fit_size(&[sub(80, 24)]), Some((80, 24)));
+    }
+
+    #[test]
+    fn best_fit_takes_min_of_each_dimension_independently() {
+        // Neither subscriber's size wins outright: cols from one, rows from the other.
+        assert_eq!(best_fit_size(&[sub(100, 30), sub(80, 40)]), Some((80, 30)));
+    }
+
+    #[test]
+    fn best_fit_ignores_zero_size_subscribers() {
+        // A subscriber that hasn't reported a usable size must not collapse the box to 0.
+        assert_eq!(best_fit_size(&[sub(80, 24), sub(0, 0)]), Some((80, 24)));
+    }
+
+    #[test]
+    fn best_fit_none_when_all_sizes_unknown() {
+        assert_eq!(best_fit_size(&[sub(0, 24), sub(80, 0)]), None);
     }
 }

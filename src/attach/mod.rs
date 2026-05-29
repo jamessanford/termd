@@ -660,7 +660,22 @@ pub async fn run(
                 }
                 _ = &mut refresh_debounce, if debounce_active => {
                     debounce_active = false;
-                    // TODO: Send SubscribeUpdate with new cols/rows
+                    // Re-subscribe with the current size so the server can refit the PTY
+                    // to all subscribers. handle_subscribe upserts (it's idempotent for an
+                    // already-subscribed client) and recomputes best-fit; if it resizes, the
+                    // resulting Resize broadcast re-renders us.
+                    let (cols, rows) = get_terminal_size();
+                    let _ = cmd_tx.send(TerminalCommand {
+                        command: Some(Command::Subscribe(SubscribeRequest {
+                            pty_id: current_pty_id,
+                            hostname: hostname::get().unwrap_or_default().to_string_lossy().into_owned(),
+                            cols,
+                            rows,
+                        })),
+                    }).await;
+                    // Always refresh regardless of whether the size changed: a SIGWINCH storm
+                    // can leave the user's terminal visually garbled even when it settles back
+                    // to the same dimensions, so we repaint unconditionally.
                     let _ = cmd_tx.send(TerminalCommand {
                         command: Some(Command::Refresh(RefreshRequest {
                             pty_id: current_pty_id,
