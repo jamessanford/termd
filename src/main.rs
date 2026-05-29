@@ -149,7 +149,7 @@ async fn main() -> Result<()> {
             }
 
             let token = server::generate_token();
-            println!("TCP connection token={token}");
+            println!("TCP connection token {token}");
 
             let registry = Arc::new(PtyRegistry::new());
             server::serve(registry, &socket, listen, token, log_grpc).await?;
