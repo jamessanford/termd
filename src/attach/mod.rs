@@ -699,7 +699,11 @@ pub async fn run(
                 // a stale/blank screen. Request one so a full repaint comes down the pipe.
                 // (Resize-driven switches are also empty but already get a server Refresh;
                 // an extra request there is a harmless idempotent repaint.)
-                if refresh_data.is_empty() {
+                //
+                // Only when we hold a live subscription: in the no-PTY wait state
+                // subscribed_pty_id is None, and refreshing a destroyed PTY is pointless
+                // (the server just replies with an ignored Command error).
+                if refresh_data.is_empty() && subscribed_pty_id == Some(current_pty_id) {
                     let _ = cmd_tx.send(TerminalCommand {
                         command: Some(Command::Refresh(RefreshRequest { pty_id: current_pty_id })),
                     }).await;
