@@ -1,5 +1,5 @@
 [alias]
-release-static = "build --release --features libghostty-vt-sys/link-static"
+build-dynamic = "build --features libghostty-vt/link-dynamic"
 
 [env]
 # Always build libghostty-vt with Zig ReleaseFast optimizations regardless of
