@@ -41,6 +41,7 @@ pub fn pty_info_to_item(info: PtyInfo) -> PtyItem {
                 }),
             }
         }).collect(),
+        sort_order: info.sort_order,
     }
 }
 

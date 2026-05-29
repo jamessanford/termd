@@ -256,7 +256,11 @@ async fn fetch_list(
         match resp_rx.message().await? {
             None => anyhow::bail!("server disconnected during list"),
             Some(r) => match r.response {
-                Some(Response::List(lr)) => { *pty_list = lr.items; return Ok(()); }
+                Some(Response::List(lr)) => {
+                    *pty_list = lr.items;
+                    pty_list.sort_by_key(|p| p.sort_order);
+                    return Ok(());
+                }
                 _ => {}
             }
         }
@@ -365,7 +369,8 @@ fn draw_list(items: &[PtyItem], selected: usize) {
         let pty_id_hex = format!("{:016x}", item.pty_id);
         let title_trunc: String = title.chars().take(32).collect();
         let line = format!(
-            " {:<16}  {:<32}  {}x{}\r\n",
+            " {:>3}  {:<16}  {:<32}  {}x{}\r\n",
+            item.sort_order,
             pty_id_hex,
             title_trunc,
             item.cols, item.rows,

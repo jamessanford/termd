@@ -163,11 +163,13 @@ async fn main() -> Result<()> {
                     if l.items.is_empty() {
                         println!("No active PTYs.");
                     } else {
-                        println!("{:<16} {:>5} {:>5}  {}", "ID", "COLS", "ROWS", "TITLE");
-                        for item in l.items {
+                        let mut items = l.items;
+                        items.sort_by_key(|p| p.sort_order);
+                        println!("{:>3} {:<16} {:>5} {:>5}  {}", "#", "ID", "COLS", "ROWS", "TITLE");
+                        for item in items {
                             println!(
-                                "{:016x} {:>5} {:>5}  {}",
-                                item.pty_id, item.cols, item.rows, item.title
+                                "{:>3} {:016x} {:>5} {:>5}  {}",
+                                item.sort_order, item.pty_id, item.cols, item.rows, item.title
                             );
                             if verbose {
                                 for sub in &item.subscribers {

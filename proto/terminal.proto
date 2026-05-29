@@ -64,6 +64,7 @@ message PtyItem {
   google.protobuf.Timestamp created_at        = 8;
   repeated SubscriberInfo   subscribers       = 9;
   optional google.protobuf.Timestamp last_subscribed_at = 10;
+  uint32                    sort_order  = 11;
 }
 
 message ListResponse    { repeated PtyItem items = 1; }

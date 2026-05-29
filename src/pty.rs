@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{Read, Write},
     os::unix::io::{AsRawFd, FromRawFd},
@@ -44,6 +44,7 @@ pub struct PtyInfo {
     pub created_at:        SystemTime,
     pub last_subscribed_at: Option<SystemTime>,
     pub subscribers:       Option<Vec<(String, SubscriberInfo)>>,
+    pub sort_order:        u32,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +108,9 @@ pub struct PtyHandle {
     generation: Arc<AtomicU64>,
     subscribers: Arc<RwLock<HashMap<String, SubscriberInfo>>>,
     last_subscribed_at: Mutex<Option<SystemTime>>,
+    // Assigned once at registration (next available slot, 0-based) for stable
+    // list ordering; never changes for the life of the handle.
+    sort_order: AtomicU32,
     child_pid: Pid,
     wakeup_write: OwnedFd,
 }
@@ -130,6 +134,7 @@ impl PtyHandle {
             created_at:        self.created_at,
             last_subscribed_at: *self.last_subscribed_at.lock().unwrap(),
             subscribers:       Some(subscribers),
+            sort_order:        self.sort_order.load(Ordering::Relaxed),
         }
     }
 
@@ -374,6 +379,7 @@ impl PtyRegistry {
             generation: generation.clone(),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
             last_subscribed_at: Mutex::new(None),
+            sort_order: AtomicU32::new(0), // real value assigned under the registry lock below
             child_pid,
             wakeup_write,
         });
@@ -391,7 +397,17 @@ impl PtyRegistry {
             ))
             .context("spawn reader thread")?;
 
-        self.ptys.write().unwrap().insert(id, handle.clone());
+        // Assign sort_order and insert atomically so concurrent creates can't
+        // pick the same slot. Smallest unused 0-based value, reusing gaps left
+        // by destroyed PTYs.
+        {
+            let mut map = self.ptys.write().unwrap();
+            let used: HashSet<u32> =
+                map.values().map(|h| h.sort_order.load(Ordering::Relaxed)).collect();
+            let order = (0u32..).find(|n| !used.contains(n)).unwrap();
+            handle.sort_order.store(order, Ordering::Relaxed);
+            map.insert(id, handle.clone());
+        }
         Ok(handle)
     }
 
@@ -819,6 +835,7 @@ fn reader_thread(
                     created_at,
                     last_subscribed_at: None,
                     subscribers: None, // subscriber map lives on PtyHandle, unavailable here
+                    sort_order: 0,     // lives on PtyHandle, unavailable here
                 },
             }));
         }
@@ -869,6 +886,7 @@ fn reader_thread(
             created_at,
             last_subscribed_at: None,
             subscribers: None, // subscriber map lives on PtyHandle, unavailable here
+            sort_order: 0,     // lives on PtyHandle, unavailable here
         },
     }));
 
