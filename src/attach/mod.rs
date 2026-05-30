@@ -144,41 +144,51 @@ pub(super) fn server_fits_client(server_cols: u32, server_rows: u32, client_cols
     client_cols >= server_cols && client_rows >= server_rows
 }
 
+// Escape sequences written to the client terminal to undo any PTY-set modes.
+// Consider using a full "RIS" reset to initial state; keeping it specific like
+// this does help us understand the missing gaps.
+const RESET_TERMINAL_MODES: &str = concat!(
+    "\x1b[?1049l",  // leave alternate screen mode
+    "\x1b[?1000l",  // disable X10 mouse reporting
+    "\x1b[?1002l",  // disable button-event mouse tracking
+    "\x1b[?1003l",  // disable all-motion mouse tracking
+    "\x1b[?1006l",  // disable SGR mouse extension
+    "\x1b[?1016l",  // disable SGR-pixels mouse extension
+    "\x1b[?1015l",  // disable urxvt mouse extension
+    "\x1b[?1004l",  // disable focus event reporting
+    "\x1b[?2004l",  // disable bracketed paste
+    "\x1b[?6l",     // disable origin mode (DECOM)
+    "\x1b[?5l",     // disable reverse video (DECSCNM)
+    "\x1b[4l",      // disable insert mode (IRM)
+    "\x1b[r",       // reset DECSTBM scroll region to full screen
+    "\x1b[?69l",    // disable DECLRMM (horizontal margins)
+    "\x1b[?7h",     // re-enable auto-wrap (DECAWM)
+    "\x1b[0m",      // reset SGR (colors, attributes)
+    // Both kitty keyboard and xterm modifyOtherKeys make the terminal emit CSI-u-style key
+    // codes; clear both so the client UI (list/help/scrollback) gets normal keys.  CSI = 0 ; 1 u
+    // resets the current kitty stack entry's flags to 0 (depth-independent — matches how
+    // pty.rs:do_refresh restores via CSI = flags ; 1 u, where a plain pop would not); the pop
+    // additionally drops a stack level pushed straight through from the server PTY.
+    "\x1b[<1u",     // pop one kitty keyboard stack level (undo a passed-through push)
+    "\x1b[=0;1u",   // reset current kitty keyboard flags to 0
+    "\x1b[>4;0m",   // disable xterm modifyOtherKeys
+    "\x1b[0q",      // reset cursor style to default
+    "\x1b[?25h",    // show cursor
+    "\x1b[?1l",     // DECCKM - normal cursor keys
+    "\x1b>",        // DECNKM - normal keypad mode
+    "\x1b(B",       // reset G0 character set to ASCII
+    "\x1b)B",       // reset G1 character set to ASCII
+    "\x1b*B",       // reset G2 character set to ASCII
+    "\x1b+B",       // reset G3 character set to ASCII
+    "\x0f",         // SI - shift in, invoke G0 into GL
+);
+
 // Disable any PTY-set terminal modes so client-side UI and new-PTY refreshes start clean.
 // Called on every renderer exit (before ShowList, PTY switch, etc.) and also at session exit
 // (where the caller appends the cursor-to-last-row tail).
 fn reset_terminal_modes() {
-    // Consider using a full "RIS" reset to initial state,
-    // keeping it specific like this does help us understand the missing gaps.
     use std::io::Write;
-    let _ = std::io::stdout().write_all(concat!(
-        "\x1b[?1049l",  // leave alternate screen mode
-        "\x1b[?1000l",  // disable X10 mouse reporting
-        "\x1b[?1002l",  // disable button-event mouse tracking
-        "\x1b[?1003l",  // disable all-motion mouse tracking
-        "\x1b[?1006l",  // disable SGR mouse extension
-        "\x1b[?1016l",  // disable SGR-pixels mouse extension
-        "\x1b[?1015l",  // disable urxvt mouse extension
-        "\x1b[?1004l",  // disable focus event reporting
-        "\x1b[?2004l",  // disable bracketed paste
-        "\x1b[?6l",     // disable origin mode (DECOM)
-        "\x1b[?5l",     // disable reverse video (DECSCNM)
-        "\x1b[4l",      // disable insert mode (IRM)
-        "\x1b[r",       // reset DECSTBM scroll region to full screen
-        "\x1b[?69l",    // disable DECLRMM (horizontal margins)
-        "\x1b[?7h",     // re-enable auto-wrap (DECAWM)
-        "\x1b[0m",      // reset SGR (colors, attributes)
-        "\x1b[<1u",     // pop kitty keyboard protocol
-        "\x1b[0q",      // reset cursor style to default
-        "\x1b[?25h",    // show cursor
-        "\x1b[?1l",     // DECCKM - normal cursor keys
-        "\x1b>",        // DECNKM - normal keypad mode
-        "\x1b(B",       // reset G0 character set to ASCII
-        "\x1b)B",       // reset G1 character set to ASCII
-        "\x1b*B",       // reset G2 character set to ASCII
-        "\x1b+B",       // reset G3 character set to ASCII
-        "\x0f",         // SI - shift in, invoke G0 into GL
-    ).as_bytes());
+    let _ = std::io::stdout().write_all(RESET_TERMINAL_MODES.as_bytes());
     let _ = std::io::stdout().flush();
 }
 
@@ -1017,4 +1027,20 @@ async fn run_debug(client: &mut AuthedClient, pty_id: u64) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reset_clears_both_csi_u_keyboard_protocols() {
+        let bytes = RESET_TERMINAL_MODES.as_bytes();
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        // kitty keyboard: depth-independent absolute clear of the current entry, plus a pop
+        assert!(has(b"\x1b[=0;1u"), "reset must clear current kitty keyboard flags to 0");
+        assert!(has(b"\x1b[<1u"), "reset must pop a passed-through kitty keyboard stack level");
+        // xterm modifyOtherKeys
+        assert!(has(b"\x1b[>4;0m"), "reset must disable xterm modifyOtherKeys");
+    }
 }

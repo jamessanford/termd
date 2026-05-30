@@ -517,14 +517,14 @@ fn do_refresh(
         palette: false,         // don't override the host terminal's color palette
         tabstops: false,        // tabstop restoration moves cursor, corrupting final position
         pwd: false,
-        keyboard: false,
+        keyboard: true,         // restore keyboard modes (xterm modifyOtherKeys) — CSI > 4 ; Pv m
         screen: ffi::FormatterScreenExtra {
             size: std::mem::size_of::<ffi::FormatterScreenExtra>(),
             cursor: true,        // emit final cursor position at end of output
             style: true,         // restore SGR attributes at cursor so subsequent output is styled correctly
             hyperlink: false,
             protection: false,
-            kitty_keyboard: false,
+            kitty_keyboard: true, // restore kitty keyboard protocol flags — CSI = flags ; 1 u
             charsets: true,      // restore G0-G3 charset designations (e.g. DEC line-drawing)
             saved_cursor: true,  // re-establish DECSC save slot for cursor restore
             // TODO: pending_wrap is not restored — CUP clears it, so if the server
@@ -544,12 +544,19 @@ fn do_refresh(
     })?;
 
     let mut out: Vec<u8> = Vec::new();
-    // Soft reset (DECSTR) + explicit mouse-mode disables + clear screen + cursor home.
-    // DECSTR alone does not reliably disable mouse-reporting modes on all terminals, so we
-    // disable them explicitly before the formatter re-enables whatever the server PTY has set
-    // (via modes:true).  The formatter output is sent as one blob, so no cursor flicker.
+    // Soft reset (DECSTR) + explicit mouse-mode disables + keyboard-mode clears + clear screen
+    // + cursor home.  DECSTR alone does not reliably disable mouse-reporting or keyboard
+    // protocol modes on all terminals, so we disable them explicitly before the formatter
+    // re-enables whatever the server PTY has set (via modes:true / keyboard:true /
+    // kitty_keyboard:true).  The formatter output is sent as one blob, so no cursor flicker.
     out.extend_from_slice(b"\x1b[!p");
     out.extend_from_slice(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+    // Keyboard protocols emit CSI-u-style key codes; clear both to a known baseline so the
+    // formatter's absolute restore is exact (it emits nothing when the PTY has none set).
+    // CSI = 0 ; 1 u resets the current kitty stack entry's flags to 0 (depth-independent,
+    // mirroring how the formatter restores via CSI = flags ; 1 u); CSI > 4 ; 0 m turns off
+    // xterm modifyOtherKeys.
+    out.extend_from_slice(b"\x1b[=0;1u\x1b[>4;0m");
     out.extend_from_slice(b"\x1b[2J\x1b[H");
     let vt = fmt.format_alloc(None)?;
     out.extend_from_slice(&vt);
@@ -1026,6 +1033,46 @@ mod scrollback_tests {
         let terminal = make_terminal(80, 24, 1000);
         let r = do_refresh(&terminal, 1).unwrap();
         assert_eq!(r.generation, 1);
+    }
+
+    // index of `needle`'s first occurrence in `haystack`, for ordering assertions
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    #[test]
+    fn do_refresh_restores_kitty_keyboard_state() {
+        // A PTY whose app pushed kitty keyboard flags (what Neovim does on Ghostty).
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"\x1b[>5u");
+        let r = do_refresh(&terminal, 1).unwrap();
+        // Preamble must clear kitty to a known baseline (absolute set of current entry to 0)...
+        let clear = find(&r.data, b"\x1b[=0;1u").expect("preamble missing kitty clear");
+        // ...and the formatter must then restore the target PTY's flags.
+        let restore = find(&r.data, b"\x1b[=5;1u").expect("missing kitty keyboard restore");
+        assert!(clear < restore, "kitty clear must precede restore");
+    }
+
+    #[test]
+    fn do_refresh_restores_modify_other_keys() {
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"\x1b[>4;2m"); // enable xterm modifyOtherKeys
+        let r = do_refresh(&terminal, 1).unwrap();
+        let clear = find(&r.data, b"\x1b[>4;0m").expect("preamble missing modifyOtherKeys disable");
+        let restore = find(&r.data, b"\x1b[>4;2m").expect("missing modifyOtherKeys restore");
+        assert!(clear < restore, "modifyOtherKeys clear must precede restore");
+    }
+
+    #[test]
+    fn do_refresh_clears_keyboard_when_pty_has_none() {
+        // A PTY with no special keyboard mode: the refresh must still neutralize any
+        // residual state on the client (the formatter emits nothing, so the preamble
+        // clears must carry it).
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"plain shell");
+        let r = do_refresh(&terminal, 1).unwrap();
+        assert!(find(&r.data, b"\x1b[=0;1u").is_some(), "missing kitty clear for plain PTY");
+        assert!(find(&r.data, b"\x1b[>4;0m").is_some(), "missing modifyOtherKeys clear for plain PTY");
     }
 
     #[test]
