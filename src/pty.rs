@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use libghostty_vt::{Terminal, TerminalOptions, RenderState, ffi};
+use libghostty_vt::render::CursorVisualStyle;
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
 use libghostty_vt::screen::Screen;
 use libghostty_vt::selection::Selection;
@@ -494,11 +495,32 @@ fn do_refresh(
     let cols = terminal.cols()? as u32;
     let rows = terminal.rows()? as u32;
 
-    // Snapshot cursor visibility; formatter modes:true may not emit ?25h for the default-visible
-    // case, so we emit it explicitly at the end to guarantee correct state after a PTY switch.
-    let cursor_visible = {
+    // Snapshot cursor visibility and shape; the formatter emits neither ?25h nor DECSCUSR for
+    // default values, so we emit them explicitly at the end to guarantee correct state after a
+    // PTY switch.
+    let (cursor_visible, cursor_shape) = {
         let mut rs = RenderState::new()?;
-        rs.update(terminal)?.cursor_visible().unwrap_or(true)
+        let rs = rs.update(terminal)?;
+        let visible = rs.cursor_visible().unwrap_or(true);
+        // Map (visual style, blink) back to a DECSCUSR code (CSI Ps SP q).  The model abstracts
+        // DECSCUSR into shape + DEC mode 12 (blink) with no "unset" state, so the default (steady
+        // block) is indistinguishable from an app that set it explicitly — we emit nothing for it,
+        // leaving the client terminal's own configured default cursor intact (reset_terminal_modes
+        // already reset it to default via DECSCUSR CSI 0 SP q).
+        let shape: Option<&'static [u8]> = match (
+            rs.cursor_visual_style().ok(),
+            rs.cursor_blinking().unwrap_or(false),
+        ) {
+            (Some(CursorVisualStyle::Underline), true)  => Some(&b"\x1b[3 q"[..]),
+            (Some(CursorVisualStyle::Underline), false) => Some(&b"\x1b[4 q"[..]),
+            (Some(CursorVisualStyle::Bar), true)        => Some(&b"\x1b[5 q"[..]),
+            (Some(CursorVisualStyle::Bar), false)       => Some(&b"\x1b[6 q"[..]),
+            // Block/BlockHollow: shape matches the default, so restore only the blink difference.
+            (Some(CursorVisualStyle::Block | CursorVisualStyle::BlockHollow), true) => Some(&b"\x1b[1 q"[..]),
+            // Steady block (the default) or an unreadable style: emit nothing.
+            _ => None,
+        };
+        (visible, shape)
     };
 
     // Restrict to the active screen — the server terminal has scrollback and we don't want it.
@@ -568,6 +590,12 @@ fn do_refresh(
         out.extend_from_slice(b"\x1b[?25h");
     } else {
         out.extend_from_slice(b"\x1b[?25l");
+    }
+    // Explicit cursor shape (DECSCUSR) — like visibility, the formatter doesn't emit it and
+    // reset_terminal_modes reset it to the client default, so restore any non-default shape the
+    // server PTY set (e.g. Neovim's bar cursor in insert mode).
+    if let Some(scusr) = cursor_shape {
+        out.extend_from_slice(scusr);
     }
 
     Ok(RefreshData {
@@ -1038,6 +1066,43 @@ mod scrollback_tests {
     // index of `needle`'s first occurrence in `haystack`, for ordering assertions
     fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    #[test]
+    fn do_refresh_restores_bar_cursor_with_blink() {
+        // Blinking bar (DECSCUSR 5) — what Neovim sets in insert mode.
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"\x1b[5 q");
+        let r = do_refresh(&terminal, 1).unwrap();
+        assert!(contains(&r.data, b"\x1b[5 q"), "missing blinking-bar DECSCUSR restore");
+    }
+
+    #[test]
+    fn do_refresh_restores_steady_underline_cursor() {
+        // Steady underline (DECSCUSR 4) — exercises shape + the steady (non-blink) code.
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"\x1b[4 q");
+        let r = do_refresh(&terminal, 1).unwrap();
+        assert!(contains(&r.data, b"\x1b[4 q"), "missing steady-underline DECSCUSR restore");
+    }
+
+    #[test]
+    fn do_refresh_restores_blinking_block_cursor() {
+        // Blinking block (DECSCUSR 1) differs from the model default (steady block),
+        // so blink must be restored even though the shape is the default block.
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"\x1b[1 q");
+        let r = do_refresh(&terminal, 1).unwrap();
+        assert!(contains(&r.data, b"\x1b[1 q"), "missing blinking-block DECSCUSR restore");
+    }
+
+    #[test]
+    fn do_refresh_omits_decscusr_for_default_cursor() {
+        // A fresh PTY (steady block) must NOT emit DECSCUSR, so the client's own
+        // configured default cursor is preserved across a switch.
+        let terminal = make_terminal(80, 24, 1000);
+        let r = do_refresh(&terminal, 1).unwrap();
+        assert!(!contains(&r.data, b" q"), "default cursor must not emit a DECSCUSR code");
     }
 
     #[test]

@@ -172,7 +172,7 @@ const RESET_TERMINAL_MODES: &str = concat!(
     "\x1b[<1u",     // pop one kitty keyboard stack level (undo a passed-through push)
     "\x1b[=0;1u",   // reset current kitty keyboard flags to 0
     "\x1b[>4;0m",   // disable xterm modifyOtherKeys
-    "\x1b[0q",      // reset cursor style to default
+    "\x1b[0 q",     // DECSCUSR: reset cursor shape to default (CSI Ps SP q — the space is required)
     "\x1b[?25h",    // show cursor
     "\x1b[?1l",     // DECCKM - normal cursor keys
     "\x1b>",        // DECNKM - normal keypad mode
@@ -1042,5 +1042,15 @@ mod tests {
         assert!(has(b"\x1b[<1u"), "reset must pop a passed-through kitty keyboard stack level");
         // xterm modifyOtherKeys
         assert!(has(b"\x1b[>4;0m"), "reset must disable xterm modifyOtherKeys");
+    }
+
+    #[test]
+    fn reset_resets_cursor_shape_with_decscusr() {
+        let bytes = RESET_TERMINAL_MODES.as_bytes();
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        // DECSCUSR is CSI Ps SP q — the space intermediate is required. CSI 0 q (no space)
+        // is DECLL (load LEDs), which does not touch the cursor shape.
+        assert!(has(b"\x1b[0 q"), "reset must reset cursor shape via DECSCUSR (CSI 0 SP q)");
+        assert!(!has(b"\x1b[0q"), "CSI 0 q without the space is DECLL, not a cursor-shape reset");
     }
 }
