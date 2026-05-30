@@ -5,6 +5,12 @@ enum EscapeState {
     AfterCtrlA,
     Escape,
     InCsi,
+    // After a Ctrl-A prefix we saw an ESC.  The pending Ctrl-A (0x01) has not
+    // been emitted yet: the ESC may begin a CSI-u encoded Ctrl-A, which would
+    // mean "Ctrl-A Ctrl-A" => SwitchRecent.  These two states defer that
+    // decision until the sequence resolves.
+    AfterCtrlAEscape,
+    AfterCtrlAInCsi,
 }
 
 pub(super) struct InputResult {
@@ -77,11 +83,7 @@ impl InputProcessor {
             EscapeState::AfterCtrlA => match byte {
                 0x00     => Some(InputAction::SwitchNext),
                 0x01     => Some(InputAction::SwitchRecent),
-                0x1B     => {
-                    to_send.push(0x01);
-                    self.state = EscapeState::Escape;
-                    None
-                }
+                0x1B     => { self.state = EscapeState::AfterCtrlAEscape; None }
                 b'a'     => { to_send.push(0x01); self.state = EscapeState::Normal; None }
                 b'c'     => Some(InputAction::Create),
                 b'F'     => Some(InputAction::ForceResize),
@@ -154,6 +156,69 @@ impl InputProcessor {
                     None
                 }
                 _ => {
+                    self.flush_csi(to_send);
+                    to_send.push(byte);
+                    self.state = EscapeState::Normal;
+                    None
+                }
+            },
+            // ESC seen after a Ctrl-A prefix; the leading Ctrl-A (0x01) is
+            // still pending and unemitted.
+            EscapeState::AfterCtrlAEscape => match byte {
+                b'[' => {
+                    self.seq_buf.clear();
+                    self.state = EscapeState::AfterCtrlAInCsi;
+                    None
+                }
+                _ => {
+                    // Not a CSI: this can't be a CSI-u Ctrl-A.  Emit the
+                    // pending Ctrl-A, then replay the ESC + this byte through
+                    // the normal Escape handling.
+                    to_send.push(0x01);
+                    self.state = EscapeState::Escape;
+                    self.process_byte(byte, to_send)
+                }
+            },
+            // CSI body following a Ctrl-A prefix, with the leading Ctrl-A still
+            // pending.  Identical to InCsi except that a non-Ctrl-A result
+            // first flushes the pending Ctrl-A, and a CSI-u Ctrl-A means the
+            // second of a "Ctrl-A Ctrl-A" => SwitchRecent.
+            EscapeState::AfterCtrlAInCsi => match byte {
+                0x20..=0x3F => {
+                    self.seq_buf.push(byte);
+                    if self.seq_buf.len() > 32 {
+                        to_send.push(0x01);
+                        self.flush_csi(to_send);
+                        self.state = EscapeState::Normal;
+                    }
+                    None
+                }
+                0x40..=0x7E => {
+                    match classify_csi(&self.seq_buf, byte) {
+                        CsiAction::CtrlA => Some(InputAction::SwitchRecent),
+                        CsiAction::Drop => {
+                            to_send.push(0x01);
+                            self.seq_buf.clear();
+                            self.state = EscapeState::Normal;
+                            None
+                        }
+                        CsiAction::Forward => {
+                            to_send.push(0x01);
+                            self.flush_csi(to_send);
+                            to_send.push(byte);
+                            self.state = EscapeState::Normal;
+                            None
+                        }
+                    }
+                }
+                0x1B => {
+                    to_send.push(0x01);
+                    self.flush_csi(to_send);
+                    self.state = EscapeState::Escape;
+                    None
+                }
+                _ => {
+                    to_send.push(0x01);
                     self.flush_csi(to_send);
                     to_send.push(byte);
                     self.state = EscapeState::Normal;
@@ -359,6 +424,61 @@ mod tests {
         let r = process(b"\x1b[97;6uc");
         assert!(matches!(r.action, Some(InputAction::Create)));
         assert!(r.write.is_empty());
+    }
+
+    #[test]
+    fn csi_u_ctrl_a_twice_switches_recent() {
+        let r = process(b"\x1b[97;5u\x1b[97;5u");
+        assert!(matches!(r.action, Some(InputAction::SwitchRecent)));
+        assert!(r.write.is_empty());
+    }
+
+    #[test]
+    fn raw_ctrl_a_then_csi_u_ctrl_a_switches_recent() {
+        let r = process(b"\x01\x1b[97;5u");
+        assert!(matches!(r.action, Some(InputAction::SwitchRecent)));
+        assert!(r.write.is_empty());
+    }
+
+    #[test]
+    fn csi_u_ctrl_a_then_raw_ctrl_a_switches_recent() {
+        let r = process(b"\x1b[97;5u\x01");
+        assert!(matches!(r.action, Some(InputAction::SwitchRecent)));
+        assert!(r.write.is_empty());
+    }
+
+    #[test]
+    fn csi_u_ctrl_a_twice_with_event_type_switches_recent() {
+        let r = process(b"\x1b[97;5u\x1b[97;5:1u");
+        assert!(matches!(r.action, Some(InputAction::SwitchRecent)));
+        assert!(r.write.is_empty());
+    }
+
+    #[test]
+    fn csi_u_ctrl_a_twice_split_across_reads() {
+        let mut proc = InputProcessor::new();
+        let r1 = proc.process(b"\x1b[97;5u\x1b[97");
+        assert!(r1.action.is_none());
+        assert!(r1.write.is_empty());
+        let r2 = proc.process(b";5u");
+        assert!(matches!(r2.action, Some(InputAction::SwitchRecent)));
+        assert!(r2.write.is_empty());
+    }
+
+    #[test]
+    fn csi_u_ctrl_a_then_arrow_emits_prefix_and_forwards() {
+        // Ctrl-A followed by a non-Ctrl-A escape sequence: the pending
+        // Ctrl-A is emitted, then the sequence is forwarded as-is.
+        let r = process(b"\x1b[97;5u\x1b[A");
+        assert!(r.action.is_none());
+        assert_eq!(r.write, b"\x01\x1b[A");
+    }
+
+    #[test]
+    fn csi_u_ctrl_a_then_alt_key_emits_prefix_and_forwards() {
+        let r = process(b"\x1b[97;5u\x1bx");
+        assert!(r.action.is_none());
+        assert_eq!(r.write, b"\x01\x1bx");
     }
 
     #[test]
