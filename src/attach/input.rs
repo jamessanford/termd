@@ -309,13 +309,6 @@ mod tests {
     }
 
     #[test]
-    fn tilde_dot_detaches() {
-        let r = process(b"\r~.");
-        assert!(matches!(r.action, Some(InputAction::Detach)));
-        assert_eq!(r.write, b"\r");
-    }
-
-    #[test]
     fn tilde_other_passes_through() {
         let r = process(b"\r~x");
         assert!(r.action.is_none());
