@@ -990,4 +990,60 @@ mod scrollback_tests {
         assert!(result.data.is_empty());
         assert_eq!(result.total_scrollback_rows, total);
     }
+
+    // --- FFI selection-pointer regression guards ----------------------------
+    //
+    // do_refresh and do_scrollback build a `Selection` from grid_refs and hand
+    // it across the FFI boundary to the libghostty-vt formatter. A dangling
+    // selection pointer on the Rust side (e.g. a libghostty-rs change that
+    // reintroduces the `&s.inner`-from-a-match-arm use-after-free) corrupts the
+    // page-list pin and segfaults inside Ghostty's page iterator. These render
+    // real content through both paths so a reintroduced bug fails the suite.
+    //
+    // The use-after-free faults *reliably* only under `--release`; in a debug
+    // build the freed stack slot usually still holds valid bytes, so a debug run
+    // may not fault. Run `cargo test --release` for the dependable check.
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn do_refresh_renders_selection_content() {
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"Hello World");
+        let r = do_refresh(&terminal, 7).unwrap();
+        assert_eq!(r.generation, 7);
+        assert!(!r.data.is_empty(), "do_refresh produced no output");
+        assert!(
+            contains(&r.data, b"Hello World"),
+            "rendered output missing the screen content (selection path broken?)"
+        );
+    }
+
+    #[test]
+    fn do_refresh_empty_terminal_does_not_crash() {
+        let terminal = make_terminal(80, 24, 1000);
+        let r = do_refresh(&terminal, 1).unwrap();
+        assert_eq!(r.generation, 1);
+    }
+
+    #[test]
+    fn do_scrollback_renders_history_content() {
+        let mut terminal = make_terminal(80, 5, 1000);
+        // 12 lines into a 5-row screen pushes 7 rows of history above the screen.
+        for i in 0..12u8 {
+            terminal.vt_write(format!("line{}\r\n", i).as_bytes());
+        }
+        let total = terminal.total_rows().unwrap() as u32;
+        // Full buffer (history + active) exercises the Point::Screen selection path.
+        let r = do_scrollback(&terminal, 0, total, 9, 80).unwrap();
+        assert_eq!(r.generation, 9);
+        assert_eq!(r.total_scrollback_rows, total);
+        assert!(!r.data.is_empty(), "do_scrollback produced no output");
+        assert!(
+            contains(&r.data, b"line0"),
+            "scrollback output missing an early history line (selection path broken?)"
+        );
+    }
 }
