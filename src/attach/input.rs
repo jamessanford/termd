@@ -246,11 +246,10 @@ fn classify_csi(content: &[u8], final_byte: u8) -> CsiAction {
         .unwrap_or(rest.len());
     let params = &rest[..param_end];
 
-    if final_byte == b'u' && private.is_none() && param_end == rest.len() {
-        if is_csi_u_ctrl_a(params) {
+    if final_byte == b'u' && private.is_none() && param_end == rest.len()
+        && is_csi_u_ctrl_a(params) {
             return CsiAction::CtrlA;
         }
-    }
 
     match (private, final_byte) {
         (Some(b'?'), b'c') => CsiAction::Drop, // DA1
