@@ -86,6 +86,9 @@ enum Cmd {
     List {
         #[command(flatten)]
         conn: ConnectionArgs,
+        /// Auth token (required when connecting over TCP)
+        #[arg(long)]
+        token: Option<String>,
         #[arg(long, help = "Show subscribers for each PTY")]
         verbose: bool,
     },
@@ -99,12 +102,18 @@ enum Cmd {
         cmd: Option<String>,
         #[command(flatten)]
         conn: ConnectionArgs,
+        /// Auth token (required when connecting over TCP)
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Destroy a PTY
     Destroy {
         pty_id: String,
         #[command(flatten)]
         conn: ConnectionArgs,
+        /// Auth token (required when connecting over TCP)
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Resize a PTY's columns and rows on the server
     Resize {
@@ -113,6 +122,9 @@ enum Cmd {
         rows: u32,
         #[command(flatten)]
         conn: ConnectionArgs,
+        /// Auth token (required when connecting over TCP)
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Inject text to a PTY
     Send {
@@ -120,6 +132,9 @@ enum Cmd {
         text: String,
         #[command(flatten)]
         conn: ConnectionArgs,
+        /// Auth token (required when connecting over TCP)
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -155,8 +170,8 @@ async fn main() -> Result<()> {
             server::serve(registry, &socket, listen, token, log_grpc).await?;
         }
 
-        Cmd::List { conn, verbose } => {
-            let mut client = connect_client(conn.destination(), None).await?;
+        Cmd::List { conn, token, verbose } => {
+            let mut client = connect_client(conn.destination(), token).await?;
             let resp = send_recv(&mut client, Command::List(ListRequest {})).await?;
             match resp.response {
                 Some(Response::List(l)) => {
@@ -186,8 +201,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Create { cols, rows, cmd, conn } => {
-            let mut client = connect_client(conn.destination(), None).await?;
+        Cmd::Create { cols, rows, cmd, conn, token } => {
+            let mut client = connect_client(conn.destination(), token).await?;
             let resp = send_recv(
                 &mut client,
                 Command::Create(CreateRequest { cols, rows, command: cmd }),
@@ -201,8 +216,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Destroy { pty_id, conn } => {
-            let mut client = connect_client(conn.destination(), None).await?;
+        Cmd::Destroy { pty_id, conn, token } => {
+            let mut client = connect_client(conn.destination(), token).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             let resp = send_recv(
                 &mut client,
@@ -222,8 +237,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Send { pty_id, text, conn } => {
-            let mut client = connect_client(conn.destination(), None).await?;
+        Cmd::Send { pty_id, text, conn, token } => {
+            let mut client = connect_client(conn.destination(), token).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             let data = text.into_bytes();
             let resp = send_recv(&mut client, Command::Write(WriteRequest { pty_id, data })).await?;
@@ -236,8 +251,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Resize { pty_id, cols, rows, conn } => {
-            let mut client = connect_client(conn.destination(), None).await?;
+        Cmd::Resize { pty_id, cols, rows, conn, token } => {
+            let mut client = connect_client(conn.destination(), token).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             let resp = send_recv(
                 &mut client,
