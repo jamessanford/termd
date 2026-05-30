@@ -6,7 +6,7 @@ termd is written using Claude Sonnet 4.6, Claude Opus 4.7, and Claude Code.
 
 ### Build/Run
 
-Try [`cargo release-static`](.cargo/config.toml) to build a version with a static libghostty linked in.  You need Zig 0.15 installed.
+Try `cargo build --release`.  You need Zig 0.15 installed.
 
 ```
 ./target/release/termd start &
