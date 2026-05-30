@@ -168,6 +168,11 @@ impl TerminalService for TerminalServiceImpl {
             }
 
             // Disconnect cleanup: remove this client from every subscribed PTY
+            tracing::debug!(
+                subscriber_id = %subscriber_id,
+                ptys = ?subscribed_ids,
+                "stream ended, reaping subscriber"
+            );
             for &pty_id in &subscribed_ids {
                 if let Some(handle) = registry.get(pty_id) {
                     handle.remove_subscriber(&subscriber_id);
@@ -247,7 +252,11 @@ pub async fn serve(
                     UnixListenerStream::new(unix_listener),
                     async move { let _ = shutdown_rx1.recv().await; },
                 ),
+            // Make sure we eventually timeout and remove TCP clients that have vanished.
             Server::builder()
+                .http2_keepalive_interval(Some(std::time::Duration::from_secs(60)))
+                .http2_keepalive_timeout(Some(std::time::Duration::from_secs(20)))
+                .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
                 .add_service(svc_tcp)
                 .serve_with_incoming_shutdown(
                     TcpListenerStream::new(tcp_listener),
