@@ -189,7 +189,7 @@ async fn main() -> Result<()> {
                             if verbose {
                                 for sub in &item.subscribers {
                                     println!(
-                                        "  ( {:<36} {} {}x{} )",
+                                        "    ( {:<36} {} {}x{} )",
                                         sub.subscriber_id, sub.hostname, sub.cols, sub.rows
                                     );
                                 }
