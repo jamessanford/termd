@@ -132,6 +132,7 @@ pub fn handle_destroy(
     }
     subscribed_ids.remove(&id);
     if let Some(handle) = registry.get(id) {
+        handle.close_scrollback(subscriber_id);
         handle.remove_subscriber(subscriber_id);
         // No SUBSCRIBERS_CHANGED broadcast here — CLOSED (emitted by reader_thread on child exit)
         // is the terminal event for subscribers. Broadcasting SUBSCRIBERS_CHANGED on destroy would
@@ -252,6 +253,7 @@ pub fn handle_unsubscribe(
     }
     subscribed_ids.remove(&id);
     if let Some(handle) = registry.get(id) {
+        handle.close_scrollback(subscriber_id);
         handle.remove_subscriber(subscriber_id);
         handle.broadcast_metadata(Arc::new(PtyMetadata {
             reason:     MetadataReason::SubscribersChanged,

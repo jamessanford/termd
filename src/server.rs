@@ -175,6 +175,7 @@ impl TerminalService for TerminalServiceImpl {
             );
             for &pty_id in &subscribed_ids {
                 if let Some(handle) = registry.get(pty_id) {
+                    handle.close_scrollback(&subscriber_id);
                     handle.remove_subscriber(&subscriber_id);
                     handle.broadcast_metadata(Arc::new(PtyMetadata {
                         reason:     MetadataReason::SubscribersChanged,
