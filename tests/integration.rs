@@ -912,3 +912,70 @@ async fn test_subscribe_shrinks_pty_for_single_smaller_client() {
     assert_eq!((item.cols, item.rows), (70, 20), "a single smaller client should shrink the PTY");
     drop(cmd_tx);
 }
+
+#[tokio::test]
+async fn test_subscribe_does_not_shrink_for_multiple_subscribers() {
+    use termd::proto::{
+        terminal_command::Command, terminal_response::Response,
+        TerminalCommand, SubscribeRequest,
+    };
+
+    let (_dir, mut client) = test_server().await;
+
+    // Create a PTY at 80x24.
+    let resp = send_recv(&mut client, Command::Create(CreateRequest {
+        cols: 80, rows: 24, command: None,
+    })).await;
+    let pty_id = match resp.response.unwrap() {
+        Response::Create(c) => c.item.unwrap().pty_id,
+        other => panic!("expected Create, got {other:?}"),
+    };
+
+    // Subscriber A (100x40) on its own connection. As the sole subscriber the PTY
+    // tracks it exactly and grows to 100x40.
+    let (cmd_tx_a, cmd_rx_a) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
+    let mut resp_a = client
+        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx_a))
+        .await.unwrap().into_inner();
+    cmd_tx_a.send(TerminalCommand {
+        command: Some(Command::Subscribe(SubscribeRequest {
+            pty_id, hostname: "a".into(), cols: 100, rows: 40,
+        })),
+    }).await.unwrap();
+    loop {
+        match resp_a.message().await.unwrap().unwrap().response.unwrap() {
+            Response::Subscribe(s) if s.success => break,
+            _ => {}
+        }
+    }
+
+    // Subscriber B (70x20) joins on a separate connection. With two subscribers the
+    // grow-only policy applies: the PTY must NOT shrink to the smaller client.
+    let (cmd_tx_b, cmd_rx_b) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
+    let mut resp_b = client
+        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx_b))
+        .await.unwrap().into_inner();
+    cmd_tx_b.send(TerminalCommand {
+        command: Some(Command::Subscribe(SubscribeRequest {
+            pty_id, hostname: "b".into(), cols: 70, rows: 20,
+        })),
+    }).await.unwrap();
+    loop {
+        match resp_b.message().await.unwrap().unwrap().response.unwrap() {
+            Response::Subscribe(s) if s.success => break,
+            _ => {}
+        }
+    }
+
+    // Both subscribers stay attached (cmd_tx_a/cmd_tx_b alive). The PTY must remain
+    // at the larger size rather than shrinking to B.
+    let resp = send_recv(&mut client, Command::List(ListRequest {})).await;
+    let item = match resp.response.unwrap() {
+        Response::List(l) => l.items.into_iter().find(|i| i.pty_id == pty_id).expect("PTY in list"),
+        other => panic!("expected List, got {other:?}"),
+    };
+    assert_eq!((item.cols, item.rows), (100, 40),
+        "with multiple subscribers the PTY must not shrink to a smaller client");
+    drop(cmd_tx_a);
+    drop(cmd_tx_b);
+}
