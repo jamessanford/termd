@@ -769,7 +769,12 @@ fn reader_thread(
     let mut terminal = match Terminal::new(TerminalOptions {
         cols: init_cols as u16,
         rows: init_rows as u16,
-        max_scrollback: 1_000_000, // NOTE: this is bytes of scrollback, not lines
+        // Byte budget for scrollback page memory, NOT a line count. libghostty
+        // allocates whole ~0.5 MB pages (a page is sized for a 215x215 grid; each
+        // Cell is 8 bytes), and every row costs cols*8 bytes regardless of how few
+        // glyphs it holds. Rough rule at 80 cols: ~2 KB/line, so 16 MB ≈ ~8k lines
+        // (proportionally fewer on wider terminals).
+        max_scrollback: 16_000_000,
     }) {
         Ok(t) => t,
         Err(e) => {
