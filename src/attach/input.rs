@@ -88,7 +88,7 @@ impl InputProcessor {
                 b'c'     => Some(InputAction::Create),
                 b'F'     => Some(InputAction::ForceResize),
                 b'R'     => Some(InputAction::ForceRefresh),
-                b'"'     => Some(InputAction::ShowList),
+                b'"' | b'w' => Some(InputAction::ShowList),
                 b'i'     => Some(InputAction::ShowInfo),
                 b'k'     => Some(InputAction::Destroy),
                 b's'     => Some(InputAction::ShowScrollback),
