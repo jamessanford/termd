@@ -31,13 +31,20 @@ message WriteRequest       { uint64 pty_id = 1; bytes data = 2; }
 message ResizeRequest      { uint64 pty_id = 1; uint32 cols = 2; uint32 rows = 3; }
 message SetTitleRequest    { uint64 pty_id = 1; string title = 2; }
 message RefreshRequest     { uint64 pty_id = 1; }
+enum ScrollbackOp {
+  SCROLLBACK_OP_OPEN  = 0;  // place pin at the live tail (row_offset 0); amount ignored
+  SCROLLBACK_OP_MOVE  = 1;  // move pin by `amount` rows; + = older/up, - = newer/down
+  SCROLLBACK_OP_CLOSE = 2;  // remove the pin; no data returned
+}
+
 message ScrollbackRequest {
-  uint64 pty_id     = 1;
-  // Distance from the active-screen edge, in rows.
-  // 0 = the bottom of the active screen
-  uint32 row_offset = 2;
-  // Maximum number of scrollback rows to return. Must be > 0; 0 returns empty data.
-  uint32 row_count  = 3;
+  uint64       pty_id    = 1;
+  reserved                 2;   // was row_offset
+  // Viewport height in rows.
+  uint32       row_count = 3;
+  ScrollbackOp op        = 4;
+  // MOVE only; signed row delta (+ older / up, - newer / down).
+  sint32       amount    = 5;
 }
 
 message TerminalResponse {
@@ -86,6 +93,8 @@ message ScrollbackResponse {
   uint64 generation            = 2;
   bytes  data                  = 3;
   uint32 total_scrollback_rows = 4;
+  // Viewport bottom-edge distance from the live tail (0 = tail).
+  uint32 row_offset            = 5;
 }
 
 message SubscriberInfo {

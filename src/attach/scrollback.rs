@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use termd::proto::{
     terminal_command::Command,
     terminal_response::Response,
-    ScrollbackRequest, ScrollbackResponse,
+    ScrollbackOp, ScrollbackRequest, ScrollbackResponse,
     TerminalCommand, TerminalResponse,
 };
 
@@ -34,6 +34,21 @@ pub(super) async fn show_scrollback(
     Ok(())
 }
 
+/// Map a raw input chunk to a scrollback intent. `rows` is the viewport height
+/// (a page). Returns None for keys that exit the pager.
+fn key_to_op(buf: &[u8], rows: u32) -> Option<(ScrollbackOp, i32)> {
+    let page = rows as i32;
+    match buf {
+        [0x1b, b'[', b'A', ..] => Some((ScrollbackOp::Move, 1)),   // Up: older
+        [0x1b, b'[', b'B', ..] => Some((ScrollbackOp::Move, -1)),  // Down: newer
+        [0x02] | [b'b']        => Some((ScrollbackOp::Move, page)),  // Ctrl-B / b: page older
+        [0x06] | [b'f']        => Some((ScrollbackOp::Move, -page)), // Ctrl-F / f: page newer
+        [b'g']                 => Some((ScrollbackOp::Move, i32::MAX)), // g: oldest (server clamps)
+        [b'G']                 => Some((ScrollbackOp::Open, 0)),     // G: jump to live tail
+        _ => None,
+    }
+}
+
 async fn run_scrollback(
     cmd_tx:  &mpsc::Sender<TerminalCommand>,
     resp_rx: &mut tonic::Streaming<TerminalResponse>,
@@ -42,11 +57,11 @@ async fn run_scrollback(
     stdin:   &mut tokio::io::Stdin,
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
-    let mut row_offset: u32 = 0;
     let mut buf = [0u8; 8];
 
-    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
-    let mut total = resp.total_scrollback_rows;
+    // Enter: place the pin at the live tail.
+    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, ScrollbackOp::Open, 0, rows).await?;
+    let total = resp.total_scrollback_rows;
 
     if total == 0 {
         let _ = std::io::stdout().write_all(
@@ -54,80 +69,54 @@ async fn run_scrollback(
         );
         let _ = std::io::stdout().flush();
         let _ = stdin.read(&mut buf).await;
+        // No pin to release in the empty case, but CLOSE is harmless/cheap.
+        let _ = fetch_scrollback(cmd_tx, resp_rx, pty_id, ScrollbackOp::Close, 0, 0).await;
         return Ok(());
     }
 
-    display_page(&resp.data, row_offset, total, rows);
+    display_page(&resp.data, resp.row_offset, total, rows);
 
     loop {
         let n = match stdin.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
+        let chunk = &buf[..n];
 
-        match &buf[..n] {
-            [0x1b, b'[', b'A', ..]
-                if row_offset < max_row_offset(total, rows) => {
-                    row_offset += 1;
-                    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
-                    total = resp.total_scrollback_rows;
-                    display_page(&resp.data, row_offset, total, rows);
+        // ESC alone (not an arrow sequence) exits; ESC[ A/B are arrows.
+        if chunk == [0x1b] {
+            let mut rest = [0u8; 2];
+            let extra = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                stdin.read(&mut rest),
+            ).await.ok().and_then(|r| r.ok());
+            match extra {
+                Some(2) if rest[0] == b'[' && rest[1] == b'A' => {
+                    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, ScrollbackOp::Move, 1, rows).await?;
+                    display_page(&resp.data, resp.row_offset, resp.total_scrollback_rows, rows);
                 }
-            [0x1b, b'[', b'B', ..]
-                if row_offset > 0 => {
-                    row_offset -= 1;
-                    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
-                    total = resp.total_scrollback_rows;
-                    display_page(&resp.data, row_offset, total, rows);
+                Some(2) if rest[0] == b'[' && rest[1] == b'B' => {
+                    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, ScrollbackOp::Move, -1, rows).await?;
+                    display_page(&resp.data, resp.row_offset, resp.total_scrollback_rows, rows);
                 }
-            [0x02] | [b'b'] => {  // Ctrl-B / f: page back (further into history)
-                let max = max_row_offset(total, rows);
-                if row_offset < max {
-                    row_offset = (row_offset + rows).min(max);
-                    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
-                    total = resp.total_scrollback_rows;
-                    display_page(&resp.data, row_offset, total, rows);
-                }
+                _ => break, // bare ESC: exit
             }
-            [0x06] | [b'f'] // Ctrl-F / f: page forward (towards active screen)
-                if row_offset > 0 => {
-                    row_offset = row_offset.saturating_sub(rows);
-                    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
-                    total = resp.total_scrollback_rows;
-                    display_page(&resp.data, row_offset, total, rows);
-                }
-            [0x11] => break, // Ctrl-Q: exit
-            [b'q'] => break,
-            [0x1b] => {
-                let mut rest = [0u8; 2];
-                let extra = tokio::time::timeout(
-                    std::time::Duration::from_millis(50),
-                    stdin.read(&mut rest),
-                ).await.ok().and_then(|r| r.ok());
-                match extra {
-                    Some(2) if rest[0] == b'[' && rest[1] == b'A' => {
-                        if row_offset < max_row_offset(total, rows) {
-                            row_offset += 1;
-                            let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
-                            total = resp.total_scrollback_rows;
-                            display_page(&resp.data, row_offset, total, rows);
-                        }
-                    }
-                    Some(2) if rest[0] == b'[' && rest[1] == b'B' => {
-                        if row_offset > 0 {
-                            row_offset -= 1;
-                            let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, row_offset, rows).await?;
-                            total = resp.total_scrollback_rows;
-                            display_page(&resp.data, row_offset, total, rows);
-                        }
-                    }
-                    _ => break,
-                }
-            }
-            _ => {}
+            continue;
+        }
+
+        // Ctrl-Q / q: exit.
+        if chunk == [0x11] || chunk == [b'q'] {
+            break;
+        }
+
+        if let Some((op, amount)) = key_to_op(chunk, rows) {
+            let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, op, amount, rows).await?;
+            display_page(&resp.data, resp.row_offset, resp.total_scrollback_rows, rows);
         }
     }
 
+    // Exit: release the pin (best-effort).
+    let _ = fetch_scrollback(cmd_tx, resp_rx, pty_id, ScrollbackOp::Close, 0, 0).await;
     Ok(())
 }
 
@@ -135,13 +124,15 @@ async fn fetch_scrollback(
     cmd_tx:     &mpsc::Sender<TerminalCommand>,
     resp_rx:    &mut tonic::Streaming<TerminalResponse>,
     pty_id:     u64,
-    row_offset: u32,
+    op:         ScrollbackOp,
+    amount:     i32,
     row_count:  u32,
 ) -> Result<ScrollbackResponse> {
     cmd_tx.send(TerminalCommand {
         command: Some(Command::Scrollback(ScrollbackRequest {
             pty_id,
-            row_offset,
+            op: op as i32,
+            amount,
             row_count,
         })),
     }).await?;
@@ -166,16 +157,12 @@ fn display_page(data: &[u8], row_offset: u32, total: u32, rows: u32) {
     let _ = std::io::stdout().flush();
 }
 
-fn max_row_offset(total: u32, rows: u32) -> u32 {
-    total.saturating_sub(rows)
-}
-
 fn format_page(data: &[u8], row_offset: u32, total: u32, rows: u32) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[2J\x1b[H");
     out.extend_from_slice(data);
     let status = format!(
-        "\x1b[{rows};1H\x1b[2K\x1b[7m SCROLLBACK  row {} / {}  (q/ESC exit  ^B/^F page  ↑↓ line) \x1b[0m",
+        "\x1b[{rows};1H\x1b[2K\x1b[7m SCROLLBACK  row {} / {}  (q/ESC exit  ^B/^F page  ↑↓ line  g/G top/tail) \x1b[0m",
         row_offset + 1, total,
     );
     out.extend_from_slice(status.as_bytes());
@@ -187,18 +174,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn max_row_offset_exact_fit() {
-        assert_eq!(max_row_offset(24, 24), 0);
+    fn key_up_moves_one_row_older() {
+        assert_eq!(key_to_op(&[0x1b, b'[', b'A'], 24), Some((ScrollbackOp::Move, 1)));
     }
 
     #[test]
-    fn max_row_offset_more_than_screen() {
-        assert_eq!(max_row_offset(100, 24), 76);
+    fn key_down_moves_one_row_newer() {
+        assert_eq!(key_to_op(&[0x1b, b'[', b'B'], 24), Some((ScrollbackOp::Move, -1)));
     }
 
     #[test]
-    fn max_row_offset_less_than_screen() {
-        assert_eq!(max_row_offset(10, 24), 0);
+    fn key_page_back_moves_a_screenful_older() {
+        assert_eq!(key_to_op(&[0x02], 24), Some((ScrollbackOp::Move, 24)));   // Ctrl-B
+        assert_eq!(key_to_op(b"b", 24), Some((ScrollbackOp::Move, 24)));
+    }
+
+    #[test]
+    fn key_page_forward_moves_a_screenful_newer() {
+        assert_eq!(key_to_op(&[0x06], 24), Some((ScrollbackOp::Move, -24)));  // Ctrl-F
+        assert_eq!(key_to_op(b"f", 24), Some((ScrollbackOp::Move, -24)));
+    }
+
+    #[test]
+    fn key_home_jumps_to_oldest_end_jumps_to_tail() {
+        assert_eq!(key_to_op(b"g", 24), Some((ScrollbackOp::Move, i32::MAX)));   // g: top
+        assert_eq!(key_to_op(b"G", 24), Some((ScrollbackOp::Open, 0)));          // G: tail
+    }
+
+    #[test]
+    fn key_quit_returns_none() {
+        assert_eq!(key_to_op(b"q", 24), None);
+        assert_eq!(key_to_op(&[0x11], 24), None); // Ctrl-Q
     }
 
     #[test]

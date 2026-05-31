@@ -15,7 +15,8 @@ use libghostty_vt::render::CursorVisualStyle;
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
 use libghostty_vt::screen::Screen;
 use libghostty_vt::selection::Selection;
-use libghostty_vt::terminal::{Point, PointCoordinate};
+use libghostty_vt::screen::TrackedGridRef;
+use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace};
 use nix::{
     pty::openpty,
     sys::signal::{Signal, kill},
@@ -90,6 +91,22 @@ pub struct ScrollbackData {
     pub generation: u64,
     pub data: Bytes,
     pub total_scrollback_rows: u32,
+    /// Viewport bottom-edge distance from the live tail (0 = tail).
+    pub row_offset: u32,
+}
+
+/// Imperative scrollback intent. The pin's position lives on the server; the
+/// client only places (`Open`), nudges (`Move`), or removes (`Close`) it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollbackOp { Open, Move, Close }
+
+/// One scrollback request handed to the reader thread over `scrollback_tx`.
+struct ScrollbackReq {
+    subscriber_id: String,
+    op: ScrollbackOp,
+    amount: i32,
+    row_count: u32,
+    reply: oneshot::Sender<Result<ScrollbackData>>,
 }
 
 pub struct PtyHandle {
@@ -103,7 +120,7 @@ pub struct PtyHandle {
     tx: broadcast::Sender<PtyEvent>,
     writer: Mutex<File>,
     refresh_tx:    std::sync::mpsc::SyncSender<oneshot::Sender<Result<RefreshData>>>,
-    scrollback_tx: std::sync::mpsc::SyncSender<(u32, u32, oneshot::Sender<Result<ScrollbackData>>)>,
+    scrollback_tx: std::sync::mpsc::SyncSender<ScrollbackReq>,
     resize_tx:     std::sync::mpsc::SyncSender<(u32, u32)>,
     meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
     generation: Arc<AtomicU64>,
@@ -205,16 +222,34 @@ impl PtyHandle {
         rx.await.map_err(|_| anyhow!("PTY reader thread dropped refresh response"))?
     }
 
-    pub async fn scrollback(&self, row_offset: u32, row_count: u32) -> Result<ScrollbackData> {
+    pub async fn scrollback(
+        &self,
+        subscriber_id: &str,
+        op: ScrollbackOp,
+        amount: i32,
+        row_count: u32,
+    ) -> Result<ScrollbackData> {
         let (tx, rx) = oneshot::channel();
-        self.scrollback_tx.send((row_offset, row_count, tx))
-            .map_err(|_| anyhow!("PTY reader thread is dead"))?;
+        self.scrollback_tx.send(ScrollbackReq {
+            subscriber_id: subscriber_id.to_owned(), op, amount, row_count, reply: tx,
+        }).map_err(|_| anyhow!("PTY reader thread is dead"))?;
         let wfd = self.wakeup_write.as_raw_fd();
         let ret = unsafe { libc::write(wfd, [1u8].as_ptr() as *const libc::c_void, 1) };
         if ret < 0 {
             tracing::debug!("wakeup write failed: {}", std::io::Error::last_os_error());
         }
         rx.await.map_err(|_| anyhow!("PTY reader thread dropped scrollback response"))?
+    }
+
+    /// Best-effort release of a subscriber's scrollback pin (teardown paths).
+    pub fn close_scrollback(&self, subscriber_id: &str) {
+        let (tx, _rx) = oneshot::channel();
+        let _ = self.scrollback_tx.try_send(ScrollbackReq {
+            subscriber_id: subscriber_id.to_owned(),
+            op: ScrollbackOp::Close, amount: 0, row_count: 0, reply: tx,
+        });
+        let wfd = self.wakeup_write.as_raw_fd();
+        let _ = unsafe { libc::write(wfd, [1u8].as_ptr() as *const libc::c_void, 1) };
     }
 
     pub fn id(&self) -> u64 {
@@ -343,7 +378,7 @@ impl PtyRegistry {
         let (refresh_tx, refresh_rx) =
             std::sync::mpsc::sync_channel::<oneshot::Sender<Result<RefreshData>>>(8);
         let (scrollback_tx, scrollback_rx) =
-            std::sync::mpsc::sync_channel::<(u32, u32, oneshot::Sender<Result<ScrollbackData>>)>(8);
+            std::sync::mpsc::sync_channel::<ScrollbackReq>(8);
         let (resize_tx, resize_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(8);
         let generation = Arc::new(AtomicU64::new(0));
 
@@ -606,23 +641,54 @@ fn do_refresh(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn do_scrollback(
-    terminal:   &Terminal<'static, 'static>,
-    row_offset: u32,
-    row_count:  u32,
-    generation: u64,
-    cols:       u32,
+    terminal:      &mut Terminal<'static, 'static>,
+    pins:          &mut HashMap<String, TrackedGridRef>,
+    subscriber_id: &str,
+    op:            ScrollbackOp,
+    amount:        i32,
+    row_count:     u32,
+    generation:    u64,
+    cols:          u32,
 ) -> Result<ScrollbackData> {
-    // Screen space covers history + active screen; y=0 is oldest history, y=total-1
-    // is the last row of the active screen. row_offset=0 therefore starts from the
-    // visible screen and increases upward into history.
     let total = terminal.total_rows()? as u32;
 
-    if total == 0 || row_count == 0 {
-        return Ok(ScrollbackData { generation, data: Bytes::new(), total_scrollback_rows: total });
+    // CLOSE: drop the pin, return nothing.
+    if op == ScrollbackOp::Close {
+        pins.remove(subscriber_id);
+        return Ok(ScrollbackData { generation, data: Bytes::new(), total_scrollback_rows: total, row_offset: 0 });
     }
-    if row_offset >= total {
-        return Ok(ScrollbackData { generation, data: Bytes::new(), total_scrollback_rows: total });
+
+    if total == 0 || row_count == 0 {
+        return Ok(ScrollbackData { generation, data: Bytes::new(), total_scrollback_rows: total, row_offset: 0 });
+    }
+
+    // Screen space: y=0 oldest history, y=total-1 live tail. The pin marks the
+    // viewport's top row. max_start keeps a full viewport ending at the tail.
+    let max_start = total.saturating_sub(row_count);
+
+    let start_y: u32 = match op {
+        ScrollbackOp::Open => max_start,
+        ScrollbackOp::Move => {
+            // Current pin row (Screen y); falls back to the tail if there's no
+            // pin yet or it can't be resolved (treat as OPEN).
+            let base = pins.get(subscriber_id)
+                .and_then(|p| p.point(PointSpace::Screen).ok().flatten())
+                .map(|c| c.y.min(total - 1))
+                .unwrap_or(max_start);
+            // + amount = older/up = decrease y; - amount = newer/down = increase y.
+            let moved = (base as i64) - (amount as i64);
+            moved.clamp(0, max_start as i64) as u32
+        }
+        ScrollbackOp::Close => unreachable!("handled above"),
+    };
+
+    // (Re)place the pin at the resolved top row.
+    let pin_point = Point::Screen(PointCoordinate { x: 0, y: start_y });
+    match pins.get_mut(subscriber_id) {
+        Some(p) => { p.set(terminal, pin_point)?; }
+        None    => { let p = terminal.track_grid_ref(pin_point)?; pins.insert(subscriber_id.to_owned(), p); }
     }
 
     // Helper closure: FormatterTerminalExtra with all flags false.
@@ -648,38 +714,12 @@ fn do_scrollback(
         },
     };
 
-    // Full-buffer case: use Point::Screen endpoints to cover history + active screen.
     // NOTE: grid_ref(Point::Screen(...)) traverses the internal scrollback page list to
     // locate the target row, which is O(scrollback_depth). If scrollback requests become a
     // latency concern (do_scrollback runs on the reader thread, blocking live PTY I/O),
     // consider offloading to a background thread.
-    if row_offset == 0 && row_count >= total {
-        let top_left = terminal.grid_ref(Point::Screen(PointCoordinate { x: 0, y: 0 }))?;
-        let bot_right = terminal.grid_ref(Point::Screen(PointCoordinate {
-            x: cols.saturating_sub(1) as u16,
-            y: total - 1,
-        }))?;
-        let selection = Selection::new(top_left, bot_right, false);
-        let mut fmt = Formatter::new(terminal, FormatterOptions {
-            format: Format::Vt,
-            trim: false,
-            unwrap: false,
-            selection: Some(selection),
-            extra: make_extra(),
-        })?;
-        let vt = fmt.format_alloc(None)?;
-        return Ok(ScrollbackData {
-            generation,
-            data: Bytes::from(vt.to_vec()),
-            total_scrollback_rows: total,
-        });
-    }
-
-    // Partial range: convert row_offset (distance from bottom of screen) to Point::Screen y-coords.
-    // Screen: y=0 = oldest history row, y=total-1 = last row of active screen.
-    let end_y   = total - 1 - row_offset;
-    let rows    = row_count.min(end_y + 1);
-    let start_y = end_y + 1 - rows;
+    let render_rows = row_count.min(total - start_y);
+    let end_y = start_y + render_rows - 1;
 
     let top_left = terminal.grid_ref(Point::Screen(PointCoordinate { x: 0, y: start_y }))?;
     let bot_right = terminal.grid_ref(Point::Screen(PointCoordinate {
@@ -696,10 +736,13 @@ fn do_scrollback(
         extra: make_extra(),
     })?;
     let vt = fmt.format_alloc(None)?;
+
+    let row_offset = total - 1 - end_y;
     Ok(ScrollbackData {
         generation,
         data: Bytes::from(vt.to_vec()),
         total_scrollback_rows: total,
+        row_offset,
     })
 }
 
@@ -710,7 +753,7 @@ fn reader_thread(
     tx: broadcast::Sender<PtyEvent>,
     generation: Arc<AtomicU64>,
     refresh_rx: std::sync::mpsc::Receiver<oneshot::Sender<Result<RefreshData>>>,
-    scrollback_rx: std::sync::mpsc::Receiver<(u32, u32, oneshot::Sender<Result<ScrollbackData>>)>,
+    scrollback_rx: std::sync::mpsc::Receiver<ScrollbackReq>,
     resize_rx: std::sync::mpsc::Receiver<(u32, u32)>,
     wakeup_read: OwnedFd,
     mut child: std::process::Child,
@@ -747,6 +790,9 @@ fn reader_thread(
 
     let mut current_cols = init_cols;
     let mut current_rows = init_rows;
+    // One scrollback pin per subscriber; the pin marks the viewport's top row and
+    // libghostty keeps it on its content across appends and eviction.
+    let mut scrollback_pins: HashMap<String, TrackedGridRef> = HashMap::new();
     // Initialize prev_title to match the initial title mutex value (pts_name),
     // so we don't emit a spurious TitleChanged before the shell sets any title.
     let mut prev_title = pts_name.clone();
@@ -780,10 +826,13 @@ fn reader_thread(
             let result = do_refresh(&terminal, gen);
             let _ = reply_tx.send(result);
         }
-        while let Ok((row_offset, row_count, reply_tx)) = scrollback_rx.try_recv() {
+        while let Ok(req) = scrollback_rx.try_recv() {
             let gen = generation.load(Ordering::Relaxed);
-            let result = do_scrollback(&terminal, row_offset, row_count, gen, current_cols);
-            let _ = reply_tx.send(result);
+            let result = do_scrollback(
+                &mut terminal, &mut scrollback_pins, &req.subscriber_id,
+                req.op, req.amount, req.row_count, gen, current_cols,
+            );
+            let _ = req.reply.send(result);
         }
 
         // Poll both the PTY master and the wakeup pipe.  Writes to wakeup_write
@@ -932,10 +981,13 @@ fn reader_thread(
         let result = do_refresh(&terminal, gen);
         let _ = reply_tx.send(result);
     }
-    while let Ok((row_offset, row_count, reply_tx)) = scrollback_rx.try_recv() {
+    while let Ok(req) = scrollback_rx.try_recv() {
         let gen = generation.load(Ordering::Relaxed);
-        let result = do_scrollback(&terminal, row_offset, row_count, gen, current_cols);
-        let _ = reply_tx.send(result);
+        let result = do_scrollback(
+            &mut terminal, &mut scrollback_pins, &req.subscriber_id,
+            req.op, req.amount, req.row_count, gen, current_cols,
+        );
+        let _ = req.reply.send(result);
     }
 
     drop(wakeup_read); // closes read end; wakeup_write already closed (PtyHandle dropped)
@@ -1004,26 +1056,91 @@ mod scrollback_tests {
         Terminal::new(TerminalOptions { cols, rows, max_scrollback: scrollback }).unwrap()
     }
 
+    fn write_lines(t: &mut Terminal<'static, 'static>, n: usize) {
+        for i in 0..n {
+            t.vt_write(format!("line{i}\n").as_bytes());
+        }
+    }
+
     #[test]
     fn do_scrollback_empty_when_row_count_zero() {
-        let terminal = make_terminal(80, 24, 1000);
-        let result = do_scrollback(&terminal, 0, 0, 42, 80).unwrap();
+        let mut terminal = make_terminal(80, 24, 1000);
+        let mut pins = std::collections::HashMap::new();
+        let result = do_scrollback(&mut terminal, &mut pins, "s", ScrollbackOp::Open, 0, 0, 42, 80).unwrap();
         assert_eq!(result.generation, 42);
         assert!(result.data.is_empty());
     }
 
     #[test]
-    fn do_scrollback_offset_beyond_total_returns_empty() {
+    fn do_scrollback_handles_more_rows_than_history() {
         let mut terminal = make_terminal(80, 5, 1000);
-        // Push 10 rows of scrollback by writing 15 lines (5-row screen scrolls 10 into history)
-        for i in 0..15u8 {
-            terminal.vt_write(format!("line{}\n", i).as_bytes());
-        }
+        let mut pins = std::collections::HashMap::new();
+        for i in 0..15u8 { terminal.vt_write(format!("line{}\n", i).as_bytes()); }
         let total = terminal.total_rows().unwrap() as u32;
         assert!(total > 0, "expected rows");
-        let result = do_scrollback(&terminal, total, 10, 7, 80).unwrap();
-        assert!(result.data.is_empty());
+        let result = do_scrollback(&mut terminal, &mut pins, "s", ScrollbackOp::Open, 0, 1000, 7, 80).unwrap();
         assert_eq!(result.total_scrollback_rows, total);
+        assert_eq!(result.row_offset, 0);
+    }
+
+    #[test]
+    fn scrollback_open_anchors_at_live_tail() {
+        let mut t = make_terminal(80, 5, 1_000_000);
+        write_lines(&mut t, 20);
+        let mut pins = std::collections::HashMap::new();
+        let r = do_scrollback(&mut t, &mut pins, "s", ScrollbackOp::Open, 0, 5, 1, 80).unwrap();
+        assert_eq!(r.row_offset, 0, "OPEN shows the live tail");
+        assert!(!r.data.is_empty());
+        assert_eq!(pins.len(), 1, "OPEN creates a pin");
+    }
+
+    #[test]
+    fn scrollback_move_up_increases_offset() {
+        let mut t = make_terminal(80, 5, 1_000_000);
+        write_lines(&mut t, 20);
+        let mut pins = std::collections::HashMap::new();
+        do_scrollback(&mut t, &mut pins, "s", ScrollbackOp::Open, 0, 5, 1, 80).unwrap();
+        let r = do_scrollback(&mut t, &mut pins, "s", ScrollbackOp::Move, 3, 5, 2, 80).unwrap();
+        assert_eq!(r.row_offset, 3, "MOVE +3 scrolls 3 rows up from the tail");
+    }
+
+    #[test]
+    fn scrollback_content_stays_put_while_streaming() {
+        // The core win: after parking the view, new output must not slide it.
+        let mut t = make_terminal(80, 5, 1_000_000);
+        write_lines(&mut t, 20);           // line0..line19
+        let mut pins = std::collections::HashMap::new();
+        do_scrollback(&mut t, &mut pins, "s", ScrollbackOp::Open, 0, 5, 1, 80).unwrap();
+        // Park 8 rows up; capture what we see.
+        let parked = do_scrollback(&mut t, &mut pins, "s", ScrollbackOp::Move, 8, 5, 2, 80).unwrap();
+        // Stream more output.
+        write_lines(&mut t, 30);
+        // Re-render with no movement (MOVE 0). Content must be identical.
+        let after = do_scrollback(&mut t, &mut pins, "s", ScrollbackOp::Move, 0, 5, 3, 80).unwrap();
+        assert_eq!(parked.data, after.data, "parked content drifted while streaming");
+    }
+
+    #[test]
+    fn scrollback_move_clamps_at_top() {
+        let mut t = make_terminal(80, 5, 1_000_000);
+        write_lines(&mut t, 20);
+        let mut pins = std::collections::HashMap::new();
+        do_scrollback(&mut t, &mut pins, "s", ScrollbackOp::Open, 0, 5, 1, 80).unwrap();
+        // Move way past the top; must clamp without panicking.
+        let r = do_scrollback(&mut t, &mut pins, "s", ScrollbackOp::Move, i32::MAX, 5, 2, 80).unwrap();
+        let total = t.total_rows().unwrap() as u32;
+        assert_eq!(r.row_offset, total - 5, "top clamp: bottom edge sits row_count above oldest");
+    }
+
+    #[test]
+    fn scrollback_close_drops_pin() {
+        let mut t = make_terminal(80, 5, 1_000_000);
+        write_lines(&mut t, 20);
+        let mut pins = std::collections::HashMap::new();
+        do_scrollback(&mut t, &mut pins, "s", ScrollbackOp::Open, 0, 5, 1, 80).unwrap();
+        let r = do_scrollback(&mut t, &mut pins, "s", ScrollbackOp::Close, 0, 5, 2, 80).unwrap();
+        assert!(r.data.is_empty());
+        assert!(pins.is_empty(), "CLOSE removes the pin");
     }
 
     // --- FFI selection-pointer regression guards ----------------------------
@@ -1148,10 +1265,13 @@ mod scrollback_tests {
             terminal.vt_write(format!("line{}\r\n", i).as_bytes());
         }
         let total = terminal.total_rows().unwrap() as u32;
-        // Full buffer (history + active) exercises the Point::Screen selection path.
-        let r = do_scrollback(&terminal, 0, total, 9, 80).unwrap();
+        // A viewport as tall as the whole buffer (OPEN) covers history + active and
+        // exercises the Point::Screen selection path from the oldest row.
+        let mut pins = std::collections::HashMap::new();
+        let r = do_scrollback(&mut terminal, &mut pins, "s", ScrollbackOp::Open, 0, total, 9, 80).unwrap();
         assert_eq!(r.generation, 9);
         assert_eq!(r.total_scrollback_rows, total);
+        assert_eq!(r.row_offset, 0, "full-height OPEN sits at the tail with the oldest row visible");
         assert!(!r.data.is_empty(), "do_scrollback produced no output");
         assert!(
             contains(&r.data, b"line0"),

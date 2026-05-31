@@ -76,7 +76,7 @@ async fn dispatch_command(
         Some(Command::Resize(r))       => commands::handle_resize(registry, r),
         Some(Command::SetTitle(r))     => commands::handle_set_title(registry, r),
         Some(Command::Refresh(r))      => commands::handle_refresh(registry, r).await,
-        Some(Command::Scrollback(r))   => commands::handle_scrollback(registry, r).await,
+        Some(Command::Scrollback(r))   => commands::handle_scrollback(registry, r, subscriber_id).await,
     }
 }
 

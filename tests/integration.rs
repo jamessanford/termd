@@ -783,7 +783,8 @@ async fn test_scrollback_via_grpc() {
         &mut client,
         terminal_command::Command::Scrollback(termd::proto::ScrollbackRequest {
             pty_id,
-            row_offset: 0,
+            op: termd::proto::ScrollbackOp::Open as i32,
+            amount: 0,
             row_count: 24,
         }),
     ).await;
@@ -794,6 +795,7 @@ async fn test_scrollback_via_grpc() {
             // With Point::Screen semantics total includes the active screen rows even
             // when there is no history yet.
             assert_eq!(sr.total_scrollback_rows, 24, "fresh PTY total should equal screen rows");
+            assert_eq!(sr.row_offset, 0, "OPEN on a fresh PTY sits at the tail");
             assert!(sr.data.is_empty(), "blank active screen produces no VT output");
         }
         other => panic!("unexpected: {other:?}"),
@@ -859,7 +861,7 @@ async fn test_subscribe_grows_pty_to_larger_client() {
 }
 
 #[tokio::test]
-async fn test_subscribe_does_not_shrink_pty_for_smaller_client() {
+async fn test_subscribe_shrinks_pty_for_single_smaller_client() {
     use termd::proto::{
         terminal_command::Command, terminal_response::Response,
         TerminalCommand, SubscribeRequest,
@@ -876,7 +878,8 @@ async fn test_subscribe_does_not_shrink_pty_for_smaller_client() {
         other => panic!("expected Create, got {other:?}"),
     };
 
-    // Subscribe with a smaller terminal. The grow-only policy must leave the PTY at 80x24.
+    // Subscribe with a smaller terminal. With a single subscriber there are no
+    // other clients to clip, so the PTY tracks it exactly and shrinks to 70x20.
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
     let mut resp_stream = client
         .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx))
@@ -899,12 +902,13 @@ async fn test_subscribe_does_not_shrink_pty_for_smaller_client() {
         }
     }
 
-    // The PTY size must be unchanged. (cmd_tx stays alive so the subscriber is still attached.)
+    // The PTY must have shrunk to the single subscriber's size.
+    // (cmd_tx stays alive so the subscriber is still attached.)
     let resp = send_recv(&mut client, Command::List(ListRequest {})).await;
     let item = match resp.response.unwrap() {
         Response::List(l) => l.items.into_iter().find(|i| i.pty_id == pty_id).expect("PTY in list"),
         other => panic!("expected List, got {other:?}"),
     };
-    assert_eq!((item.cols, item.rows), (80, 24), "a smaller client must not shrink the PTY");
+    assert_eq!((item.cols, item.rows), (70, 20), "a single smaller client should shrink the PTY");
     drop(cmd_tx);
 }

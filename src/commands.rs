@@ -318,17 +318,25 @@ pub async fn handle_refresh(registry: &PtyRegistry, req: RefreshRequest) -> Term
 pub async fn handle_scrollback(
     registry: &PtyRegistry,
     req: ScrollbackRequest,
+    subscriber_id: &str,
 ) -> TerminalResponse {
+    use crate::pty::ScrollbackOp;
     let id = req.pty_id;
+    let op = match req.op() {
+        proto::ScrollbackOp::Open  => ScrollbackOp::Open,
+        proto::ScrollbackOp::Move  => ScrollbackOp::Move,
+        proto::ScrollbackOp::Close => ScrollbackOp::Close,
+    };
     match registry.get(id) {
         None => err_response(id, "PTY not found".into()),
-        Some(h) => match h.scrollback(req.row_offset, req.row_count).await {
+        Some(h) => match h.scrollback(subscriber_id, op, req.amount, req.row_count).await {
             Ok(data) => TerminalResponse {
                 response: Some(Response::Scrollback(ScrollbackResponse {
                     pty_id:                id,
                     generation:            data.generation,
                     data:                  data.data.to_vec(),
                     total_scrollback_rows: data.total_scrollback_rows,
+                    row_offset:            data.row_offset,
                 })),
             },
             Err(e) => err_response(id, e.to_string()),
