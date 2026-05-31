@@ -937,8 +937,12 @@ pub async fn run(
                     }
 
                     InputAction::ShowInfo => {
+                        let (client_cols, client_rows) = get_terminal_size();
                         show_info(&format!(
-                            "requested={mode:?} actual={dispatch_mode:?} pty={current_pty_id:016x}"
+                            "requested={mode:?} actual={dispatch_mode:?} pty={current_pty_id:016x} \
+                             server={server_cols}x{server_rows} client={client_cols}x{client_rows}",
+                            server_cols = current_item.cols,
+                            server_rows = current_item.rows,
                         )).await;
                     }
 
