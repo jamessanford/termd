@@ -72,6 +72,7 @@ fn create_handler(
 
 enum RunOutcome {
     ServerClosed,
+    OutputClosed,
     PtyClosed,
     Action(InputAction),
 }
@@ -535,6 +536,75 @@ async fn run_idle(
     }
 }
 
+/// Status line shown on the client's terminal while reconnecting. The caller
+/// has already reset the terminal (left the alt screen, cleared modes), so we
+/// just clear and print at the top of the main screen.
+fn reconnect_status(msg: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(format!("\x1b[2J\x1b[H[{msg}]\r\n").as_bytes());
+    let _ = out.flush();
+}
+
+/// Re-establish the bidirectional command/response stream after a transport
+/// failure, retrying with capped exponential backoff until it succeeds. A
+/// freshly opened stream can report success before the underlying connection is
+/// actually usable (lazily-reconnecting tonic `Channel`s do this), so we confirm
+/// liveness with a `List` round-trip before handing the stream back — otherwise
+/// a dead-but-"Ok" stream would spin the caller's reconnect path with no delay.
+///
+/// While waiting between attempts the user can press Ctrl-C or `q` to give up.
+/// Returns the fresh `(cmd_tx, resp_rx)` once connected, or `None` if the user
+/// aborted (or stdin closed). Re-subscribing and repainting is the caller's job.
+async fn reconnect(
+    client: &mut AuthedClient,
+    stdin:  &mut tokio::io::Stdin,
+) -> Option<(
+    mpsc::Sender<TerminalCommand>,
+    tonic::Streaming<termd::proto::TerminalResponse>,
+)> {
+    let mut backoff = std::time::Duration::from_millis(500);
+    let max_backoff = std::time::Duration::from_secs(5);
+    let mut buf = [0u8; 8];
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        reconnect_status(&format!(
+            "Connection lost — reconnecting (attempt {attempt})…  Ctrl-C/q to quit"
+        ));
+        let (cmd_tx, cmd_rx) = mpsc::channel::<TerminalCommand>(64);
+        let probe = match client.stream(ReceiverStream::new(cmd_rx)).await {
+            Ok(resp) => {
+                let mut resp_rx = resp.into_inner();
+                let mut throwaway = Vec::new();
+                // A real round-trip also re-runs the per-stream auth handshake,
+                // so a successful List confirms the link is genuinely back.
+                fetch_list(&cmd_tx, &mut resp_rx, &mut throwaway)
+                    .await
+                    .map(|()| (cmd_tx, resp_rx))
+            }
+            Err(status) => Err(anyhow::anyhow!("{}", status.message())),
+        };
+        match probe {
+            Ok(conn) => return Some(conn),
+            Err(e) => reconnect_status(&format!(
+                "Reconnect failed: {e} — retrying in {:.1}s  (Ctrl-C/q to quit)",
+                backoff.as_secs_f32(),
+            )),
+        }
+        // Wait out the backoff, but let the user abort with Ctrl-C / q.
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            r = stdin.read(&mut buf) => match r {
+                Ok(0) | Err(_) => return None,
+                Ok(n) if buf[..n].iter().any(|&b| b == 0x03 || b == b'q') => return None,
+                _ => {}
+            }
+        }
+        backoff = (backoff * 2).min(max_backoff);
+    }
+}
+
 pub async fn run(
     client: &mut AuthedClient,
     item: PtyItem,
@@ -545,7 +615,7 @@ pub async fn run(
         return run_debug(client, item.pty_id).await;
     }
 
-    let (cmd_tx, cmd_rx) = mpsc::channel::<TerminalCommand>(64);
+    let (mut cmd_tx, cmd_rx) = mpsc::channel::<TerminalCommand>(64);
     let mut resp_rx = client
         .stream(ReceiverStream::new(cmd_rx))
         .await?
@@ -567,6 +637,36 @@ pub async fn run(
     let mut out = Vec::new();
     let mut skip_subscribe = false;
 
+    // On a transport failure, re-establish the stream (retrying with backoff)
+    // and restart the session loop so we re-subscribe and repaint the current
+    // PTY. If the user aborts the reconnect, leave the session cleanly.
+    // The loop label is passed in because `macro_rules!` labels are hygienic and
+    // can't otherwise see the caller's `'session`.
+    macro_rules! do_reconnect {
+        ($lt:lifetime) => {
+            match reconnect(client, &mut stdin).await {
+                Some((tx, rx)) => {
+                    cmd_tx = tx;
+                    resp_rx = rx;
+                    subscribed_pty_id = None;
+                    continue $lt;
+                }
+                None => break $lt,
+            }
+        };
+    }
+    // Unwrap a command-helper Result, treating any Err as a transport failure
+    // that triggers a reconnect. (Helpers signal logical failures as Ok values,
+    // so Err is always the stream going away.)
+    macro_rules! reconnect_or_break {
+        ($lt:lifetime, $e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(_) => do_reconnect!($lt),
+            }
+        };
+    }
+
     'session: loop {
         let (refresh_gen, refresh_bytes, buffered): RefreshSnapshot = 'refresh: {
         if skip_subscribe {
@@ -575,7 +675,7 @@ pub async fn run(
         }
 
         let subscribe_ok = if subscribed_pty_id != Some(current_pty_id) {
-            let ok = subscribe(&cmd_tx, &mut resp_rx, current_pty_id).await?;
+            let ok = reconnect_or_break!('session, subscribe(&cmd_tx, &mut resp_rx, current_pty_id).await);
             if ok { subscribed_pty_id = Some(current_pty_id); }
             ok
         } else {
@@ -583,7 +683,7 @@ pub async fn run(
         };
 
         let refresh_result = if subscribe_ok {
-            request_refresh(&cmd_tx, &mut resp_rx, current_pty_id).await?
+            reconnect_or_break!('session, request_refresh(&cmd_tx, &mut resp_rx, current_pty_id).await)
         } else {
             None
         };
@@ -781,7 +881,7 @@ pub async fn run(
                 }
 
                 if !out.is_empty() {
-                    if stdout.write_all(&out).is_err() { break RunOutcome::ServerClosed; }
+                    if stdout.write_all(&out).is_err() { break RunOutcome::OutputClosed; }
                     let _ = stdout.flush();
                 }
             }
@@ -789,9 +889,15 @@ pub async fn run(
 
         match outcome {
             RunOutcome::ServerClosed => {
+                // Leave the alt screen / clear PTY modes so the reconnect status
+                // shows on a clean main screen, then retry the transport.
                 reset_terminal_modes();
-                move_terminal_end();
-                eprintln!("[Connection closed]");
+                do_reconnect!('session);
+            }
+            RunOutcome::OutputClosed => {
+                // Our own stdout died (the client terminal went away). Reconnecting
+                // the server stream wouldn't help — just exit cleanly.
+                reset_terminal_modes();
                 break 'session;
             }
             RunOutcome::PtyClosed => {
@@ -855,15 +961,14 @@ pub async fn run(
 
                     InputAction::Create => {
                         let (cols, rows) = get_terminal_size();
-                        cmd_tx.send(TerminalCommand {
+                        reconnect_or_break!('session, cmd_tx.send(TerminalCommand {
                             command: Some(Command::Create(CreateRequest {
                                 cols, rows, command: None,
                             })),
-                        }).await?;
+                        }).await);
                         'create: loop {
-                            match resp_rx.message().await? {
-                                None => { move_terminal_end(); eprintln!("[Server disconnected]"); break 'session; }
-                                Some(r) => if let Some(Response::Create(cr)) = r.response {
+                            match resp_rx.message().await {
+                                Ok(Some(r)) => if let Some(Response::Create(cr)) = r.response {
                                     match cr.item {
                                         Some(new_item) => {
                                             switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, new_item).await;
@@ -875,7 +980,9 @@ pub async fn run(
                                             continue 'session;
                                         }
                                     }
-                                }
+                                },
+                                // Stream closed (None) or errored: reconnect and restart the session.
+                                _ => do_reconnect!('session),
                             }
                         }
                         pty_list.clear();
