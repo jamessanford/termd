@@ -860,6 +860,11 @@ fn process_read(
             if tail.is_empty() {
                 head_gen // read ended exactly at the boundary — no tail to emit
             } else {
+                // The split loop only wrote batch[..i]; apply the tail now so the
+                // reader's parser/screen stays in sync with the real byte stream
+                // (vt_at_boundary on later reads depends on it). Snapshot is already
+                // pinned above, so the tail correctly lands after it.
+                terminal.vt_write(&tail);
                 broadcast_data(tail) // resumes on ground for any attaching client
             }
         }
@@ -1332,6 +1337,33 @@ mod process_read_tests {
         assert!(matches!(events[0], PtyEvent::Data(_)), "first event is head Data");
         assert!(matches!(events[1], PtyEvent::Refresh(_)), "second event is Refresh");
         assert!(!pending, "the pending refresh was flushed at the boundary");
+    }
+
+    // The reader's parser must mirror the real byte stream exactly, because
+    // vt_at_boundary() (used to choose split points) reads that parser state. When a
+    // split happens, the tail must still be applied to the terminal — otherwise the
+    // reader desyncs from the stream and later reports false boundaries, pinning a
+    // refresh mid-sequence and resuming a new attacher on an orphaned escape tail.
+    #[test]
+    fn split_applies_tail_to_terminal_so_parser_stays_in_sync() {
+        let mut t = make_terminal();
+        t.vt_write(b"\x1b[31"); // leave the parser mid-SGR
+        assert!(!t.vt_at_boundary());
+
+        let (tx, _rx) = broadcast::channel(16);
+        let generation = AtomicU64::new(0);
+        let mut replies = Vec::new();
+        let mut pending = true;
+
+        // 'm' completes the SGR (first boundary); the tail "hello\x1b[1" ends mid-CSI.
+        process_read(&mut t, Bytes::from_static(b"mhello\x1b[1"), &generation, &tx, &mut replies, &mut pending);
+
+        // The real stream is now mid-CSI, so the reader's parser must report the same.
+        // If the tail was dropped, the parser sits at ground after 'm' and lies here.
+        assert!(
+            !t.vt_at_boundary(),
+            "tail must be applied to the terminal; parser should still be mid-sequence"
+        );
     }
 }
 
