@@ -791,6 +791,83 @@ fn flush_refreshes(
     }
 }
 
+/// Apply one PTY read to the terminal and broadcast it to subscribers, returning
+/// the generation stamped on the last data chunk emitted (so a co-emitted metadata
+/// event can carry the matching generation).
+///
+/// Fast path (no refresh pending): write and broadcast the whole read as a single
+/// generation — the read boundary was never meaningful to subscribers, who just
+/// concatenate the bytes.
+///
+/// When a refresh *is* pending the parser is, by construction, mid-sequence: the
+/// boundary check before `poll()` flushes any pending refresh whenever the parser
+/// sits at ground, and nothing writes to the terminal between that check and here.
+/// So a surviving pending refresh means the previous read ended inside an escape
+/// sequence (or a multi-byte codepoint). Rather than hope some later read happens
+/// to end at a boundary, walk this read one byte at a time until the parser returns
+/// to ground, then split the read there: broadcast the head (which now ends clean),
+/// pin the refresh snapshot at that boundary, and broadcast the tail as its own
+/// generation. An attaching client drops everything `<=` the refresh generation
+/// (the head) and resumes on the tail, which starts at ground — no orphaned tail.
+///
+/// If the whole read sits inside one unfinished sequence (e.g. a long OSC), there
+/// is no boundary to split on: broadcast it whole and leave the refresh pending for
+/// a later read. The `poll()` stall timeout covers the case where no later read ever
+/// comes (the app went idle mid-sequence) so the attach can't block forever.
+fn process_read(
+    terminal: &mut Terminal<'static, 'static>,
+    batch: Bytes,
+    generation: &AtomicU64,
+    tx: &broadcast::Sender<PtyEvent>,
+    pending_replies: &mut Vec<oneshot::Sender<Result<RefreshData>>>,
+    pending_broadcast: &mut bool,
+) -> u64 {
+    // Stamp the next generation onto a raw chunk and broadcast it; returns the gen.
+    let broadcast_data = |data: Bytes| -> u64 {
+        let gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = tx.send(PtyEvent::Data(PtyChunk { generation: gen, data }));
+        gen
+    };
+
+    if pending_replies.is_empty() && !*pending_broadcast {
+        // Fast path: nothing waiting on a boundary, so don't pay the byte-by-byte
+        // scan — write and broadcast the read whole.
+        terminal.vt_write(&batch);
+        return broadcast_data(batch);
+    }
+
+    // A refresh is pending => the parser is mid-sequence. Feed bytes one at a time
+    // until it returns to a ground boundary; that offset is where we split the read.
+    let mut split_at = None;
+    for i in 0..batch.len() {
+        terminal.vt_write(&batch[i..i + 1]);
+        if terminal.vt_at_boundary() {
+            split_at = Some(i + 1);
+            break;
+        }
+    }
+
+    match split_at {
+        Some(i) => {
+            // batch[..i] completes the open sequence and ends clean; snapshot there.
+            let head_gen = broadcast_data(batch.slice(0..i));
+            flush_refreshes(terminal, generation, tx, pending_replies, pending_broadcast);
+            let tail = batch.slice(i..);
+            if tail.is_empty() {
+                head_gen // read ended exactly at the boundary — no tail to emit
+            } else {
+                broadcast_data(tail) // resumes on ground for any attaching client
+            }
+        }
+        None => {
+            // The whole read stayed inside one unfinished sequence (the loop already
+            // wrote every byte). Broadcast it whole; the refresh stays pending for
+            // the read that finally completes the sequence.
+            broadcast_data(batch)
+        }
+    }
+}
+
 // Reader thread — owns libghostty Terminal state (not Send + Sync).
 #[allow(clippy::too_many_arguments)]
 fn reader_thread(
@@ -959,7 +1036,16 @@ fn reader_thread(
             continue;
         }
 
-        terminal.vt_write(&batch);
+        // Write and broadcast the read. If a refresh is pending, process_read splits
+        // the read at a VT ground boundary and pins the snapshot there (see its doc);
+        // otherwise it's the plain whole-read broadcast. `gen` is the last data chunk's
+        // generation, so an accompanying TitleChanged below carries a matching gen.
+        let gen = process_read(
+            &mut terminal, Bytes::from(batch), &generation, &tx,
+            &mut pending_replies, &mut pending_broadcast_refresh,
+        );
+
+        // Screen / title state is read after the full read has been applied.
         let current_screen = terminal.active_screen().unwrap_or(Screen::Primary);
         if current_screen != prev_screen {
             prev_screen = current_screen;
@@ -967,17 +1053,8 @@ fn reader_thread(
             pending_broadcast_refresh = true;
         }
         let current_title = title.lock().unwrap().clone();
-        let title_changed = current_title != prev_title;
-        if title_changed {
+        if current_title != prev_title {
             prev_title = current_title.clone();
-        }
-        let gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = tx.send(PtyEvent::Data(PtyChunk {
-            generation: gen,
-            data: Bytes::from(batch),
-        })); // ignore SendError (no subscribers is fine)
-        // Emit TitleChanged after fetch_add so generation matches the accompanying chunk.
-        if title_changed {
             let _ = meta_tx.send(Arc::new(PtyMetadata {
                 reason: MetadataReason::TitleChanged,
                 exit_code: None,
@@ -996,10 +1073,10 @@ fn reader_thread(
                 },
             }));
         }
-        // The raw batch is broadcast; if a refresh is pending and the batch left
-        // the parser at a ground boundary, snapshot now — the new-screen redraw and
-        // any attach replies land at a clean point in the stream. Otherwise they
-        // wait for the batch that completes the open sequence.
+        // A refresh can have become pending *this* round (a screen switch above), and
+        // process_read only splits for refreshes that were already pending on entry.
+        // If the read left the parser at ground, service that fresh refresh now;
+        // otherwise it waits for the read that completes the open sequence.
         if (!pending_replies.is_empty() || pending_broadcast_refresh) && terminal.vt_at_boundary() {
             flush_refreshes(&terminal, &generation, &tx, &mut pending_replies, &mut pending_broadcast_refresh);
         }
@@ -1123,6 +1200,134 @@ mod boundary_tests {
         assert!(!t.vt_at_boundary());
         t.vt_write(b"[0m");
         assert!(t.vt_at_boundary());
+    }
+}
+
+#[cfg(test)]
+mod process_read_tests {
+    use super::*;
+
+    fn make_terminal() -> Terminal<'static, 'static> {
+        Terminal::new(TerminalOptions { cols: 80, rows: 24, max_scrollback: 1000 }).unwrap()
+    }
+
+    // Non-blocking drain of every event the broadcast currently holds.
+    fn collect(rx: &mut broadcast::Receiver<PtyEvent>) -> Vec<PtyEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    // With no refresh waiting, a read is written and broadcast unchanged — one
+    // Data chunk, no splitting, no Refresh.
+    #[test]
+    fn no_pending_refresh_emits_single_data_chunk() {
+        let mut t = make_terminal();
+        let (tx, mut rx) = broadcast::channel(16);
+        let generation = AtomicU64::new(0);
+        let mut replies = Vec::new();
+        let mut pending = false;
+
+        process_read(&mut t, Bytes::from_static(b"hello"), &generation, &tx, &mut replies, &mut pending);
+
+        let events = collect(&mut rx);
+        assert_eq!(events.len(), 1, "expected a single Data chunk");
+        match &events[0] {
+            PtyEvent::Data(c) => assert_eq!(&c.data[..], b"hello"),
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    // The core case: a refresh is pending and the parser is mid-sequence (the
+    // previous read ended inside a CSI). The read is split at the first ground
+    // boundary into head + tail, with the snapshot pinned strictly between them.
+    #[test]
+    fn pending_refresh_splits_read_at_boundary_into_head_refresh_tail() {
+        let mut t = make_terminal();
+        t.vt_write(b"\x1b[31"); // leave the parser mid-SGR
+        assert!(!t.vt_at_boundary());
+
+        let (tx, mut rx) = broadcast::channel(16);
+        let generation = AtomicU64::new(0);
+        let mut replies = Vec::new();
+        let mut pending = true; // a resize/screen-switch broadcast refresh is waiting
+
+        // 'm' completes the SGR (first boundary); "hello" is the clean tail.
+        process_read(&mut t, Bytes::from_static(b"mhello"), &generation, &tx, &mut replies, &mut pending);
+
+        let events = collect(&mut rx);
+        assert_eq!(events.len(), 3, "expected head Data + Refresh + tail Data");
+        let (head_gen, head) = match &events[0] {
+            PtyEvent::Data(c) => (c.generation, c.data.clone()),
+            other => panic!("expected head Data, got {other:?}"),
+        };
+        let refresh_gen = match &events[1] {
+            PtyEvent::Refresh(r) => r.generation,
+            other => panic!("expected Refresh, got {other:?}"),
+        };
+        let (tail_gen, tail) = match &events[2] {
+            PtyEvent::Data(c) => (c.generation, c.data.clone()),
+            other => panic!("expected tail Data, got {other:?}"),
+        };
+
+        assert_eq!(&head[..], b"m", "head completes the open sequence");
+        assert_eq!(&tail[..], b"hello", "tail is the clean remainder");
+        let mut joined = head.to_vec();
+        joined.extend_from_slice(&tail);
+        assert_eq!(joined, b"mhello", "head ++ tail reconstructs the read exactly");
+        assert!(
+            head_gen < refresh_gen && refresh_gen < tail_gen,
+            "snapshot must sit between head and tail: head={head_gen} refresh={refresh_gen} tail={tail_gen}"
+        );
+        assert!(!pending, "the pending refresh was flushed at the boundary");
+    }
+
+    // When the entire read sits inside one unfinished sequence there is no boundary
+    // to split on: broadcast it whole and keep the refresh pending for a later read.
+    #[test]
+    fn read_entirely_inside_sequence_emits_whole_and_keeps_pending() {
+        let mut t = make_terminal();
+        t.vt_write(b"\x1b]0;tit"); // mid-OSC, no terminator
+        assert!(!t.vt_at_boundary());
+
+        let (tx, mut rx) = broadcast::channel(16);
+        let generation = AtomicU64::new(0);
+        let mut replies = Vec::new();
+        let mut pending = true;
+
+        // More OSC body, still no ST/BEL — the read never reaches ground.
+        process_read(&mut t, Bytes::from_static(b"le-more"), &generation, &tx, &mut replies, &mut pending);
+
+        let events = collect(&mut rx);
+        assert_eq!(events.len(), 1, "no boundary => single whole-read Data, no Refresh");
+        match &events[0] {
+            PtyEvent::Data(c) => assert_eq!(&c.data[..], b"le-more"),
+            other => panic!("expected Data, got {other:?}"),
+        }
+        assert!(pending, "refresh stays pending until a boundary arrives");
+    }
+
+    // The boundary can fall at the very end of the read, leaving an empty tail —
+    // we emit head + Refresh and skip the empty tail Data.
+    #[test]
+    fn split_with_empty_tail_emits_head_and_refresh_only() {
+        let mut t = make_terminal();
+        t.vt_write(b"\x1b[31"); // mid-SGR
+        let (tx, mut rx) = broadcast::channel(16);
+        let generation = AtomicU64::new(0);
+        let mut replies = Vec::new();
+        let mut pending = true;
+
+        // 'm' completes the SGR and the read ends exactly at the boundary.
+        process_read(&mut t, Bytes::from_static(b"m"), &generation, &tx, &mut replies, &mut pending);
+
+        let events = collect(&mut rx);
+        assert_eq!(events.len(), 2, "head + Refresh only; no empty tail Data");
+        assert!(matches!(events[0], PtyEvent::Data(_)), "first event is head Data");
+        assert!(matches!(events[1], PtyEvent::Refresh(_)), "second event is Refresh");
+        assert!(!pending, "the pending refresh was flushed at the boundary");
     }
 }
 
