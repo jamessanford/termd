@@ -86,6 +86,11 @@ message RefreshResponse {
   reserved            5;
   uint32 cols       = 6;
   uint32 rows       = 7;
+  // True when the daemon was forced to snapshot mid-sequence by the refresh
+  // stall timeout (the app went idle inside an escape sequence). The render is
+  // best-effort and may resume a client on an orphaned sequence tail; the client
+  // decides whether to request a clean refresh later. See docs/REFRESH.md.
+  bool   degraded   = 8;
 }
 
 message ScrollbackResponse {

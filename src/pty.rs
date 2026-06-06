@@ -84,6 +84,11 @@ pub struct RefreshData {
     pub data: Bytes,
     pub cols: u32,
     pub rows: u32,
+    /// True when this snapshot was forced out mid-sequence by the stall timeout
+    /// rather than pinned at a clean VT ground boundary. `do_refresh` always sets
+    /// this false; only `flush_refreshes` marks it true on the stall path. See
+    /// docs/REFRESH.md for what a client should do about it.
+    pub degraded: bool,
 }
 
 // pty_id is not included — callers supply it directly from the request (see RefreshData).
@@ -640,6 +645,7 @@ fn do_refresh(
         data: Bytes::from(out),
         cols,
         rows,
+        degraded: false, // boundary-clean by default; flush_refreshes marks the stall path
     })
 }
 
@@ -770,13 +776,16 @@ fn flush_refreshes(
     tx: &broadcast::Sender<PtyEvent>,
     pending_replies: &mut Vec<oneshot::Sender<Result<RefreshData>>>,
     pending_broadcast: &mut bool,
+    degraded: bool,
 ) {
     if pending_replies.is_empty() && !*pending_broadcast {
         return;
     }
     let refresh_gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
     match do_refresh(terminal, refresh_gen) {
-        Ok(data) => {
+        Ok(mut data) => {
+            data.degraded = degraded; // true only on the stall-timeout path
+
             for reply in pending_replies.drain(..) {
                 let _ = reply.send(Ok(data.clone()));
             }
@@ -855,7 +864,7 @@ fn process_read(
         Some(i) => {
             // batch[..i] completes the open sequence and ends clean; snapshot there.
             let head_gen = broadcast_data(batch.slice(0..i));
-            flush_refreshes(terminal, generation, tx, pending_replies, pending_broadcast);
+            flush_refreshes(terminal, generation, tx, pending_replies, pending_broadcast, false);
             let tail = batch.slice(i..);
             if tail.is_empty() {
                 head_gen // read ended exactly at the boundary — no tail to emit
@@ -968,7 +977,7 @@ fn reader_thread(
         // If the parser is already at a ground boundary, service deferred refreshes
         // now; otherwise they wait for the batch that completes the open sequence.
         if (!pending_replies.is_empty() || pending_broadcast_refresh) && terminal.vt_at_boundary() {
-            flush_refreshes(&terminal, &generation, &tx, &mut pending_replies, &mut pending_broadcast_refresh);
+            flush_refreshes(&terminal, &generation, &tx, &mut pending_replies, &mut pending_broadcast_refresh, false);
         }
         while let Ok(req) = scrollback_rx.try_recv() {
             let gen = generation.load(Ordering::Relaxed);
@@ -1012,7 +1021,7 @@ fn reader_thread(
         // hasn't come (app went idle mid-sequence). Snapshot anyway rather than
         // block the attach — a degraded boundary that self-heals on the next repaint.
         if poll_ret == 0 {
-            flush_refreshes(&terminal, &generation, &tx, &mut pending_replies, &mut pending_broadcast_refresh);
+            flush_refreshes(&terminal, &generation, &tx, &mut pending_replies, &mut pending_broadcast_refresh, true);
             continue;
         }
 
@@ -1087,7 +1096,7 @@ fn reader_thread(
         // If the read left the parser at ground, service that fresh refresh now;
         // otherwise it waits for the read that completes the open sequence.
         if (!pending_replies.is_empty() || pending_broadcast_refresh) && terminal.vt_at_boundary() {
-            flush_refreshes(&terminal, &generation, &tx, &mut pending_replies, &mut pending_broadcast_refresh);
+            flush_refreshes(&terminal, &generation, &tx, &mut pending_replies, &mut pending_broadcast_refresh, false);
         }
     }
 
@@ -1364,6 +1373,42 @@ mod process_read_tests {
             !t.vt_at_boundary(),
             "tail must be applied to the terminal; parser should still be mid-sequence"
         );
+    }
+
+    // The stall-timeout flush stamps degraded=true on both the on-demand reply and
+    // the broadcast refresh; a boundary-clean flush leaves it false. This is the only
+    // signal the client gets that a snapshot was forced out mid-sequence.
+    #[test]
+    fn flush_refreshes_marks_degraded_only_on_the_stall_path() {
+        let t = make_terminal();
+        let (tx, mut rx) = broadcast::channel(16);
+        let generation = AtomicU64::new(0);
+
+        // Stall flush: a waiting reply + a pending broadcast, degraded=true.
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        let mut replies = vec![reply_tx];
+        let mut pending = true;
+        flush_refreshes(&t, &generation, &tx, &mut replies, &mut pending, true);
+
+        let reply = reply_rx.try_recv().expect("reply not sent").expect("refresh failed");
+        assert!(reply.degraded, "stall reply must be marked degraded");
+        match rx.try_recv().expect("no broadcast refresh") {
+            PtyEvent::Refresh(r) => assert!(r.degraded, "stall broadcast must be degraded"),
+            other => panic!("expected Refresh, got {other:?}"),
+        }
+
+        // Boundary-clean flush: degraded=false.
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        let mut replies = vec![reply_tx];
+        let mut pending = true;
+        flush_refreshes(&t, &generation, &tx, &mut replies, &mut pending, false);
+
+        let reply = reply_rx.try_recv().expect("reply not sent").expect("refresh failed");
+        assert!(!reply.degraded, "clean reply must not be degraded");
+        match rx.try_recv().expect("no broadcast refresh") {
+            PtyEvent::Refresh(r) => assert!(!r.degraded, "clean broadcast must not be degraded"),
+            other => panic!("expected Refresh, got {other:?}"),
+        }
     }
 }
 

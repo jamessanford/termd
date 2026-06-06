@@ -310,6 +310,7 @@ pub async fn handle_refresh(registry: &PtyRegistry, req: RefreshRequest) -> Term
                     data: data.data.to_vec(),
                     cols: data.cols,
                     rows: data.rows,
+                    degraded: data.degraded,
                 })),
             },
             Err(e) => err_response(id, e.to_string()),

@@ -138,6 +138,7 @@ impl TerminalService for TerminalServiceImpl {
                                         data: rd.data.to_vec(),
                                         cols: rd.cols,
                                         rows: rd.rows,
+                                        degraded: rd.degraded,
                                     }
                                 )),
                             },
