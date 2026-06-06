@@ -84,10 +84,9 @@ pub struct RefreshData {
     pub data: Bytes,
     pub cols: u32,
     pub rows: u32,
-    /// True when this snapshot was forced out mid-sequence by the stall timeout
-    /// rather than pinned at a clean VT ground boundary. `do_refresh` always sets
-    /// this false; only `flush_refreshes` marks it true on the stall path. See
-    /// docs/REFRESH.md for what a client should do about it.
+    /// True when this snapshot was forced mid-sequence by the stall timeout,
+    /// and is not pinned at a clean VT escape sequence boundary.
+    /// See docs/REFRESH.md.
     pub degraded: bool,
 }
 
@@ -645,7 +644,7 @@ fn do_refresh(
         data: Bytes::from(out),
         cols,
         rows,
-        degraded: false, // boundary-clean by default; flush_refreshes marks the stall path
+        degraded: false,
     })
 }
 
