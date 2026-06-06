@@ -575,6 +575,8 @@ fn do_refresh(
         tabstops: false,        // tabstop restoration moves cursor, corrupting final position
         pwd: false,
         keyboard: true,         // restore keyboard modes (xterm modifyOtherKeys) — CSI > 4 ; Pv m
+        title: true,            // restore OSC 0 window title
+        colors: true,           // restore OSC 10/11/12 dynamic fg/bg/cursor overrides (only app-set ones)
         screen: ffi::FormatterScreenExtra {
             size: std::mem::size_of::<ffi::FormatterScreenExtra>(),
             cursor: true,        // emit final cursor position at end of output
@@ -702,6 +704,8 @@ fn do_scrollback(
         tabstops: false,
         pwd: false,
         keyboard: false,
+        title: false,
+        colors: false,
         screen: ffi::FormatterScreenExtra {
             size: std::mem::size_of::<ffi::FormatterScreenExtra>(),
             cursor: false,
@@ -749,7 +753,7 @@ fn do_scrollback(
 /// Milliseconds to wait when a refresh is deferred but the parser is stuck
 /// mid-sequence (the app wrote a partial escape sequence then went idle). Bounds
 /// how long an attach/refresh can block before we give up and snapshot anyway.
-const REFRESH_STALL_TIMEOUT_MS: libc::c_int = 100;
+const REFRESH_STALL_TIMEOUT_MS: libc::c_int = 1000;
 
 /// Service deferred refreshes — the on-demand (attach) replies and the
 /// resize/screen-switch broadcast. Callers gate this on `vt_at_boundary()` so the
