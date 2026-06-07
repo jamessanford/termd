@@ -27,8 +27,8 @@ bytes = "1"
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 hostname = "0.4"
-libghostty-vt = { git = "https://github.com/jamessanford/libghostty-rs", rev = "e87b14e60a166e25c8730b2c9d16475f67755ce3", default-features = false, features = ["kitty-graphics"] }
-libghostty-vt-sys = { git = "https://github.com/jamessanford/libghostty-rs", rev = "e87b14e60a166e25c8730b2c9d16475f67755ce3", default-features = false, features = ["pkg-config", "kitty-graphics"] }
+libghostty-vt = { git = "https://github.com/jamessanford/libghostty-rs", rev = "0bc60291aeaaca618fbd86edd17510c3d42dcab0", default-features = false, features = ["kitty-graphics"] }
+libghostty-vt-sys = { git = "https://github.com/jamessanford/libghostty-rs", rev = "0bc60291aeaaca618fbd86edd17510c3d42dcab0", default-features = false, features = ["pkg-config", "kitty-graphics"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tonic-prost = "0.14.6"
 
