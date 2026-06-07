@@ -76,19 +76,29 @@ wired in via `tracing_subscriber::fmt().with_writer(|| IgnoreWriteErrors(std::io
 
 Now a dead terminal degrades to dropped log lines instead of a task-killing panic.
 
-### Secondary / defense-in-depth (considered, then DROPPED)
+### Defense-in-depth: RAII cleanup guards (implemented)
+
+The writer fix removes the *cause* of the panic, but two RAII guards now make the
+cleanup itself panic-proof, so any future unwind in these tasks can't strand state:
+
+- **`ConnReaper` (`src/server.rs`)** — owns a connection's `subscribed_ids` /
+  `sub_tasks`; its `Drop` reaps the client's subscribers and aborts its forwarding
+  tasks. Replaces the old straight-line cleanup after the select loop, so it runs
+  whether the task ends cleanly or unwinds. Verified: with the `main.rs` writer fix
+  *temporarily disabled* (panic firing on every abrupt disconnect), the repro still
+  shows 0 leaks — the panic unwinds through `Drop` and reaps.
+
+- **`ReaderExitGuard` (`src/pty.rs`)** — armed for the life of `reader_thread`'s
+  main loop, disarmed once the normal exit path has sent its (richer) `Closed`
+  event. If the loop unwinds instead, the guard's `Drop` still broadcasts a minimal
+  `Closed` and drops the utmp record, so a panicking reader can't leave clients
+  hung on a dead PTY. The drop path deliberately does not touch the libghostty
+  `Terminal` (which may be unsafe to use mid-panic).
 
 An earlier `subscribed_ids`-drift safety net (`remove_subscriber -> bool` +
-registry-wide orphan scan with a WARN canary in the disconnect cleanup) was
-prototyped and then reverted once the real root cause was found: it doesn't help,
-because the panic aborts the task *before* any cleanup runs. The remaining diff is
-just the `main.rs` writer fix.
-
-A better, still-open hardening direction (RAII): hold subscriber registration in a
-`Drop` guard so cleanup runs during unwind regardless of how the task exits
-(return / `?` / panic). That would make subscriber reaping panic-proof. Same idea
-applies to `reader_thread` — a teardown guard that broadcasts `CLOSED` on thread
-exit (incl. panic) so a panicking reader can't silently wedge a PTY.
+registry-wide orphan scan with a WARN canary) was prototyped and reverted: it
+didn't help, because the panic aborts the task *before* any cleanup runs. The
+`Drop`-guard approach supersedes it.
 
 ## Verification
 

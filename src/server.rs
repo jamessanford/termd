@@ -80,6 +80,43 @@ async fn dispatch_command(
     }
 }
 
+/// Owns one connection's subscription bookkeeping and reaps it on drop — whether
+/// the stream task ends cleanly or unwinds (panic). Doing the cleanup from `Drop`
+/// rather than as straight-line code after the loop means a panicking handler
+/// can't strand this client's subscriber entries on their PTYs. See docs/REAP.md
+/// for the bug this hardens against.
+struct ConnReaper {
+    registry:       Arc<PtyRegistry>,
+    subscriber_id:  String,
+    subscribed_ids: std::collections::HashSet<u64>,
+    sub_tasks:      std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ConnReaper {
+    fn drop(&mut self) {
+        tracing::debug!(
+            subscriber_id = %self.subscriber_id,
+            ptys = ?self.subscribed_ids,
+            "stream ended, reaping subscriber"
+        );
+        for &pty_id in &self.subscribed_ids {
+            if let Some(handle) = self.registry.get(pty_id) {
+                handle.close_scrollback(&self.subscriber_id);
+                handle.remove_subscriber(&self.subscriber_id);
+                handle.broadcast_metadata(Arc::new(PtyMetadata {
+                    reason:     MetadataReason::SubscribersChanged,
+                    exit_code:  None,
+                    generation: handle.current_generation(),
+                    info:       handle.info(),
+                }));
+            }
+        }
+        for (_, t) in self.sub_tasks.drain() {
+            t.abort();
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl TerminalService for TerminalServiceImpl {
     type StreamStream = tokio_stream::wrappers::ReceiverStream<Result<proto::TerminalResponse, Status>>;
@@ -100,9 +137,15 @@ impl TerminalService for TerminalServiceImpl {
         let (sub_tx, mut sub_rx) = mpsc::channel::<(u64, PtyEvent)>(1024);
 
         tokio::spawn(async move {
-            let subscriber_id = uuid::Uuid::new_v4().to_string();
-            let mut sub_tasks: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
-            let mut subscribed_ids: HashSet<u64> = HashSet::new();
+            // All subscription bookkeeping lives in the reaper so it's cleaned up on
+            // drop — covering both a clean loop exit and an unwind. Nothing below
+            // needs a manual cleanup block.
+            let mut reaper = ConnReaper {
+                registry:       registry.clone(),
+                subscriber_id:  uuid::Uuid::new_v4().to_string(),
+                subscribed_ids: HashSet::new(),
+                sub_tasks:      HashMap::new(),
+            };
 
             loop {
                 tokio::select! {
@@ -116,7 +159,8 @@ impl TerminalService for TerminalServiceImpl {
                             Some(Ok(cmd)) => {
                                 if log_grpc { tracing::debug!(command = ?cmd, "gRPC request"); }
                                 let resp = dispatch_command(
-                                    cmd, &registry, &subscriber_id, &mut subscribed_ids, &mut sub_tasks, &sub_tx
+                                    cmd, &registry, &reaper.subscriber_id,
+                                    &mut reaper.subscribed_ids, &mut reaper.sub_tasks, &sub_tx,
                                 ).await;
                                 if log_grpc { tracing::debug!(response = ?resp, "gRPC response"); }
                                 if resp_tx.send(Ok(resp)).await.is_err() { break; }
@@ -168,25 +212,9 @@ impl TerminalService for TerminalServiceImpl {
                 }
             }
 
-            // Disconnect cleanup: remove this client from every subscribed PTY
-            tracing::debug!(
-                subscriber_id = %subscriber_id,
-                ptys = ?subscribed_ids,
-                "stream ended, reaping subscriber"
-            );
-            for &pty_id in &subscribed_ids {
-                if let Some(handle) = registry.get(pty_id) {
-                    handle.close_scrollback(&subscriber_id);
-                    handle.remove_subscriber(&subscriber_id);
-                    handle.broadcast_metadata(Arc::new(PtyMetadata {
-                        reason:     MetadataReason::SubscribersChanged,
-                        exit_code:  None,
-                        generation: handle.current_generation(),
-                        info:       handle.info(),
-                    }));
-                }
-            }
-            for (_, t) in sub_tasks { t.abort(); }
+            // `reaper` drops here — on a clean exit or an unwind — reaping this
+            // client's subscriptions and aborting its forwarding tasks.
+            drop(reaper);
         });
 
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(resp_rx)))

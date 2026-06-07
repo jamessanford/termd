@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io::{Read, Write},
-    os::unix::io::{AsRawFd, FromRawFd},
+    os::unix::io::{AsRawFd, FromRawFd, RawFd},
     os::fd::OwnedFd,
     sync::{Arc, Mutex, RwLock, atomic::{AtomicU32, AtomicU64, Ordering}},
     time::SystemTime,
@@ -885,6 +885,69 @@ fn process_read(
     }
 }
 
+/// Fires a `Closed` metadata broadcast (and drops the utmp record) if the reader
+/// thread exits *abnormally*. The normal exit path at the end of `reader_thread`
+/// sends a richer `Closed` event (with exit code and a final screen render) and
+/// then calls `disarm()`, so this guard only acts when the thread unwinds — e.g. a
+/// panic inside libghostty or `process_read`. Without it, a panicked reader would
+/// silently stop, leaving every attached client believing the PTY is still alive.
+///
+/// The drop path is deliberately minimal: it must not touch the libghostty
+/// `Terminal`, which may be mid-operation (and unsafe to use) after a panic.
+struct ReaderExitGuard {
+    armed:      bool,
+    meta_tx:    broadcast::Sender<Arc<PtyMetadata>>,
+    generation: Arc<AtomicU64>,
+    master_fd:  RawFd,
+    pty_id:     u64,
+    hostname:   String,
+    pts_name:   String,
+    title:      Arc<Mutex<String>>,
+    created_at: SystemTime,
+    // Best-effort size for the synthetic Closed event; the live size is tracked in
+    // reader_thread locals, but on the panic path an approximate size is harmless
+    // (the client is tearing the PTY down anyway).
+    cols:       u32,
+    rows:       u32,
+}
+
+impl ReaderExitGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReaderExitGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        crate::utmp::remove_record(self.master_fd);
+        // Tolerate a poisoned title lock — a panic may have happened while it was held.
+        let title = match self.title.lock() {
+            Ok(g)  => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        let _ = self.meta_tx.send(Arc::new(PtyMetadata {
+            reason:     MetadataReason::Closed,
+            exit_code:  None,
+            generation: self.generation.load(Ordering::Relaxed),
+            info: PtyInfo {
+                id:                 self.pty_id,
+                hostname:           self.hostname.clone(),
+                pts_name:           self.pts_name.clone(),
+                cols:               self.cols,
+                rows:               self.rows,
+                title,
+                created_at:         self.created_at,
+                last_subscribed_at: None,
+                subscribers:        None,
+                sort_order:         0,
+            },
+        }));
+    }
+}
+
 // Reader thread — owns libghostty Terminal state (not Send + Sync).
 #[allow(clippy::too_many_arguments)]
 fn reader_thread(
@@ -953,6 +1016,23 @@ fn reader_thread(
     let master_fd = master.as_raw_fd();
     let wakeup_fd = wakeup_read.as_raw_fd();
 
+    // Armed for the whole loop; disarmed once the normal exit path below has sent
+    // its own Closed event. If the loop unwinds (panic), this guard's Drop still
+    // tells clients the PTY is gone instead of leaving them hung on a dead reader.
+    let mut exit_guard = ReaderExitGuard {
+        armed:      true,
+        meta_tx:    meta_tx.clone(),
+        generation: generation.clone(),
+        master_fd,
+        pty_id,
+        hostname:   hostname.clone(),
+        pts_name:   pts_name.clone(),
+        title:      title.clone(),
+        created_at,
+        cols:       current_cols,
+        rows:       current_rows,
+    };
+
     let mut buf = [0u8; 4096];
     'main: loop {
         // Drain the wakeup pipe, then handle any pending resize and refresh requests
@@ -962,6 +1042,8 @@ fn reader_thread(
         while let Ok((cols, rows)) = resize_rx.try_recv() {
             current_cols = cols;
             current_rows = rows;
+            exit_guard.cols = cols;
+            exit_guard.rows = rows;
             if let Err(e) = terminal.resize(cols as u16, rows as u16, 0, 0) {
                 tracing::debug!("PTY reader: terminal resize failed: {e}");
             } else {
@@ -1138,6 +1220,8 @@ fn reader_thread(
             sort_order: 0,     // lives on PtyHandle, unavailable here
         },
     }));
+    // Normal exit has now announced Closed; stop the guard from sending a second.
+    exit_guard.disarm();
 
     // Service refreshes deferred at exit, plus any that arrived just before it.
     // The terminal is final now, so render directly without waiting for a boundary.
