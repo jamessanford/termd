@@ -15,6 +15,24 @@ use termd::{
     server,
 };
 
+/// A `std::io::Write` wrapper that attempts the underlying write but never
+/// reports an error. Used for the daemon's tracing output so that a stdout/stderr
+/// gone bad (EIO after the controlling terminal disappears) degrades to dropped
+/// log lines instead of a panic that would tear down the logging task. See the
+/// `with_writer` call in `Cmd::Start` for the full rationale.
+struct IgnoreWriteErrors<W>(W);
+
+impl<W: std::io::Write> std::io::Write for IgnoreWriteErrors<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = self.0.write_all(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = self.0.flush();
+        Ok(())
+    }
+}
+
 mod attach;
 
 fn default_socket() -> PathBuf {
@@ -157,6 +175,17 @@ async fn main() -> Result<()> {
                     tracing_subscriber::EnvFilter::try_from_default_env()
                         .unwrap_or_else(|_| level.into()),
                 )
+                // Write logs through a wrapper that never surfaces write errors.
+                // A backgrounded daemon can outlive its controlling terminal
+                // (started in a shell that later closes); its stdout/stderr then
+                // fail every write with EIO. tracing-subscriber reacts to a writer
+                // error by falling back to eprintln!, which itself panics when
+                // stderr is also broken ("failed printing to stderr"). That panic
+                // unwinds whatever task happened to be logging — including a
+                // connection's disconnect-cleanup path, which leaks that client's
+                // subscriber entries. Swallowing the error makes logging a silent
+                // no-op instead of a process-corrupting panic.
+                .with_writer(|| IgnoreWriteErrors(std::io::stdout()))
                 .init();
 
             if let Some(parent) = socket.parent() {
