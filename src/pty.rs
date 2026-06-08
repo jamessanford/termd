@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io::{Read, Write},
-    os::unix::io::{AsRawFd, FromRawFd, RawFd},
+    os::unix::io::{AsRawFd, FromRawFd},
     os::fd::OwnedFd,
     sync::{Arc, Mutex, RwLock, atomic::{AtomicU32, AtomicU64, Ordering}},
     time::SystemTime,
@@ -885,65 +885,49 @@ fn process_read(
     }
 }
 
-/// Fires a `Closed` metadata broadcast (and drops the utmp record) if the reader
-/// thread exits *abnormally*. The normal exit path at the end of `reader_thread`
-/// sends a richer `Closed` event (with exit code and a final screen render) and
-/// then calls `disarm()`, so this guard only acts when the thread unwinds — e.g. a
-/// panic inside libghostty or `process_read`. Without it, a panicked reader would
-/// silently stop, leaving every attached client believing the PTY is still alive.
-///
-/// The drop path is deliberately minimal: it must not touch the libghostty
-/// `Terminal`, which may be mid-operation (and unsafe to use) after a panic.
-struct ReaderExitGuard {
-    armed:      bool,
-    meta_tx:    broadcast::Sender<Arc<PtyMetadata>>,
-    generation: Arc<AtomicU64>,
-    master_fd:  RawFd,
-    pty_id:     u64,
-    hostname:   String,
-    pts_name:   String,
-    title:      Arc<Mutex<String>>,
-    created_at: SystemTime,
-    // Best-effort size for the synthetic Closed event; the live size is tracked in
-    // reader_thread locals, but on the panic path an approximate size is harmless
-    // (the client is tearing the PTY down anyway).
-    cols:       u32,
-    rows:       u32,
-}
-
-impl ReaderExitGuard {
-    fn disarm(&mut self) {
-        self.armed = false;
+impl PtyInfo {
+    /// Barebones info for a `Closed` event. Only `id` is read by consumers off a
+    /// `Closed` (it identifies the PTY); the rest is ignored there — see
+    /// `ClosedNotifier`. `exit_code` / `generation` travel as their own fields on
+    /// `PtyMetadata`, not in here.
+    fn closed(id: u64, created_at: SystemTime) -> Self {
+        PtyInfo {
+            id,
+            hostname: String::new(),
+            pts_name: String::new(),
+            cols: 0,
+            rows: 0,
+            title: String::new(),
+            created_at,
+            last_subscribed_at: None,
+            subscribers: None,
+            sort_order: 0,
+        }
     }
 }
 
-impl Drop for ReaderExitGuard {
+/// Sole emitter of `reader_thread`'s `Closed` metadata, fired from `Drop` so it runs
+/// whether the thread returns normally or unwinds. The normal exit path sets
+/// `exit_code` before falling through; a panic leaves it `None` ("unknown"). The
+/// payload is deliberately barebones (no consumer reads title/size/host off a
+/// `Closed`), which keeps this guard to a few copy-cheap fields with no mirrored
+/// state. It does not touch the libghostty `Terminal` (unsafe mid-panic) or the utmp
+/// record (a leaked record on a reader panic is tolerated; the normal path removes it).
+struct ClosedNotifier {
+    meta_tx:    broadcast::Sender<Arc<PtyMetadata>>,
+    generation: Arc<AtomicU64>,
+    pty_id:     u64,
+    created_at: SystemTime,
+    exit_code:  Option<i32>,
+}
+
+impl Drop for ClosedNotifier {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        crate::utmp::remove_record(self.master_fd);
-        // Tolerate a poisoned title lock — a panic may have happened while it was held.
-        let title = match self.title.lock() {
-            Ok(g)  => g.clone(),
-            Err(p) => p.into_inner().clone(),
-        };
         let _ = self.meta_tx.send(Arc::new(PtyMetadata {
             reason:     MetadataReason::Closed,
-            exit_code:  None,
+            exit_code:  self.exit_code,
             generation: self.generation.load(Ordering::Relaxed),
-            info: PtyInfo {
-                id:                 self.pty_id,
-                hostname:           self.hostname.clone(),
-                pts_name:           self.pts_name.clone(),
-                cols:               self.cols,
-                rows:               self.rows,
-                title,
-                created_at:         self.created_at,
-                last_subscribed_at: None,
-                subscribers:        None,
-                sort_order:         0,
-            },
+            info:       PtyInfo::closed(self.pty_id, self.created_at),
         }));
     }
 }
@@ -1016,21 +1000,16 @@ fn reader_thread(
     let master_fd = master.as_raw_fd();
     let wakeup_fd = wakeup_read.as_raw_fd();
 
-    // Armed for the whole loop; disarmed once the normal exit path below has sent
-    // its own Closed event. If the loop unwinds (panic), this guard's Drop still
-    // tells clients the PTY is gone instead of leaving them hung on a dead reader.
-    let mut exit_guard = ReaderExitGuard {
-        armed:      true,
+    // Emits the `Closed` metadata from its Drop — on a clean return below (after
+    // exit_code is set) or on an unwind. A panic thus still tells attached clients the
+    // PTY is gone (they key off StreamMetadataReason::Closed to detach) instead of
+    // leaving them hung. utmp removal stays on the normal path only (leak on panic OK).
+    let mut closed = ClosedNotifier {
         meta_tx:    meta_tx.clone(),
         generation: generation.clone(),
-        master_fd,
         pty_id,
-        hostname:   hostname.clone(),
-        pts_name:   pts_name.clone(),
-        title:      title.clone(),
         created_at,
-        cols:       current_cols,
-        rows:       current_rows,
+        exit_code:  None,
     };
 
     let mut buf = [0u8; 4096];
@@ -1042,8 +1021,6 @@ fn reader_thread(
         while let Ok((cols, rows)) = resize_rx.try_recv() {
             current_cols = cols;
             current_rows = rows;
-            exit_guard.cols = cols;
-            exit_guard.rows = rows;
             if let Err(e) = terminal.resize(cols as u16, rows as u16, 0, 0) {
                 tracing::debug!("PTY reader: terminal resize failed: {e}");
             } else {
@@ -1202,26 +1179,9 @@ fn reader_thread(
         generation: gen,
         data: Bytes::from(exit_msg.into_bytes()),
     }));
-    let exit_code = status.as_ref().and_then(|s| s.code());
-    let _ = meta_tx.send(Arc::new(PtyMetadata {
-        reason: MetadataReason::Closed,
-        exit_code,
-        generation: generation.load(Ordering::Relaxed),
-        info: PtyInfo {
-            id: pty_id,
-            hostname: hostname.clone(),
-            pts_name: pts_name.clone(),
-            cols: current_cols,
-            rows: current_rows,
-            title: title.lock().unwrap().clone(),
-            created_at,
-            last_subscribed_at: None,
-            subscribers: None, // subscriber map lives on PtyHandle, unavailable here
-            sort_order: 0,     // lives on PtyHandle, unavailable here
-        },
-    }));
-    // Normal exit has now announced Closed; stop the guard from sending a second.
-    exit_guard.disarm();
+    // Hand the real exit code to the notifier; its Drop emits the Closed event (here
+    // on a normal return, or during unwind on a panic).
+    closed.exit_code = status.as_ref().and_then(|s| s.code());
 
     // Service refreshes deferred at exit, plus any that arrived just before it.
     // The terminal is final now, so render directly without waiting for a boundary.

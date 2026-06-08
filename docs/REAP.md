@@ -78,8 +78,8 @@ Now a dead terminal degrades to dropped log lines instead of a task-killing pani
 
 ### Defense-in-depth: RAII cleanup guards (implemented)
 
-The writer fix removes the *cause* of the panic, but two RAII guards now make the
-cleanup itself panic-proof, so any future unwind in these tasks can't strand state:
+The writer fix removes the *cause* of the panic; two `Drop` guards make the cleanup
+itself panic-proof so any future unwind can't strand state:
 
 - **`ConnReaper` (`src/server.rs`)** — owns a connection's `subscribed_ids` /
   `sub_tasks`; its `Drop` reaps the client's subscribers and aborts its forwarding
@@ -88,12 +88,18 @@ cleanup itself panic-proof, so any future unwind in these tasks can't strand sta
   *temporarily disabled* (panic firing on every abrupt disconnect), the repro still
   shows 0 leaks — the panic unwinds through `Drop` and reaps.
 
-- **`ReaderExitGuard` (`src/pty.rs`)** — armed for the life of `reader_thread`'s
-  main loop, disarmed once the normal exit path has sent its (richer) `Closed`
-  event. If the loop unwinds instead, the guard's `Drop` still broadcasts a minimal
-  `Closed` and drops the utmp record, so a panicking reader can't leave clients
-  hung on a dead PTY. The drop path deliberately does not touch the libghostty
-  `Terminal` (which may be unsafe to use mid-panic).
+- **`ClosedNotifier` (`src/pty.rs`)** — the sole emitter of `reader_thread`'s
+  `Closed` metadata, fired from `Drop` on both the normal return and an unwind, so a
+  panicking reader still tells attached clients the PTY is gone (they detach on
+  `StreamMetadataReason::Closed`) instead of hanging. The normal path sets its
+  `exit_code` before falling through; a panic leaves it `None`. The payload is
+  **barebones** (`id` + `created_at` + exit code) because no consumer reads
+  title/size/host off a `Closed` — that keeps the guard to a few copy-cheap fields
+  with no mirrored live state. It does **not** touch the libghostty `Terminal`
+  (unsafe mid-panic), and utmp removal stays on the normal path only (a leaked utmp
+  record on a reader panic is tolerated). An earlier version tried to reproduce the
+  *rich* `Closed` (title/host/cols/rows) from `Drop`, which forced a mirrored
+  `cols`/`rows` copy and an `armed` latch; the barebones form removes both.
 
 An earlier `subscribed_ids`-drift safety net (`remove_subscriber -> bool` +
 registry-wide orphan scan with a WARN canary) was prototyped and reverted: it
