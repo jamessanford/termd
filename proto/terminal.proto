@@ -122,6 +122,9 @@ enum StreamMetadataReason {
   CLOSED              = 1;
   TITLE_CHANGED       = 2;
   SUBSCRIBERS_CHANGED = 3;
+  // This subscriber lagged the server's broadcast and stream data was lost.
+  // The client should request a Refresh to resynchronize its screen.
+  DATA_LOST           = 4;
 }
 
 message StreamMetadata {

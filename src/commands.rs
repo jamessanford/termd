@@ -144,7 +144,7 @@ pub fn handle_destroy(
     }
 }
 
-pub fn handle_subscribe(
+pub async fn handle_subscribe(
     registry:       &PtyRegistry,
     req:            SubscribeRequest,
     subscriber_id:  &str,
@@ -219,7 +219,10 @@ pub fn handle_subscribe(
             if let Some(best) = best_fit_size(subs) {
                 let allow_shrink = subs.len() == 1;
                 if let Some((cols, rows)) = refit_target((snapshot.cols, snapshot.rows), best, allow_shrink) {
-                    handle.resize_detached(cols, rows);
+                    // Await the reader's ack (ignoring the outcome) so the refit has
+                    // taken effect before the Subscribe response goes out — callers
+                    // and tests rely on List showing the refitted size immediately.
+                    let _ = handle.resize(cols, rows).await;
                 }
             }
             handle.broadcast_metadata(Arc::new(PtyMetadata {

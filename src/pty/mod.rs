@@ -58,6 +58,9 @@ pub enum MetadataReason {
     Closed,
     TitleChanged,
     SubscribersChanged,
+    /// Synthesized per-subscriber by the forwarding task on broadcast lag —
+    /// never emitted by the reader thread.
+    DataLost,
 }
 
 #[derive(Clone, Debug)]
@@ -211,13 +214,6 @@ impl PtyHandle {
     pub async fn resize(&self, cols: u32, rows: u32) -> Result<()> {
         let rx = self.request_resize(cols, rows)?;
         rx.await.map_err(|_| anyhow!("PTY reader thread dropped resize response"))?
-    }
-
-    /// Fire-and-forget resize for callers that don't care about the outcome
-    /// (subscriber refit). Dropping the reply receiver is fine — the reader's
-    /// reply send becomes a no-op.
-    pub fn resize_detached(&self, cols: u32, rows: u32) {
-        let _ = self.request_resize(cols, rows);
     }
 
     pub fn set_title(&self, title: &str) {

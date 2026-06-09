@@ -70,7 +70,7 @@ async fn dispatch_command(
         Some(Command::List(_r))        => commands::handle_list(registry),
         Some(Command::Create(r))       => commands::handle_create(registry, r),
         Some(Command::Destroy(r))      => commands::handle_destroy(registry, r, subscriber_id, subscribed_ids, sub_tasks),
-        Some(Command::Subscribe(r))    => commands::handle_subscribe(registry, r, subscriber_id, subscribed_ids, sub_tasks, sub_tx),
+        Some(Command::Subscribe(r))    => commands::handle_subscribe(registry, r, subscriber_id, subscribed_ids, sub_tasks, sub_tx).await,
         Some(Command::Unsubscribe(r))  => commands::handle_unsubscribe(registry, r, subscriber_id, subscribed_ids, sub_tasks),
         Some(Command::Write(r))        => commands::handle_write(registry, r),
         Some(Command::Resize(r))       => commands::handle_resize(registry, r).await,
@@ -193,6 +193,7 @@ impl TerminalService for TerminalServiceImpl {
                                     MetadataReason::Closed             => StreamMetadataReason::Closed,
                                     MetadataReason::TitleChanged       => StreamMetadataReason::TitleChanged,
                                     MetadataReason::SubscribersChanged => StreamMetadataReason::SubscribersChanged,
+                                    MetadataReason::DataLost           => StreamMetadataReason::DataLost,
                                 };
                                 proto::TerminalResponse {
                                     response: Some(proto::terminal_response::Response::Metadata(
