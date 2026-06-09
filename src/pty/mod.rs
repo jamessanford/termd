@@ -162,7 +162,6 @@ impl PtyHandle {
         self.shared.info()
     }
 
-    #[allow(dead_code)] // non-test caller arrives with the forwarding-task extraction
     pub(crate) fn shared(&self) -> Arc<PtyShared> {
         self.shared.clone()
     }

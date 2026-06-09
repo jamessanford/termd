@@ -4,8 +4,65 @@ use prost_types::Timestamp;
 
 use crate::{
     proto::{self, terminal_response::Response, *},
-    pty::{MetadataReason, PtyEvent, PtyInfo, PtyMetadata, PtyRegistry, SubscriberInfo},
+    pty::{MetadataReason, PtyEvent, PtyInfo, PtyMetadata, PtyRegistry, PtyShared, SubscriberInfo},
 };
+
+/// The per-subscriber DataLost event: this subscriber fell behind the broadcast
+/// and events were dropped. Carries real PtyInfo from the shared state (the
+/// forwarding task holds Arc<PtyShared>, deliberately NOT Arc<PtyHandle> —
+/// that would keep wakeup_write alive and break destroy-by-drop).
+fn data_lost_event(shared: &PtyShared) -> PtyEvent {
+    use std::sync::atomic::Ordering;
+    PtyEvent::Metadata(Arc::new(PtyMetadata {
+        reason:     MetadataReason::DataLost,
+        exit_code:  None,
+        generation: shared.generation.load(Ordering::Relaxed),
+        info:       shared.info(),
+    }))
+}
+
+/// Forwards one PTY's data + metadata broadcasts to a connection's event queue,
+/// tagging each with the pty_id. On broadcast lag the dropped events are gone
+/// for good, so the subscriber is told explicitly (DataLost) and is expected to
+/// recover by requesting a Refresh. Runs until both broadcasts close or the
+/// connection's queue drops.
+pub(crate) async fn forward_subscription(
+    pty_id:  u64,
+    shared:  Arc<PtyShared>,
+    data_rx: tokio::sync::broadcast::Receiver<PtyEvent>,
+    meta_rx: tokio::sync::broadcast::Receiver<Arc<PtyMetadata>>,
+    tx:      tokio::sync::mpsc::Sender<(u64, PtyEvent)>,
+) {
+    use tokio_stream::{StreamExt, wrappers::{BroadcastStream, errors::BroadcastStreamRecvError}};
+    let mut data_stream = BroadcastStream::new(data_rx);
+    let mut meta_stream = BroadcastStream::new(meta_rx);
+    loop {
+        tokio::select! {
+            item = data_stream.next() => match item {
+                Some(Ok(event)) => {
+                    if tx.send((pty_id, event)).await.is_err() { break; }
+                }
+                Some(Err(BroadcastStreamRecvError::Lagged(n))) => {
+                    tracing::warn!(pty_id = format!("{:016x}", pty_id), skipped = n, "data broadcast lagged");
+                    if tx.send((pty_id, data_lost_event(&shared))).await.is_err() { break; }
+                }
+                None => break,
+            },
+            item = meta_stream.next() => match item {
+                Some(Ok(meta)) => {
+                    if tx.send((pty_id, PtyEvent::Metadata(meta))).await.is_err() { break; }
+                }
+                Some(Err(BroadcastStreamRecvError::Lagged(n))) => {
+                    tracing::warn!(pty_id = format!("{:016x}", pty_id), skipped = n, "meta broadcast lagged");
+                    // A lagged-away Resize/TitleChanged is also repaired by a
+                    // refresh (RefreshResponse carries cols/rows).
+                    if tx.send((pty_id, data_lost_event(&shared))).await.is_err() { break; }
+                }
+                None => break,
+            },
+        }
+    }
+}
 
 /// Smallest bounding box that fits every subscriber, so no client has its
 /// content clipped. Subscribers that report an unknown (zero) size are ignored.
@@ -170,37 +227,13 @@ pub async fn handle_subscribe(
                 created_at: std::time::SystemTime::now(),
             };
             if !subscribed_ids.contains(&id) {
-                let data_rx = handle.subscribe();
-                let meta_rx = handle.meta_subscribe();
-                let tx = sub_tx.clone();
-                let pty_id_clone = id;
-                let task = tokio::spawn(async move {
-                    use tokio_stream::{StreamExt, wrappers::{BroadcastStream, errors::BroadcastStreamRecvError}};
-                    let mut data_stream = BroadcastStream::new(data_rx);
-                    let mut meta_stream = BroadcastStream::new(meta_rx);
-                    loop {
-                        tokio::select! {
-                            item = data_stream.next() => match item {
-                                Some(Ok(event)) => {
-                                    if tx.send((pty_id_clone, event)).await.is_err() { break; }
-                                }
-                                Some(Err(BroadcastStreamRecvError::Lagged(n))) => {
-                                    tracing::warn!(pty_id = format!("{:016x}", pty_id_clone), skipped = n, "data broadcast lagged");
-                                }
-                                None => break,
-                            },
-                            item = meta_stream.next() => match item {
-                                Some(Ok(meta)) => {
-                                    if tx.send((pty_id_clone, PtyEvent::Metadata(meta))).await.is_err() { break; }
-                                }
-                                Some(Err(BroadcastStreamRecvError::Lagged(n))) => {
-                                    tracing::warn!(pty_id = format!("{:016x}", pty_id_clone), skipped = n, "meta broadcast lagged");
-                                }
-                                None => break,
-                            },
-                        }
-                    }
-                });
+                let task = tokio::spawn(forward_subscription(
+                    id,
+                    handle.shared(),
+                    handle.subscribe(),
+                    handle.meta_subscribe(),
+                    sub_tx.clone(),
+                ));
                 sub_tasks.insert(id, task);
                 subscribed_ids.insert(id);
             }
@@ -441,5 +474,84 @@ mod tests {
     fn refit_none_when_equal_even_if_shrink_allowed() {
         // No resize when the PTY already matches the subscriber exactly.
         assert_eq!(refit_target((80, 24), (80, 24), true), None);
+    }
+
+    use std::sync::Arc;
+    use std::time::Duration;
+    use bytes::Bytes;
+    use tokio::sync::broadcast;
+    use crate::pty::{MetadataReason, PtyChunk, PtyEvent, PtyMetadata, PtyShared};
+
+    fn test_shared() -> Arc<PtyShared> {
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        Arc::new(PtyShared {
+            id: 7,
+            hostname: String::new(),
+            pts_name: String::new(),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            cols: AtomicU32::new(80),
+            rows: AtomicU32::new(24),
+            title: std::sync::Mutex::new(String::new()),
+            generation: AtomicU64::new(0),
+            subscribers: std::sync::RwLock::new(std::collections::HashMap::new()),
+            last_subscribed_at: std::sync::Mutex::new(None),
+            sort_order: AtomicU32::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn forwarding_passes_data_through() {
+        let (data_tx, data_rx) = broadcast::channel::<PtyEvent>(8);
+        let (meta_tx, meta_rx) = broadcast::channel::<Arc<PtyMetadata>>(8);
+        let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel(8);
+        let task = tokio::spawn(forward_subscription(9, test_shared(), data_rx, meta_rx, sub_tx));
+
+        data_tx.send(PtyEvent::Data(PtyChunk { generation: 1, data: Bytes::from_static(b"hi") })).unwrap();
+        let (pty_id, ev) = tokio::time::timeout(Duration::from_secs(5), sub_rx.recv())
+            .await.expect("timed out").expect("channel closed");
+        assert_eq!(pty_id, 9);
+        assert!(matches!(ev, PtyEvent::Data(c) if c.data.as_ref() == b"hi"));
+
+        drop(data_tx);
+        drop(meta_tx);
+        task.await.unwrap(); // both broadcasts closed => task exits
+    }
+
+    #[tokio::test]
+    async fn forwarding_emits_data_lost_on_lag() {
+        let (data_tx, data_rx) = broadcast::channel::<PtyEvent>(8);
+        let (meta_tx, meta_rx) = broadcast::channel::<Arc<PtyMetadata>>(8);
+        let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel(64);
+
+        // Overflow the 8-slot ring before the task starts draining: the
+        // receiver's first poll yields Lagged(12).
+        for i in 0..20u64 {
+            data_tx.send(PtyEvent::Data(PtyChunk {
+                generation: i,
+                data: Bytes::from_static(b"x"),
+            })).unwrap();
+        }
+        let task = tokio::spawn(forward_subscription(7, test_shared(), data_rx, meta_rx, sub_tx));
+
+        let mut saw_data_lost = false;
+        for _ in 0..25 {
+            match tokio::time::timeout(Duration::from_secs(5), sub_rx.recv()).await {
+                Ok(Some((pty_id, PtyEvent::Metadata(m))))
+                    if matches!(m.reason, MetadataReason::DataLost) =>
+                {
+                    assert_eq!(pty_id, 7);
+                    assert_eq!(m.info.id, 7, "DataLost must carry real PtyShared info");
+                    saw_data_lost = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(saw_data_lost, "lagged subscriber must receive a DataLost metadata");
+
+        drop(data_tx);
+        drop(meta_tx);
+        task.await.unwrap();
     }
 }
