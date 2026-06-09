@@ -355,7 +355,7 @@ async fn test_resize_broadcasts_metadata() {
     let handle = registry.create(80, 24, None).unwrap();
     let mut rx = handle.meta_subscribe();
 
-    handle.resize(120, 40).unwrap();
+    handle.resize(120, 40).await.unwrap();
 
     let found = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -384,7 +384,7 @@ async fn test_resize_broadcasts_refresh_event() {
     let handle = registry.create(80, 24, None).unwrap();
     let mut rx = handle.subscribe();
 
-    handle.resize(120, 40).unwrap();
+    handle.resize(120, 40).await.unwrap();
 
     let found = tokio::time::timeout(Duration::from_secs(2), async {
         loop {

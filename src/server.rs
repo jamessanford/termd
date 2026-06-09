@@ -73,7 +73,7 @@ async fn dispatch_command(
         Some(Command::Subscribe(r))    => commands::handle_subscribe(registry, r, subscriber_id, subscribed_ids, sub_tasks, sub_tx),
         Some(Command::Unsubscribe(r))  => commands::handle_unsubscribe(registry, r, subscriber_id, subscribed_ids, sub_tasks),
         Some(Command::Write(r))        => commands::handle_write(registry, r),
-        Some(Command::Resize(r))       => commands::handle_resize(registry, r),
+        Some(Command::Resize(r))       => commands::handle_resize(registry, r).await,
         Some(Command::SetTitle(r))     => commands::handle_set_title(registry, r),
         Some(Command::Refresh(r))      => commands::handle_refresh(registry, r).await,
         Some(Command::Scrollback(r))   => commands::handle_scrollback(registry, r, subscriber_id).await,

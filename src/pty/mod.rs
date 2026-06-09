@@ -20,7 +20,7 @@ use tokio::sync::{broadcast, oneshot};
 mod reader;
 mod snapshot;
 
-use reader::{reader_thread, ScrollbackReq};
+use reader::{Reader, ReaderRequest};
 
 const TERM_NAME: &str = "xterm-ghostty";
 // TODO: expose from libghostty_vt::build_info when available
@@ -150,9 +150,7 @@ pub struct PtyHandle {
     shared: Arc<PtyShared>,
     tx: broadcast::Sender<PtyEvent>,
     writer: Mutex<File>,
-    refresh_tx:    std::sync::mpsc::SyncSender<oneshot::Sender<Result<RefreshData>>>,
-    scrollback_tx: std::sync::mpsc::SyncSender<ScrollbackReq>,
-    resize_tx:     std::sync::mpsc::SyncSender<(u32, u32)>,
+    req_tx: std::sync::mpsc::Sender<ReaderRequest>,
     meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
     child_pid: Pid,
     wakeup_write: OwnedFd,
@@ -184,38 +182,37 @@ impl PtyHandle {
         self.writer.lock().unwrap().write_all(data).context("write to PTY")
     }
 
-    pub fn resize(&self, cols: u32, rows: u32) -> Result<()> {
-        use nix::pty::Winsize;
-        use nix::libc;
-        let ws = Winsize {
-            ws_col: cols as u16,
-            ws_row: rows as u16,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        let fd = {
-            use std::os::unix::io::AsRawFd;
-            self.writer.lock().unwrap().as_raw_fd()
-        };
-        let ret = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws as *const Winsize) };
-        if ret < 0 {
-            return Err(anyhow!("TIOCSWINSZ failed: {}", std::io::Error::last_os_error()));
-        }
-        self.shared.cols.store(cols, Ordering::Relaxed);
-        self.shared.rows.store(rows, Ordering::Relaxed);
-        // Notify reader thread so libghostty Terminal dimensions stay in sync.
-        // Best-effort: if the channel is full or the thread is gone, skip silently.
-        let _ = self.resize_tx.try_send((cols, rows));
+    /// One-byte poke so a poll()-parked reader notices a queued request promptly.
+    fn wake(&self) {
         let wfd = self.wakeup_write.as_raw_fd();
-        let _ = unsafe { libc::write(wfd, [2u8].as_ptr() as *const libc::c_void, 1) };
-        // Broadcast updated state to all subscribers
-        let _ = self.meta_tx.send(Arc::new(PtyMetadata {
-            reason: MetadataReason::Resize,
-            exit_code: None,
-            generation: self.shared.generation.load(Ordering::Relaxed),
-            info: self.info(),
-        }));
-        Ok(())
+        let ret = unsafe { libc::write(wfd, [1u8].as_ptr() as *const libc::c_void, 1) };
+        if ret < 0 {
+            tracing::debug!("wakeup write failed: {}", std::io::Error::last_os_error());
+        }
+    }
+
+    fn request_resize(&self, cols: u32, rows: u32) -> Result<oneshot::Receiver<Result<()>>> {
+        let (tx, rx) = oneshot::channel();
+        self.req_tx
+            .send(ReaderRequest::Resize { cols, rows, reply: tx })
+            .map_err(|_| anyhow!("PTY reader thread is dead"))?;
+        self.wake();
+        Ok(rx)
+    }
+
+    /// Resize the PTY. Executed on the reader thread (kernel ioctl, VT resize,
+    /// and the Resize metadata broadcast happen there, in order); this awaits
+    /// the reader's acknowledgement.
+    pub async fn resize(&self, cols: u32, rows: u32) -> Result<()> {
+        let rx = self.request_resize(cols, rows)?;
+        rx.await.map_err(|_| anyhow!("PTY reader thread dropped resize response"))?
+    }
+
+    /// Fire-and-forget resize for callers that don't care about the outcome
+    /// (subscriber refit). Dropping the reply receiver is fine — the reader's
+    /// reply send becomes a no-op.
+    pub fn resize_detached(&self, cols: u32, rows: u32) {
+        let _ = self.request_resize(cols, rows);
     }
 
     pub fn set_title(&self, title: &str) {
@@ -224,13 +221,10 @@ impl PtyHandle {
 
     pub async fn refresh(&self) -> Result<RefreshData> {
         let (tx, rx) = oneshot::channel();
-        self.refresh_tx.send(tx).map_err(|_| anyhow!("PTY reader thread is dead"))?;
-        // Wake the reader immediately so it handles the refresh before the next PTY event.
-        let wfd = self.wakeup_write.as_raw_fd();
-        let ret = unsafe { libc::write(wfd, [1u8].as_ptr() as *const libc::c_void, 1) };
-        if ret < 0 {
-            tracing::debug!("wakeup write failed: {}", std::io::Error::last_os_error());
-        }
+        self.req_tx
+            .send(ReaderRequest::Refresh { reply: tx })
+            .map_err(|_| anyhow!("PTY reader thread is dead"))?;
+        self.wake();
         rx.await.map_err(|_| anyhow!("PTY reader thread dropped refresh response"))?
     }
 
@@ -242,26 +236,23 @@ impl PtyHandle {
         row_count: u32,
     ) -> Result<ScrollbackData> {
         let (tx, rx) = oneshot::channel();
-        self.scrollback_tx.send(ScrollbackReq {
-            subscriber_id: subscriber_id.to_owned(), op, amount, row_count, reply: tx,
-        }).map_err(|_| anyhow!("PTY reader thread is dead"))?;
-        let wfd = self.wakeup_write.as_raw_fd();
-        let ret = unsafe { libc::write(wfd, [1u8].as_ptr() as *const libc::c_void, 1) };
-        if ret < 0 {
-            tracing::debug!("wakeup write failed: {}", std::io::Error::last_os_error());
-        }
+        self.req_tx
+            .send(ReaderRequest::Scrollback {
+                subscriber_id: subscriber_id.to_owned(), op, amount, row_count, reply: tx,
+            })
+            .map_err(|_| anyhow!("PTY reader thread is dead"))?;
+        self.wake();
         rx.await.map_err(|_| anyhow!("PTY reader thread dropped scrollback response"))?
     }
 
     /// Best-effort release of a subscriber's scrollback pin (teardown paths).
     pub fn close_scrollback(&self, subscriber_id: &str) {
         let (tx, _rx) = oneshot::channel();
-        let _ = self.scrollback_tx.try_send(ScrollbackReq {
+        let _ = self.req_tx.send(ReaderRequest::Scrollback {
             subscriber_id: subscriber_id.to_owned(),
             op: ScrollbackOp::Close, amount: 0, row_count: 0, reply: tx,
         });
-        let wfd = self.wakeup_write.as_raw_fd();
-        let _ = unsafe { libc::write(wfd, [1u8].as_ptr() as *const libc::c_void, 1) };
+        self.wake();
     }
 
     pub fn id(&self) -> u64 {
@@ -387,11 +378,7 @@ impl PtyRegistry {
 
         let (tx, _) = broadcast::channel::<PtyEvent>(512);
         let (meta_tx, _) = broadcast::channel::<Arc<PtyMetadata>>(64);
-        let (refresh_tx, refresh_rx) =
-            std::sync::mpsc::sync_channel::<oneshot::Sender<Result<RefreshData>>>(8);
-        let (scrollback_tx, scrollback_rx) =
-            std::sync::mpsc::sync_channel::<ScrollbackReq>(8);
-        let (resize_tx, resize_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(8);
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<ReaderRequest>();
 
         // Create wakeup pipe before spawning the child so that a failure here doesn't
         // leave a zombie process behind.  O_CLOEXEC and O_NONBLOCK are set atomically
@@ -422,9 +409,7 @@ impl PtyRegistry {
             shared: shared.clone(),
             tx: tx.clone(),
             writer: Mutex::new(File::from(master)),
-            refresh_tx,
-            scrollback_tx,
-            resize_tx,
+            req_tx,
             meta_tx: meta_tx.clone(),
             child_pid,
             wakeup_write,
@@ -432,12 +417,27 @@ impl PtyRegistry {
 
         // Spawn dedicated reader thread — owns libghostty state and child process
         let master_reader = File::from(master_reader);
+        let meta_tx_spawn = meta_tx.clone();
+        let shared_spawn = shared.clone();
         std::thread::Builder::new()
             .name(format!("pty-reader-{id:016x}"))
-            .spawn(move || reader_thread(
-                master_reader, tx, refresh_rx, scrollback_rx, resize_rx,
-                wakeup_read, child, meta_tx, shared,
-            ))
+            .spawn(move || {
+                match Reader::new(master_reader, wakeup_read, req_rx, tx, meta_tx, shared, child) {
+                    Ok(r) => r.run(),
+                    Err(e) => {
+                        // Startup failure: there is no Reader (and so no Drop) yet.
+                        // Emit Closed ourselves so the PTY doesn't sit listed forever
+                        // with a dead reader behind it.
+                        tracing::warn!("PTY reader failed to start: {e}");
+                        let _ = meta_tx_spawn.send(Arc::new(PtyMetadata {
+                            reason:     MetadataReason::Closed,
+                            exit_code:  None,
+                            generation: 0,
+                            info:       PtyInfo::closed(shared_spawn.id, shared_spawn.created_at),
+                        }));
+                    }
+                }
+            })
             .context("spawn reader thread")?;
 
         // Assign sort_order and insert atomically so concurrent creates can't
@@ -581,6 +581,32 @@ mod subscriber_tests {
     fn remove_nonexistent_is_noop() {
         let h = make_handle();
         h.remove_subscriber("nonexistent"); // must not panic
+    }
+
+    #[tokio::test]
+    async fn resize_via_request_updates_state_and_broadcasts() {
+        let reg = PtyRegistry::new();
+        let h = reg.create(80, 24, None).unwrap();
+        h.upsert_subscriber("sub-a", make_info("host1"));
+        let mut meta_rx = h.meta_subscribe();
+
+        h.resize(100, 30).await.unwrap();
+
+        let info = h.info();
+        assert_eq!((info.cols, info.rows), (100, 30));
+
+        // The reader broadcast Resize metadata before replying, so it's queued.
+        let meta = tokio::time::timeout(std::time::Duration::from_secs(5), meta_rx.recv())
+            .await.expect("timed out").expect("meta channel closed");
+        assert!(matches!(meta.reason, MetadataReason::Resize));
+        assert_eq!((meta.info.cols, meta.info.rows), (100, 30));
+        // Full info, not a fabricated stub: the subscriber map came through.
+        assert_eq!(meta.info.subscribers.as_ref().unwrap().len(), 1);
+
+        // The refresh path sees the new dimensions.
+        let r = h.refresh().await.unwrap();
+        assert_eq!((r.cols, r.rows), (100, 30));
+        let _ = reg.destroy(h.id());
     }
 
     #[test]

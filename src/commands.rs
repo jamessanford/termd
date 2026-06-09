@@ -219,7 +219,7 @@ pub fn handle_subscribe(
             if let Some(best) = best_fit_size(subs) {
                 let allow_shrink = subs.len() == 1;
                 if let Some((cols, rows)) = refit_target((snapshot.cols, snapshot.rows), best, allow_shrink) {
-                    let _ = handle.resize(cols, rows);
+                    handle.resize_detached(cols, rows);
                 }
             }
             handle.broadcast_metadata(Arc::new(PtyMetadata {
@@ -276,11 +276,11 @@ pub fn handle_write(registry: &PtyRegistry, req: WriteRequest) -> TerminalRespon
     }
 }
 
-pub fn handle_resize(registry: &PtyRegistry, req: ResizeRequest) -> TerminalResponse {
+pub async fn handle_resize(registry: &PtyRegistry, req: ResizeRequest) -> TerminalResponse {
     let id = req.pty_id;
     match registry.get(id) {
         None => err_response(id, "PTY not found".into()),
-        Some(h) => match h.resize(req.cols, req.rows) {
+        Some(h) => match h.resize(req.cols, req.rows).await {
             Ok(_) => ok_response(id),
             Err(e) => err_response(id, e.to_string()),
         },
