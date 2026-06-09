@@ -4,7 +4,7 @@ use std::{
     io::Read,
     os::fd::OwnedFd,
     os::unix::io::AsRawFd,
-    sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}},
+    sync::{Arc, atomic::{AtomicU64, Ordering}},
     time::SystemTime,
 };
 
@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, oneshot};
 
 use super::snapshot::{do_refresh, do_scrollback};
 use super::{
-    MetadataReason, PtyChunk, PtyEvent, PtyInfo, PtyMetadata,
+    MetadataReason, PtyChunk, PtyEvent, PtyInfo, PtyMetadata, PtyShared,
     RefreshData, ScrollbackData, ScrollbackOp,
 };
 
@@ -189,11 +189,9 @@ impl PtyInfo {
 /// state. It does not touch the libghostty `Terminal` (unsafe mid-panic) or the utmp
 /// record (a leaked record on a reader panic is tolerated; the normal path removes it).
 struct ClosedNotifier {
-    meta_tx:    broadcast::Sender<Arc<PtyMetadata>>,
-    generation: Arc<AtomicU64>,
-    pty_id:     u64,
-    created_at: SystemTime,
-    exit_code:  Option<i32>,
+    meta_tx:   broadcast::Sender<Arc<PtyMetadata>>,
+    shared:    Arc<PtyShared>,
+    exit_code: Option<i32>,
 }
 
 impl Drop for ClosedNotifier {
@@ -201,8 +199,8 @@ impl Drop for ClosedNotifier {
         let _ = self.meta_tx.send(Arc::new(PtyMetadata {
             reason:     MetadataReason::Closed,
             exit_code:  self.exit_code,
-            generation: self.generation.load(Ordering::Relaxed),
-            info:       PtyInfo::closed(self.pty_id, self.created_at),
+            generation: self.shared.generation.load(Ordering::Relaxed),
+            info:       PtyInfo::closed(self.shared.id, self.shared.created_at),
         }));
     }
 }
@@ -212,24 +210,17 @@ impl Drop for ClosedNotifier {
 pub(super) fn reader_thread(
     mut master: File,
     tx: broadcast::Sender<PtyEvent>,
-    generation: Arc<AtomicU64>,
     refresh_rx: std::sync::mpsc::Receiver<oneshot::Sender<Result<RefreshData>>>,
     scrollback_rx: std::sync::mpsc::Receiver<ScrollbackReq>,
     resize_rx: std::sync::mpsc::Receiver<(u32, u32)>,
     wakeup_read: OwnedFd,
     mut child: std::process::Child,
-    title: Arc<Mutex<String>>,
-    init_cols: u32,
-    init_rows: u32,
     meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
-    pty_id: u64,
-    hostname: String,
-    pts_name: String,
-    created_at: SystemTime,
+    shared: Arc<PtyShared>,
 ) {
     let mut terminal = match Terminal::new(TerminalOptions {
-        cols: init_cols as u16,
-        rows: init_rows as u16,
+        cols: shared.cols.load(Ordering::Relaxed) as u16,
+        rows: shared.rows.load(Ordering::Relaxed) as u16,
         // Byte budget for scrollback page memory, NOT a line count. libghostty
         // allocates whole ~0.5 MB pages (a page is sized for a 215x215 grid; each
         // Cell is 8 bytes), and every row costs cols*8 bytes regardless of how few
@@ -244,24 +235,23 @@ pub(super) fn reader_thread(
         }
     };
 
-    let title_cb = title.clone();
+    let shared_cb = shared.clone();
     if let Err(e) = terminal.on_title_changed(move |term| {
         if let Ok(t) = term.title() {
-            *title_cb.lock().unwrap() = t.to_string();
+            *shared_cb.title.lock().unwrap() = t.to_string();
         }
     }) {
         tracing::debug!("PTY reader: failed to register title callback: {e}");
         return;
     }
 
-    let mut current_cols = init_cols;
-    let mut current_rows = init_rows;
+    let mut current_cols = shared.cols.load(Ordering::Relaxed);
     // One scrollback pin per subscriber; the pin marks the viewport's top row and
     // libghostty keeps it on its content across appends and eviction.
     let mut scrollback_pins: HashMap<String, TrackedGridRef> = HashMap::new();
     // Initialize prev_title to match the initial title mutex value (pts_name),
     // so we don't emit a spurious TitleChanged before the shell sets any title.
-    let mut prev_title = pts_name.clone();
+    let mut prev_title = shared.pts_name.clone();
     let mut prev_screen = Screen::Primary;
 
     // Refreshes are deferred until the VT parser is at a ground boundary, so a
@@ -280,11 +270,9 @@ pub(super) fn reader_thread(
     // PTY is gone (they key off StreamMetadataReason::Closed to detach) instead of
     // leaving them hung. utmp removal stays on the normal path only (leak on panic OK).
     let mut closed = ClosedNotifier {
-        meta_tx:    meta_tx.clone(),
-        generation: generation.clone(),
-        pty_id,
-        created_at,
-        exit_code:  None,
+        meta_tx:   meta_tx.clone(),
+        shared:    shared.clone(),
+        exit_code: None,
     };
 
     let mut buf = [0u8; 4096];
@@ -295,7 +283,6 @@ pub(super) fn reader_thread(
         unsafe { libc::read(wakeup_fd, wake_byte.as_mut_ptr() as *mut libc::c_void, wake_byte.len()) };
         while let Ok((cols, rows)) = resize_rx.try_recv() {
             current_cols = cols;
-            current_rows = rows;
             if let Err(e) = terminal.resize(cols as u16, rows as u16, 0, 0) {
                 tracing::debug!("PTY reader: terminal resize failed: {e}");
             } else {
@@ -310,10 +297,10 @@ pub(super) fn reader_thread(
         // If the parser is already at a ground boundary, service deferred refreshes
         // now; otherwise they wait for the batch that completes the open sequence.
         if (!pending_replies.is_empty() || pending_broadcast_refresh) && terminal.vt_at_boundary() {
-            flush_refreshes(&terminal, &generation, &tx, &mut pending_replies, &mut pending_broadcast_refresh, false);
+            flush_refreshes(&terminal, &shared.generation, &tx, &mut pending_replies, &mut pending_broadcast_refresh, false);
         }
         while let Ok(req) = scrollback_rx.try_recv() {
-            let gen = generation.load(Ordering::Relaxed);
+            let gen = shared.generation.load(Ordering::Relaxed);
             let result = do_scrollback(
                 &mut terminal, &mut scrollback_pins, &req.subscriber_id,
                 req.op, req.amount, req.row_count, gen, current_cols,
@@ -354,7 +341,7 @@ pub(super) fn reader_thread(
         // hasn't come (app went idle mid-sequence). Snapshot anyway rather than
         // block the attach — a degraded boundary that self-heals on the next repaint.
         if poll_ret == 0 {
-            flush_refreshes(&terminal, &generation, &tx, &mut pending_replies, &mut pending_broadcast_refresh, true);
+            flush_refreshes(&terminal, &shared.generation, &tx, &mut pending_replies, &mut pending_broadcast_refresh, true);
             continue;
         }
 
@@ -392,7 +379,7 @@ pub(super) fn reader_thread(
         // otherwise it's the plain whole-read broadcast. `gen` is the last data chunk's
         // generation, so an accompanying TitleChanged below carries a matching gen.
         let gen = process_read(
-            &mut terminal, Bytes::from(batch), &generation, &tx,
+            &mut terminal, Bytes::from(batch), &shared.generation, &tx,
             &mut pending_replies, &mut pending_broadcast_refresh,
         );
 
@@ -403,25 +390,14 @@ pub(super) fn reader_thread(
             // Defer the new-screen redraw to a ground boundary (serviced below).
             pending_broadcast_refresh = true;
         }
-        let current_title = title.lock().unwrap().clone();
+        let current_title = shared.title.lock().unwrap().clone();
         if current_title != prev_title {
-            prev_title = current_title.clone();
+            prev_title = current_title;
             let _ = meta_tx.send(Arc::new(PtyMetadata {
                 reason: MetadataReason::TitleChanged,
                 exit_code: None,
                 generation: gen,
-                info: PtyInfo {
-                    id: pty_id,
-                    hostname: hostname.clone(),
-                    pts_name: pts_name.clone(),
-                    cols: current_cols,
-                    rows: current_rows,
-                    title: current_title,
-                    created_at,
-                    last_subscribed_at: None,
-                    subscribers: None, // subscriber map lives on PtyHandle, unavailable here
-                    sort_order: 0,     // lives on PtyHandle, unavailable here
-                },
+                info: shared.info(),
             }));
         }
         // A refresh can have become pending *this* round (a screen switch above), and
@@ -429,7 +405,7 @@ pub(super) fn reader_thread(
         // If the read left the parser at ground, service that fresh refresh now;
         // otherwise it waits for the read that completes the open sequence.
         if (!pending_replies.is_empty() || pending_broadcast_refresh) && terminal.vt_at_boundary() {
-            flush_refreshes(&terminal, &generation, &tx, &mut pending_replies, &mut pending_broadcast_refresh, false);
+            flush_refreshes(&terminal, &shared.generation, &tx, &mut pending_replies, &mut pending_broadcast_refresh, false);
         }
     }
 
@@ -437,7 +413,7 @@ pub(super) fn reader_thread(
     let status = child.try_wait().ok().flatten().or_else(|| child.wait().ok());
     crate::utmp::remove_record(master.as_raw_fd());
     let exit_msg = {
-        let title = title.lock().unwrap().clone();
+        let title = shared.title.lock().unwrap().clone();
         match status {
             Some(s) => {
                 if let Some(code) = s.code() {
@@ -449,7 +425,7 @@ pub(super) fn reader_thread(
             None => format!("\r\n[Command {} terminated]\r\n", title),
         }
     };
-    let gen = generation.fetch_add(1, Ordering::Relaxed) + 1;
+    let gen = shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
     let _ = tx.send(PtyEvent::Data(PtyChunk {
         generation: gen,
         data: Bytes::from(exit_msg.into_bytes()),
@@ -461,16 +437,16 @@ pub(super) fn reader_thread(
     // Service refreshes deferred at exit, plus any that arrived just before it.
     // The terminal is final now, so render directly without waiting for a boundary.
     for reply_tx in pending_replies.drain(..) {
-        let gen = generation.load(Ordering::Relaxed);
+        let gen = shared.generation.load(Ordering::Relaxed);
         let _ = reply_tx.send(do_refresh(&terminal, gen));
     }
     while let Ok(reply_tx) = refresh_rx.try_recv() {
-        let gen = generation.load(Ordering::Relaxed);
+        let gen = shared.generation.load(Ordering::Relaxed);
         let result = do_refresh(&terminal, gen);
         let _ = reply_tx.send(result);
     }
     while let Ok(req) = scrollback_rx.try_recv() {
-        let gen = generation.load(Ordering::Relaxed);
+        let gen = shared.generation.load(Ordering::Relaxed);
         let result = do_scrollback(
             &mut terminal, &mut scrollback_pins, &req.subscriber_id,
             req.op, req.amount, req.row_count, gen, current_cols,

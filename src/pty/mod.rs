@@ -102,32 +102,28 @@ pub struct ScrollbackData {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollbackOp { Open, Move, Close }
 
-pub struct PtyHandle {
-    id: u64,
-    pts_name: String,
-    created_at: SystemTime,
-    hostname: String,
-    cols: AtomicU32,
-    rows: AtomicU32,
-    title: Arc<Mutex<String>>,
-    tx: broadcast::Sender<PtyEvent>,
-    writer: Mutex<File>,
-    refresh_tx:    std::sync::mpsc::SyncSender<oneshot::Sender<Result<RefreshData>>>,
-    scrollback_tx: std::sync::mpsc::SyncSender<ScrollbackReq>,
-    resize_tx:     std::sync::mpsc::SyncSender<(u32, u32)>,
-    meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
-    generation: Arc<AtomicU64>,
-    subscribers: Arc<RwLock<HashMap<String, SubscriberInfo>>>,
-    last_subscribed_at: Mutex<Option<SystemTime>>,
+/// State shared between the PtyHandle (tokio side) and the reader thread.
+/// Everything here is cheap to read concurrently; the libghostty Terminal and
+/// the master fd deliberately do NOT live here — they are exclusive to the
+/// reader thread.
+pub(crate) struct PtyShared {
+    pub(crate) id:                 u64,
+    pub(crate) hostname:           String,
+    pub(crate) pts_name:           String,
+    pub(crate) created_at:         SystemTime,
+    pub(crate) cols:               AtomicU32,
+    pub(crate) rows:               AtomicU32,
+    pub(crate) title:              Mutex<String>,
+    pub(crate) generation:         AtomicU64,
+    pub(crate) subscribers:        RwLock<HashMap<String, SubscriberInfo>>,
+    pub(crate) last_subscribed_at: Mutex<Option<SystemTime>>,
     // Assigned once at registration (next available slot, 0-based) for stable
     // list ordering; never changes for the life of the handle.
-    sort_order: AtomicU32,
-    child_pid: Pid,
-    wakeup_write: OwnedFd,
+    pub(crate) sort_order:         AtomicU32,
 }
 
-impl PtyHandle {
-    pub fn info(&self) -> PtyInfo {
+impl PtyShared {
+    pub(crate) fn info(&self) -> PtyInfo {
         let subscribers = {
             let map = self.subscribers.read().unwrap();
             let mut v: Vec<(String, SubscriberInfo)> =
@@ -136,17 +132,40 @@ impl PtyHandle {
             v
         };  // read-lock released here
         PtyInfo {
-            id:                self.id,
-            hostname:          self.hostname.clone(),
-            pts_name:          self.pts_name.clone(),
-            cols:              self.cols.load(Ordering::Relaxed),
-            rows:              self.rows.load(Ordering::Relaxed),
-            title:             self.title.lock().unwrap().clone(),
-            created_at:        self.created_at,
+            id:                 self.id,
+            hostname:           self.hostname.clone(),
+            pts_name:           self.pts_name.clone(),
+            cols:               self.cols.load(Ordering::Relaxed),
+            rows:               self.rows.load(Ordering::Relaxed),
+            title:              self.title.lock().unwrap().clone(),
+            created_at:         self.created_at,
             last_subscribed_at: *self.last_subscribed_at.lock().unwrap(),
-            subscribers:       Some(subscribers),
-            sort_order:        self.sort_order.load(Ordering::Relaxed),
+            subscribers:        Some(subscribers),
+            sort_order:         self.sort_order.load(Ordering::Relaxed),
         }
+    }
+}
+
+pub struct PtyHandle {
+    shared: Arc<PtyShared>,
+    tx: broadcast::Sender<PtyEvent>,
+    writer: Mutex<File>,
+    refresh_tx:    std::sync::mpsc::SyncSender<oneshot::Sender<Result<RefreshData>>>,
+    scrollback_tx: std::sync::mpsc::SyncSender<ScrollbackReq>,
+    resize_tx:     std::sync::mpsc::SyncSender<(u32, u32)>,
+    meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
+    child_pid: Pid,
+    wakeup_write: OwnedFd,
+}
+
+impl PtyHandle {
+    pub fn info(&self) -> PtyInfo {
+        self.shared.info()
+    }
+
+    #[allow(dead_code)] // non-test caller arrives with the forwarding-task extraction
+    pub(crate) fn shared(&self) -> Arc<PtyShared> {
+        self.shared.clone()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<PtyEvent> {
@@ -182,8 +201,8 @@ impl PtyHandle {
         if ret < 0 {
             return Err(anyhow!("TIOCSWINSZ failed: {}", std::io::Error::last_os_error()));
         }
-        self.cols.store(cols, Ordering::Relaxed);
-        self.rows.store(rows, Ordering::Relaxed);
+        self.shared.cols.store(cols, Ordering::Relaxed);
+        self.shared.rows.store(rows, Ordering::Relaxed);
         // Notify reader thread so libghostty Terminal dimensions stay in sync.
         // Best-effort: if the channel is full or the thread is gone, skip silently.
         let _ = self.resize_tx.try_send((cols, rows));
@@ -193,14 +212,14 @@ impl PtyHandle {
         let _ = self.meta_tx.send(Arc::new(PtyMetadata {
             reason: MetadataReason::Resize,
             exit_code: None,
-            generation: self.generation.load(Ordering::Relaxed),
+            generation: self.shared.generation.load(Ordering::Relaxed),
             info: self.info(),
         }));
         Ok(())
     }
 
     pub fn set_title(&self, title: &str) {
-        *self.title.lock().unwrap() = title.to_string();
+        *self.shared.title.lock().unwrap() = title.to_string();
     }
 
     pub async fn refresh(&self) -> Result<RefreshData> {
@@ -246,19 +265,19 @@ impl PtyHandle {
     }
 
     pub fn id(&self) -> u64 {
-        self.id
+        self.shared.id
     }
 
     pub fn current_generation(&self) -> u64 {
-        self.generation.load(Ordering::Relaxed)
+        self.shared.generation.load(Ordering::Relaxed)
     }
 
     pub fn touch_last_subscribed(&self) {
-        *self.last_subscribed_at.lock().unwrap() = Some(SystemTime::now());
+        *self.shared.last_subscribed_at.lock().unwrap() = Some(SystemTime::now());
     }
 
     pub fn upsert_subscriber(&self, subscriber_id: &str, info: SubscriberInfo) {
-        let mut map = self.subscribers.write().unwrap();
+        let mut map = self.shared.subscribers.write().unwrap();
         map.entry(subscriber_id.to_owned())
             .and_modify(|e| {
                 e.hostname = info.hostname.clone();
@@ -270,7 +289,7 @@ impl PtyHandle {
     }
 
     pub fn remove_subscriber(&self, subscriber_id: &str) {
-        self.subscribers.write().unwrap().remove(subscriber_id);
+        self.shared.subscribers.write().unwrap().remove(subscriber_id);
     }
 }
 
@@ -373,7 +392,6 @@ impl PtyRegistry {
         let (scrollback_tx, scrollback_rx) =
             std::sync::mpsc::sync_channel::<ScrollbackReq>(8);
         let (resize_tx, resize_rx) = std::sync::mpsc::sync_channel::<(u32, u32)>(8);
-        let generation = Arc::new(AtomicU64::new(0));
 
         // Create wakeup pipe before spawning the child so that a failure here doesn't
         // leave a zombie process behind.  O_CLOEXEC and O_NONBLOCK are set atomically
@@ -385,44 +403,40 @@ impl PtyRegistry {
 
         let child_pid = Pid::from_raw(child.id() as i32);
         crate::utmp::add_record(master.as_raw_fd(), &hostname);
-        let created_at = SystemTime::now();
-        let title = Arc::new(Mutex::new(pts_name.clone()));
-        let meta_tx_for_thread = meta_tx.clone();
-        let id_for_thread = id;
-        let hostname_for_thread = hostname.clone();
-        let pts_name_for_thread = pts_name.clone();
-        let handle = Arc::new(PtyHandle {
+
+        let shared = Arc::new(PtyShared {
             id,
-            pts_name,
-            created_at,
             hostname,
+            title: Mutex::new(pts_name.clone()),
+            pts_name,
+            created_at: SystemTime::now(),
             cols: AtomicU32::new(cols),
             rows: AtomicU32::new(rows),
-            title: title.clone(),
+            generation: AtomicU64::new(0),
+            subscribers: RwLock::new(HashMap::new()),
+            last_subscribed_at: Mutex::new(None),
+            sort_order: AtomicU32::new(0), // real value assigned under the registry lock below
+        });
+
+        let handle = Arc::new(PtyHandle {
+            shared: shared.clone(),
             tx: tx.clone(),
             writer: Mutex::new(File::from(master)),
             refresh_tx,
             scrollback_tx,
             resize_tx,
             meta_tx: meta_tx.clone(),
-            generation: generation.clone(),
-            subscribers: Arc::new(RwLock::new(HashMap::new())),
-            last_subscribed_at: Mutex::new(None),
-            sort_order: AtomicU32::new(0), // real value assigned under the registry lock below
             child_pid,
             wakeup_write,
         });
 
         // Spawn dedicated reader thread — owns libghostty state and child process
         let master_reader = File::from(master_reader);
-        let title_for_thread = title.clone();
         std::thread::Builder::new()
             .name(format!("pty-reader-{id:016x}"))
             .spawn(move || reader_thread(
-                master_reader, tx, generation, refresh_rx, scrollback_rx, resize_rx, wakeup_read,
-                child, title_for_thread, cols, rows,
-                meta_tx_for_thread, id_for_thread, hostname_for_thread,
-                pts_name_for_thread, created_at,
+                master_reader, tx, refresh_rx, scrollback_rx, resize_rx,
+                wakeup_read, child, meta_tx, shared,
             ))
             .context("spawn reader thread")?;
 
@@ -432,9 +446,9 @@ impl PtyRegistry {
         {
             let mut map = self.ptys.write().unwrap();
             let used: HashSet<u32> =
-                map.values().map(|h| h.sort_order.load(Ordering::Relaxed)).collect();
+                map.values().map(|h| h.shared.sort_order.load(Ordering::Relaxed)).collect();
             let order = (0u32..).find(|n| !used.contains(n)).unwrap();
-            handle.sort_order.store(order, Ordering::Relaxed);
+            handle.shared.sort_order.store(order, Ordering::Relaxed);
             map.insert(id, handle.clone());
         }
         Ok(handle)
@@ -567,6 +581,16 @@ mod subscriber_tests {
     fn remove_nonexistent_is_noop() {
         let h = make_handle();
         h.remove_subscriber("nonexistent"); // must not panic
+    }
+
+    #[test]
+    fn shared_info_reflects_title_and_dims() {
+        let h = make_handle();
+        h.set_title("new-title");
+        let info = h.shared().info();
+        assert_eq!(info.title, "new-title");
+        assert_eq!((info.cols, info.rows), (80, 24));
+        assert!(info.subscribers.is_some());
     }
 }
 
