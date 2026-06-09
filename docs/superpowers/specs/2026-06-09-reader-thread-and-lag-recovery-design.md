@@ -86,9 +86,16 @@ pub(crate) enum ReaderRequest {
 - Requests are handled in channel order: a client's Write → Resize → Write
   sequencing is preserved.
 - `Resize` carries a reply so `handle_resize` returns an honest
-  `CommandResponse`; the refit call in `handle_subscribe` drops the receiver
-  (fire-and-forget). `PtyHandle::resize` becomes `async fn` and
+  `CommandResponse`. `PtyHandle::resize` becomes `async fn` and
   `handle_resize` follows.
+- **Amended during implementation:** the refit call in `handle_subscribe` was
+  specified as fire-and-forget (drop the receiver), but that made the refit
+  asynchronous relative to the Subscribe response and a `List` racing it could
+  observe stale dimensions (caught by
+  `test_subscribe_does_not_shrink_for_multiple_subscribers`, flaky ~1 in 6).
+  `handle_subscribe` now awaits the reader's ack while still ignoring the
+  outcome (`let _ = handle.resize(..).await`), restoring the pre-existing
+  contract that the refit has taken effect before Subscribe returns.
 - `close_scrollback` keeps its fire-and-forget character (send + ignore).
 
 ### PtyShared

@@ -191,7 +191,7 @@ pub fn handle_destroy(
     if let Some(handle) = registry.get(id) {
         handle.close_scrollback(subscriber_id);
         handle.remove_subscriber(subscriber_id);
-        // No SUBSCRIBERS_CHANGED broadcast here — CLOSED (emitted by reader_thread on child exit)
+        // No SUBSCRIBERS_CHANGED broadcast here — CLOSED (emitted by the reader thread on child exit)
         // is the terminal event for subscribers. Broadcasting SUBSCRIBERS_CHANGED on destroy would
         // race with the CLOSED event and add no useful information.
     }

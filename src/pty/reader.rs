@@ -243,7 +243,7 @@ fn process_read(
 impl PtyInfo {
     /// Barebones info for a `Closed` event. Only `id` is read by consumers off a
     /// `Closed` (it identifies the PTY); the rest is ignored there — see
-    /// `ClosedNotifier`. `exit_code` / `generation` travel as their own fields on
+    /// `Reader`'s `Drop`. `exit_code` / `generation` travel as their own fields on
     /// `PtyMetadata`, not in here.
     pub(super) fn closed(id: u64, created_at: SystemTime) -> Self {
         PtyInfo {

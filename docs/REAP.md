@@ -88,11 +88,12 @@ itself panic-proof so any future unwind can't strand state:
   *temporarily disabled* (panic firing on every abrupt disconnect), the repro still
   shows 0 leaks — the panic unwinds through `Drop` and reaps.
 
-- **`ClosedNotifier` (`src/pty.rs`)** — the sole emitter of `reader_thread`'s
-  `Closed` metadata, fired from `Drop` on both the normal return and an unwind, so a
-  panicking reader still tells attached clients the PTY is gone (they detach on
-  `StreamMetadataReason::Closed`) instead of hanging. The normal path sets its
-  `exit_code` before falling through; a panic leaves it `None`. The payload is
+- **`Reader`'s `Drop` (`src/pty/reader.rs`, formerly `ClosedNotifier`)** — the sole
+  emitter of the reader thread's `Closed` metadata, fired from `Drop` on both the
+  normal return and an unwind, so a panicking reader still tells attached clients
+  the PTY is gone (they detach on `StreamMetadataReason::Closed`) instead of
+  hanging. The normal path (`cleanup()`) sets `exit_code` before the struct drops;
+  a panic leaves it `None`. The payload is
   **barebones** (`id` + `created_at` + exit code) because no consumer reads
   title/size/host off a `Closed` — that keeps the guard to a few copy-cheap fields
   with no mirrored live state. It does **not** touch the libghostty `Terminal`

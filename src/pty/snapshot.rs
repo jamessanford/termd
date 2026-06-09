@@ -12,7 +12,7 @@ use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace};
 use super::{RefreshData, ScrollbackData, ScrollbackOp};
 
 // Note: on-demand refresh only renders the active screen at call time.  The screen-switch
-// broadcast in reader_thread (screen_changed path) mitigates the primary↔alternate gap by
+// broadcast in the reader loop (screen-switch path) mitigates the primary↔alternate gap by
 // pushing a full render of the new screen to all subscribers immediately after the switch.
 pub(crate) fn do_refresh(
     terminal: &Terminal<'static, 'static>,
