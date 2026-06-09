@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::Write,
     os::unix::io::{AsRawFd, FromRawFd},
     os::fd::OwnedFd,
     sync::{Arc, Mutex, RwLock, atomic::{AtomicU32, AtomicU64, Ordering}},
@@ -149,7 +148,6 @@ impl PtyShared {
 pub struct PtyHandle {
     shared: Arc<PtyShared>,
     tx: broadcast::Sender<PtyEvent>,
-    writer: Mutex<File>,
     req_tx: std::sync::mpsc::Sender<ReaderRequest>,
     meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
     child_pid: Pid,
@@ -178,8 +176,15 @@ impl PtyHandle {
         let _ = self.meta_tx.send(meta);
     }
 
+    /// Queue input for the PTY. Fire-and-forget: the reader thread delivers it
+    /// (buffering on EAGAIN); Err only means the reader is gone, which clients
+    /// also learn via the Closed metadata.
     pub fn write(&self, data: &[u8]) -> Result<()> {
-        self.writer.lock().unwrap().write_all(data).context("write to PTY")
+        self.req_tx
+            .send(ReaderRequest::Write(Bytes::copy_from_slice(data)))
+            .map_err(|_| anyhow!("PTY reader thread is dead"))?;
+        self.wake();
+        Ok(())
     }
 
     /// One-byte poke so a poll()-parked reader notices a queued request promptly.
@@ -322,12 +327,12 @@ impl PtyRegistry {
             { nix::pty::ptsname(&nix::pty::PtyMaster::from_owned_fd(owned)) }
         }.unwrap_or_else(|_| String::from("unknown"));
 
-        // Dup master for the reader thread before transferring ownership to File
-        let master_reader = dup_fd(master.as_raw_fd()).context("dup master fd for reader")?;
-        // Set O_NONBLOCK so the reader can drain all available bytes in a loop
-        let flags = unsafe { libc::fcntl(master_reader.as_raw_fd(), libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(master_reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(std::io::Error::last_os_error()).context("set O_NONBLOCK on master reader fd");
+        // Single master fd, owned by the reader thread. O_NONBLOCK so the reader
+        // drains reads in a loop, and so PTY-input writes fail fast with EAGAIN
+        // into the pending buffer instead of ever blocking the thread.
+        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("set O_NONBLOCK on master fd");
         }
 
         use std::os::unix::process::CommandExt;
@@ -338,7 +343,7 @@ impl PtyRegistry {
         // Set FD_CLOEXEC on all master and slave fds so concurrent forks
         // don't inherit them. Rust's spawn dup2s them to 0/1/2 in the
         // child before exec, so the shell still gets them correctly.
-        for fd in [master.as_raw_fd(), master_reader.as_raw_fd(), slave_fd.as_raw_fd(), slave_stdout.as_raw_fd(), slave_stderr.as_raw_fd()] {
+        for fd in [master.as_raw_fd(), slave_fd.as_raw_fd(), slave_stdout.as_raw_fd(), slave_stderr.as_raw_fd()] {
             let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
             if rc < 0 {
                 return Err(std::io::Error::last_os_error()).context("set FD_CLOEXEC on open fds");
@@ -408,21 +413,21 @@ impl PtyRegistry {
         let handle = Arc::new(PtyHandle {
             shared: shared.clone(),
             tx: tx.clone(),
-            writer: Mutex::new(File::from(master)),
             req_tx,
             meta_tx: meta_tx.clone(),
             child_pid,
             wakeup_write,
         });
 
-        // Spawn dedicated reader thread — owns libghostty state and child process
-        let master_reader = File::from(master_reader);
+        // Spawn dedicated reader thread — owns libghostty state, the master fd,
+        // and the child process
+        let master = File::from(master);
         let meta_tx_spawn = meta_tx.clone();
         let shared_spawn = shared.clone();
         std::thread::Builder::new()
             .name(format!("pty-reader-{id:016x}"))
             .spawn(move || {
-                match Reader::new(master_reader, wakeup_read, req_rx, tx, meta_tx, shared, child) {
+                match Reader::new(master, wakeup_read, req_rx, tx, meta_tx, shared, child) {
                     Ok(r) => r.run(),
                     Err(e) => {
                         // Startup failure: there is no Reader (and so no Drop) yet.

@@ -26,6 +26,9 @@ use super::{
 /// the wakeup pipe so a poll()-parked reader services it promptly. Requests
 /// are handled strictly in channel order.
 pub(crate) enum ReaderRequest {
+    /// PTY input. Fire-and-forget: the reader writes it through, buffering the
+    /// unwritten tail on EAGAIN and draining it via POLLOUT.
+    Write(Bytes),
     Resize {
         cols: u32,
         rows: u32,
@@ -47,6 +50,70 @@ pub(crate) enum ReaderRequest {
 /// mid-sequence (the app wrote a partial escape sequence then went idle). Bounds
 /// how long an attach/refresh can block before we give up and snapshot anyway.
 const REFRESH_STALL_TIMEOUT_MS: libc::c_int = 1000;
+
+/// Hard cap on buffered PTY input (~16x the kernel input queue). Past this the
+/// child has stopped reading; dropping new input with a warning beats unbounded
+/// growth — the loss now at least shows up in the logs, unlike the old silent
+/// EAGAIN drop.
+const MAX_PENDING_INPUT: usize = 1 << 20;
+
+/// Write as much as the PTY accepts without blocking. Ok(n) may be short of
+/// data.len() — that's EAGAIN, and the caller buffers the tail. Err is a real
+/// error (PTY torn down), never WouldBlock.
+fn write_some(master: &File, data: &[u8]) -> std::io::Result<usize> {
+    use std::io::Write;
+    let mut written = 0;
+    while written < data.len() {
+        match (&*master).write(&data[written..]) {
+            Ok(0) => break,
+            Ok(n) => written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(written)
+}
+
+/// Queue PTY input: write immediately when nothing is pending (preserving
+/// order), buffer the unwritten tail for the POLLOUT path.
+fn queue_write(master: &File, pending_out: &mut Vec<u8>, data: &[u8], cap: usize) {
+    let mut tail: &[u8] = data;
+    if pending_out.is_empty() {
+        match write_some(master, data) {
+            Ok(n) => tail = &data[n..],
+            Err(e) => {
+                tracing::debug!("PTY write failed: {e}");
+                return;
+            }
+        }
+    }
+    if tail.is_empty() {
+        return;
+    }
+    if pending_out.len() + tail.len() > cap {
+        tracing::warn!(
+            pending = pending_out.len(),
+            dropped = tail.len(),
+            "PTY input buffer full; dropping write"
+        );
+        return;
+    }
+    pending_out.extend_from_slice(tail);
+}
+
+/// Drain as much pending input as the PTY accepts. On a real error the
+/// remainder is discarded — the PTY is gone and the read side will surface
+/// the same failure to the main loop.
+fn flush_pending(master: &File, pending_out: &mut Vec<u8>) {
+    match write_some(master, pending_out) {
+        Ok(n) => { pending_out.drain(..n); }
+        Err(e) => {
+            tracing::debug!("PTY write failed: {e}");
+            pending_out.clear();
+        }
+    }
+}
 
 /// Service deferred refreshes — the on-demand (attach) replies and the
 /// resize/screen-switch broadcast. Callers gate this on `vt_at_boundary()` so the
@@ -209,6 +276,8 @@ pub(super) struct Reader {
     // One scrollback pin per subscriber; the pin marks the viewport's top row and
     // libghostty keeps it on its content across appends and eviction.
     pins: HashMap<String, TrackedGridRef>,
+    // PTY input the kernel wouldn't accept yet (EAGAIN); drained via POLLOUT.
+    pending_out: Vec<u8>,
     // Refreshes are deferred until the VT parser is at a ground boundary, so a
     // snapshot never pins a generation in the middle of an escape sequence (which
     // would leave an attaching client resuming on an orphaned sequence tail). The
@@ -260,6 +329,7 @@ impl Reader {
             shared,
             child,
             pins: HashMap::new(),
+            pending_out: Vec::new(),
             pending_replies: Vec::new(),
             pending_broadcast_refresh: false,
             prev_title,
@@ -282,11 +352,19 @@ impl Reader {
                 self.handle_request(req);
             }
             self.flush_refreshes_if_at_boundary();
+            if !self.pending_out.is_empty() {
+                flush_pending(&self.master, &mut self.pending_out);
+            }
 
             // Poll both the PTY master and the wakeup pipe.  Writes to wakeup_write
             // (any queued request) unblock the poll so requests are handled promptly.
+            // While PTY input is buffered, also watch for the master becoming writable.
+            let mut master_events = libc::POLLIN;
+            if !self.pending_out.is_empty() {
+                master_events |= libc::POLLOUT;
+            }
             let mut pfds = [
-                libc::pollfd { fd: master_fd, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: master_fd, events: master_events, revents: 0 },
                 libc::pollfd { fd: wakeup_fd, events: libc::POLLIN, revents: 0 },
             ];
             // Block indefinitely unless a refresh is waiting behind an unfinished
@@ -321,6 +399,11 @@ impl Reader {
                     &mut self.pending_replies, &mut self.pending_broadcast_refresh, true,
                 );
                 continue;
+            }
+
+            // Master writable again: drain buffered PTY input.
+            if pfds[0].revents & libc::POLLOUT != 0 {
+                flush_pending(&self.master, &mut self.pending_out);
             }
 
             // Only read from PTY master if it actually has data ready.
@@ -404,6 +487,9 @@ impl Reader {
 
     fn handle_request(&mut self, req: ReaderRequest) {
         match req {
+            ReaderRequest::Write(data) => {
+                queue_write(&self.master, &mut self.pending_out, &data, MAX_PENDING_INPUT);
+            }
             ReaderRequest::Resize { cols, rows, reply } => {
                 let _ = reply.send(self.apply_resize(cols, rows));
             }
@@ -499,6 +585,7 @@ impl Reader {
                 ReaderRequest::Resize { reply, .. } => {
                     let _ = reply.send(Err(anyhow!("PTY closed")));
                 }
+                ReaderRequest::Write(_) => {} // child is gone; input has nowhere to go
             }
         }
     }
@@ -768,5 +855,76 @@ mod process_read_tests {
             PtyEvent::Refresh(r) => assert!(!r.degraded, "clean broadcast must not be degraded"),
             other => panic!("expected Refresh, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod write_buffer_tests {
+    use super::*;
+    use std::io::Read;
+
+    // Non-blocking pipe pair standing in for the PTY master: identical EAGAIN
+    // semantics when the kernel buffer fills.
+    fn pipe_pair() -> (File, File) {
+        let (r, w) = super::super::wakeup_pipe().unwrap();
+        (File::from(r), File::from(w))
+    }
+
+    fn drain(read_end: &mut File) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match read_end.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("pipe read failed: {e}"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn queue_write_writes_directly_when_buffer_empty() {
+        let (mut r, w) = pipe_pair();
+        let mut pending = Vec::new();
+        queue_write(&w, &mut pending, b"hello", MAX_PENDING_INPUT);
+        assert!(pending.is_empty(), "small write must go straight through");
+        assert_eq!(drain(&mut r), b"hello");
+    }
+
+    #[test]
+    fn queue_write_buffers_tail_on_full_pipe_and_flush_preserves_order() {
+        let (mut r, w) = pipe_pair();
+        let mut pending = Vec::new();
+        // Fill the pipe until a tail lands in the buffer.
+        let chunk = [b'a'; 4096];
+        while pending.is_empty() {
+            queue_write(&w, &mut pending, &chunk, MAX_PENDING_INPUT);
+        }
+        // With bytes pending, later writes append instead of jumping the queue.
+        queue_write(&w, &mut pending, b"WORLD", MAX_PENDING_INPUT);
+        assert!(pending.ends_with(b"WORLD"));
+
+        // Drain the pipe, flush, repeat: every byte arrives, in order.
+        let mut received = drain(&mut r);
+        while !pending.is_empty() {
+            flush_pending(&w, &mut pending);
+            received.extend_from_slice(&drain(&mut r));
+        }
+        assert!(received.ends_with(b"WORLD"), "buffered tail must arrive last");
+        let body = &received[..received.len() - 5];
+        assert!(body.iter().all(|&b| b == b'a'), "no reordering or corruption");
+    }
+
+    #[test]
+    fn queue_write_drops_beyond_cap_keeps_buffer_intact() {
+        let (_r, w) = pipe_pair();
+        let mut pending = vec![b'x'; 10]; // non-empty => no direct-write path
+        queue_write(&w, &mut pending, b"toolarge", 12); // 10 + 8 > 12: dropped
+        assert_eq!(pending.len(), 10);
+        queue_write(&w, &mut pending, b"ok", 12);       // 10 + 2 <= 12: appended
+        assert_eq!(pending.len(), 12);
+        assert!(pending.ends_with(b"ok"));
     }
 }
