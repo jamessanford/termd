@@ -723,6 +723,9 @@ pub async fn run(
             run_idle(&mut resp_rx, &mut stdin, &mut input).await?
         } else {
             let mut current_refresh_gen = refresh_gen;
+            // True while a lag-recovery Refresh request is in flight, so a
+            // persistently slow link can't amplify lag into a refresh storm.
+            let mut refresh_pending = false;
 
             let buffered: Vec<_> = buffered.into_iter()
                 .filter(|(gen, _)| *gen > current_refresh_gen)
@@ -769,6 +772,7 @@ pub async fn run(
                                 }
                                 Some(Response::Refresh(rf)) if rf.pty_id == current_pty_id => {
                                     current_refresh_gen = rf.generation;
+                                    refresh_pending = false;
                                     current_item.cols = rf.cols;
                                     current_item.rows = rf.rows;
                                     let result = handler.on_pty_event(
@@ -798,6 +802,20 @@ pub async fn run(
                                         handler.on_pty_event(PtyEvent::Closed, &mut out)?;
                                         input.reset();
                                         break RunOutcome::PtyClosed;
+                                    } else if m.reason == StreamMetadataReason::DataLost as i32 {
+                                        // We lagged the server's broadcast and lost stream
+                                        // bytes; the screen may be corrupt. Ask for a full
+                                        // snapshot — every render mode recovers completely
+                                        // from a Refresh, and the generation filter drops
+                                        // any straggler chunks from before the snapshot.
+                                        if !refresh_pending {
+                                            refresh_pending = true;
+                                            let _ = cmd_tx.send(TerminalCommand {
+                                                command: Some(Command::Refresh(RefreshRequest {
+                                                    pty_id: current_pty_id,
+                                                })),
+                                            }).await;
+                                        }
                                     }
                                 }
                                 _ => {}
