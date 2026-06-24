@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn region_setup_emits_decstbm() {
-        let mut wi = WrapInjector::new(4, 3).unwrap();
+        let wi = WrapInjector::new(4, 3).unwrap();
         let mut out = Vec::new();
         wi.emit_region_setup(&mut out);
         assert_eq!(out, b"\x1b[1;3r");
