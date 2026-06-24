@@ -19,6 +19,7 @@ pub(super) struct WrapInjector {
     glyph: Vec<u8>,
     /// Buffered bytes of the in-progress escape sequence, not yet emitted.
     seq: Vec<u8>,
+    server_rows: u32,
 }
 
 impl WrapInjector {
@@ -32,6 +33,7 @@ impl WrapInjector {
             state: State::Ground,
             glyph: Vec::new(),
             seq: Vec::new(),
+            server_rows,
         })
     }
 
@@ -44,6 +46,7 @@ impl WrapInjector {
         self.state = State::Ground;
         self.glyph.clear();
         self.seq.clear();
+        self.server_rows = server_rows;
         Ok(())
     }
 
@@ -75,11 +78,59 @@ impl WrapInjector {
         self.glyph.clear();
     }
 
-    /// Called when a complete escape sequence has been fed. Emits it verbatim.
-    /// (Task 4 replaces this with DECSTBM-clamping logic.)
+    /// Emit a completed escape sequence (in `self.seq`), clamping a DECSTBM
+    /// bottom margin to the server row count. All other sequences pass verbatim.
     fn emit_sequence(&mut self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.seq);
-        self.seq.clear();
+        let seq = std::mem::take(&mut self.seq);
+        if let Some(clamped) = self.clamp_decstbm(&seq) {
+            out.extend_from_slice(&clamped);
+        } else {
+            out.extend_from_slice(&seq);
+        }
+    }
+
+    /// If `seq` is a DECSTBM (`\x1b[<top>;<bottom>r`, no private marker) whose
+    /// bottom exceeds `server_rows`, return a clamped rewrite. A bare `\x1b[r`
+    /// (reset) and in-bounds regions return `None` (emit verbatim).
+    fn clamp_decstbm(&self, seq: &[u8]) -> Option<Vec<u8>> {
+        // Must be CSI ... 'r' with a non-private parameter body.
+        if seq.len() < 3 || seq[0] != 0x1b || seq[1] != b'[' || *seq.last().unwrap() != b'r' {
+            return None;
+        }
+        let params = &seq[2..seq.len() - 1];
+        if params.first() == Some(&b'?') {
+            return None; // private mode, not DECSTBM
+        }
+        if params.is_empty() {
+            return None; // bare reset \x1b[r — pass through
+        }
+        // Parse "top;bottom" (either may be empty/absent).
+        let mut parts = params.split(|&c| c == b';');
+        let top = parts.next().unwrap_or(b"");
+        let bottom = parts.next().unwrap_or(b"");
+        if parts.next().is_some() {
+            return None; // more than two params: not a DECSTBM we model
+        }
+        // Validate digits only.
+        if !top.iter().all(|c| c.is_ascii_digit()) || !bottom.iter().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let bottom_val: u32 = std::str::from_utf8(bottom).ok()?.parse().ok().unwrap_or(0);
+        if bottom.is_empty() || bottom_val <= self.server_rows {
+            return None; // already in-bounds (or default bottom = screen)
+        }
+        let top_str = std::str::from_utf8(top).ok()?;
+        let mut rewritten = Vec::new();
+        use std::io::Write as _;
+        write!(rewritten, "\x1b[{};{}r", top_str, self.server_rows).ok();
+        Some(rewritten)
+    }
+
+    /// Emit the DECSTBM that establishes the vertical scroll region the
+    /// client must use: top margin always 1, bottom margin the server rows.
+    pub(super) fn emit_region_setup(&self, out: &mut Vec<u8>) {
+        use std::io::Write as _;
+        write!(out, "\x1b[1;{}r", self.server_rows).ok();
     }
 
     pub(super) fn process(&mut self, input: &[u8], out: &mut Vec<u8>) {
@@ -242,6 +293,31 @@ mod tests {
         // Same as full_line_then_printable, but "e" arrives in a later chunk and
         // the 4th glyph is split mid-stream. The break must still land before "e".
         assert_eq!(run_bytes(4, 3, &[b"abc", b"d", b"e"]), b"abcd\r\ne");
+    }
+
+    #[test]
+    fn region_setup_emits_decstbm() {
+        let mut wi = WrapInjector::new(4, 3).unwrap();
+        let mut out = Vec::new();
+        wi.emit_region_setup(&mut out);
+        assert_eq!(out, b"\x1b[1;3r");
+    }
+
+    #[test]
+    fn app_decstbm_bottom_is_clamped_to_server_rows() {
+        // App tries to set a scroll region 1..10 on a 3-row server; clamp to 1..3.
+        assert_eq!(run_bytes(4, 3, &[b"\x1b[1;10r"]), b"\x1b[1;3r");
+    }
+
+    #[test]
+    fn app_decstbm_within_bounds_passes_through() {
+        assert_eq!(run_bytes(4, 3, &[b"\x1b[2;3r"]), b"\x1b[2;3r");
+    }
+
+    #[test]
+    fn app_decstbm_reset_passes_through() {
+        // A bare \x1b[r (reset scroll region) passes through unchanged.
+        assert_eq!(run_bytes(4, 3, &[b"\x1b[r"]), b"\x1b[r");
     }
 }
 
