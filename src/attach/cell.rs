@@ -33,16 +33,16 @@ impl LocalTerminal {
 
 pub(super) struct CellHandler {
     lt: LocalTerminal,
-    allow_upgrade: bool,
+    upgrade_to: Option<super::RenderMode>,
     server_cols: u32,
     server_rows: u32,
 }
 
 impl CellHandler {
-    pub(super) fn new(cols: u32, rows: u32, allow_upgrade: bool) -> Result<Self> {
+    pub(super) fn new(cols: u32, rows: u32, upgrade_to: Option<super::RenderMode>) -> Result<Self> {
         Ok(Self {
             lt: LocalTerminal::new(cols, rows)?,
-            allow_upgrade,
+            upgrade_to,
             server_cols: cols,
             server_rows: rows,
         })
@@ -70,8 +70,10 @@ impl super::RenderModeHandler for CellHandler {
                 self.server_cols = cols;
                 self.server_rows = rows;
                 let (client_cols, client_rows) = super::get_terminal_size();
-                if self.allow_upgrade && super::server_fits_client(cols, rows, client_cols, client_rows) {
-                    return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Region));
+                if let Some(target) = self.upgrade_to {
+                    if super::server_fits_client(cols, rows, client_cols, client_rows) {
+                        return Ok(super::EventResult::ChangeRenderMode(target));
+                    }
                 }
                 self.lt.resize(cols, rows)?;
                 self.lt.terminal.vt_write(data);
@@ -81,8 +83,10 @@ impl super::RenderModeHandler for CellHandler {
                 self.server_cols = cols;
                 self.server_rows = rows;
                 let (client_cols, client_rows) = super::get_terminal_size();
-                if self.allow_upgrade && super::server_fits_client(cols, rows, client_cols, client_rows) {
-                    return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Region));
+                if let Some(target) = self.upgrade_to {
+                    if super::server_fits_client(cols, rows, client_cols, client_rows) {
+                        return Ok(super::EventResult::ChangeRenderMode(target));
+                    }
                 }
                 self.lt.resize(cols, rows)?;
             }
@@ -92,8 +96,10 @@ impl super::RenderModeHandler for CellHandler {
     }
 
     fn on_sigwinch(&mut self, cols: u32, rows: u32, out: &mut Vec<u8>) -> Result<super::EventResult> {
-        if self.allow_upgrade && super::server_fits_client(self.server_cols, self.server_rows, cols, rows) {
-            return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Region));
+        if let Some(target) = self.upgrade_to {
+            if super::server_fits_client(self.server_cols, self.server_rows, cols, rows) {
+                return Ok(super::EventResult::ChangeRenderMode(target));
+            }
         }
         render_dirty(&self.lt.terminal, &mut self.lt.render_state, &mut self.lt.row_iter, &mut self.lt.cell_iter, true, out)?;
         Ok(super::EventResult::Continue)
@@ -253,7 +259,7 @@ mod tests {
 
     #[test]
     fn cell_init_renders_content() {
-        let mut h = CellHandler::new(80, 24, false).unwrap();
+        let mut h = CellHandler::new(80, 24, None).unwrap();
         let mut out = Vec::new();
         let result = h.init(b"Hello", &[], &mut out).unwrap();
         assert!(matches!(result, EventResult::Continue));
@@ -262,21 +268,21 @@ mod tests {
 
     #[test]
     fn cell_init_replays_buffered() {
-        let mut h = CellHandler::new(80, 24, false).unwrap();
+        let mut h = CellHandler::new(80, 24, None).unwrap();
         let mut out = Vec::new();
         h.init(b"", &[], &mut out).unwrap();
         let initial_len = out.len();
 
         let buffered = vec![(2, b"World".to_vec())];
         out.clear();
-        let mut h2 = CellHandler::new(80, 24, false).unwrap();
+        let mut h2 = CellHandler::new(80, 24, None).unwrap();
         h2.init(b"", &buffered, &mut out).unwrap();
         assert!(out.len() > initial_len, "init with buffered should produce more output");
     }
 
     #[test]
     fn cell_stream_renders_dirty() {
-        let mut h = CellHandler::new(80, 24, false).unwrap();
+        let mut h = CellHandler::new(80, 24, None).unwrap();
         let mut out = Vec::new();
         h.init(b"", &[], &mut out).unwrap();
         out.clear();
@@ -288,7 +294,7 @@ mod tests {
 
     #[test]
     fn cell_refresh_resizes_and_renders() {
-        let mut h = CellHandler::new(80, 24, false).unwrap();
+        let mut h = CellHandler::new(80, 24, None).unwrap();
         let mut out = Vec::new();
         h.init(b"", &[], &mut out).unwrap();
         out.clear();
@@ -303,7 +309,7 @@ mod tests {
 
     #[test]
     fn cell_no_upgrade_when_not_allowed() {
-        let mut h = CellHandler::new(80, 24, false).unwrap();
+        let mut h = CellHandler::new(80, 24, None).unwrap();
         let mut out = Vec::new();
         h.init(b"", &[], &mut out).unwrap();
         out.clear();
@@ -317,7 +323,7 @@ mod tests {
 
     #[test]
     fn cell_sigwinch_re_renders() {
-        let mut h = CellHandler::new(80, 24, false).unwrap();
+        let mut h = CellHandler::new(80, 24, None).unwrap();
         let mut out = Vec::new();
         h.init(b"Hello", &[], &mut out).unwrap();
         out.clear();

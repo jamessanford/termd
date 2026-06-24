@@ -32,6 +32,8 @@ pub enum RenderMode {
     Raw,
     /// Raw passthrough within a DECSTBM scroll region
     Region,
+    /// Raw passthrough with libghostty-driven explicit wrap injection
+    Autowrap,
 }
 
 pub(super) enum PtyEvent<'a> {
@@ -58,15 +60,16 @@ fn create_handler(
     mode: RenderMode,
     server_cols: u32,
     server_rows: u32,
-    allow_upgrade: bool,
+    upgrade_to: Option<RenderMode>,
 ) -> anyhow::Result<Box<dyn RenderModeHandler>> {
     Ok(match mode {
-        RenderMode::Cell => Box::new(cell::CellHandler::new(server_cols, server_rows, allow_upgrade)?),
+        RenderMode::Cell => Box::new(cell::CellHandler::new(server_cols, server_rows, upgrade_to)?),
         RenderMode::Raw => Box::new(raw::RawHandler::new()),
         RenderMode::Region => {
             let (client_cols, client_rows) = get_terminal_size();
             Box::new(region::RegionHandler::new(server_rows, server_cols, client_rows, client_cols))
         }
+        RenderMode::Autowrap => Box::new(autowrap::AutowrapHandler::new(server_cols, server_rows)?),
     })
 }
 
@@ -84,6 +87,7 @@ use termd::proto::{
     TerminalCommand, StreamMetadataReason,
 };
 
+mod autowrap;
 mod cell;
 mod help;
 mod raw;
@@ -629,7 +633,11 @@ pub async fn run(
     let mut previous_pty_id: Option<u64> = None;
     let mut subscribed_pty_id: Option<u64> = None;
 
-    let allow_upgrade = mode == RenderMode::Region;
+    let upgrade_to = match mode {
+        RenderMode::Region => Some(RenderMode::Region),
+        RenderMode::Autowrap => Some(RenderMode::Autowrap),
+        _ => None,
+    };
     let mut dispatch_mode = mode;
     let mut stdout = std::io::stdout();
     let mut stdin = tokio::io::stdin();
@@ -721,7 +729,7 @@ pub async fn run(
                 .collect();
 
             let mut handler: Box<dyn RenderModeHandler> = create_handler(
-                dispatch_mode, current_item.cols, current_item.rows, allow_upgrade,
+                dispatch_mode, current_item.cols, current_item.rows, upgrade_to,
             )?;
 
             out.clear();
@@ -732,7 +740,7 @@ pub async fn run(
                     out.clear();
                 }
                 dispatch_mode = new_mode;
-                handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, allow_upgrade)?;
+                handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, upgrade_to)?;
                 handler.init(&refresh_bytes, &buffered, &mut out)?;
             }
             if !out.is_empty() {
@@ -859,12 +867,12 @@ pub async fn run(
                 if let Some((new_mode, refresh_data)) = change_mode {
                     handler.cleanup(&mut out);
                     dispatch_mode = new_mode;
-                    handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, allow_upgrade)?;
+                    handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, upgrade_to)?;
                     let init_result = handler.init(&refresh_data, &[], &mut out)?;
                     if let EventResult::ChangeRenderMode(fallback) = init_result {
                         handler.cleanup(&mut out);
                         dispatch_mode = fallback;
-                        handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, allow_upgrade)?;
+                        handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, upgrade_to)?;
                         handler.init(&refresh_data, &[], &mut out)?;
                     }
                     // A SIGWINCH-driven switch hands off empty data and doesn't resize the
