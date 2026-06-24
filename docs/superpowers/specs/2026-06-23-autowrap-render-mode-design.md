@@ -58,26 +58,35 @@ A self-contained struct owning a tracking `libghostty_vt::Terminal` sized
 transformed bytes to an `out: &mut Vec<u8>`. No async, no I/O — the corpus tests drive
 it directly.
 
-Polling algorithm, per input byte `b`:
+Polling algorithm: the classifier buffers each **printable glyph** (accumulating
+bytes until `vt_at_boundary()` returns to ground), recording the cursor position
+`(x0, y0)` before feeding it and `(x1, y1)` after. If feeding the glyph moved the
+cursor to a new row (`y1 > y0`) **or** back toward the left edge (`x1 < x0`, the
+signature of a wrap that scrolled at the bottom margin), the server soft-wrapped —
+inject `\r\n` before the buffered glyph. Otherwise emit the glyph unchanged. Escape
+sequences and C0 controls are forwarded verbatim (the escape path also clamps app
+DECSTBM, see Component 2) and never run through the glyph path.
 
-- If `tracking.vt_at_boundary()` **and** `b` starts a printable glyph **and**
-  `tracking.is_cursor_pending_wrap()` → inject `\r\n` to `out` first (replicating the
-  soft-wrap the wider client would not perform on its own).
-- Feed `b` to the tracking terminal (`vt_write`) and forward `b` to `out`.
-
-The injector relies entirely on the tracking terminal's `is_cursor_pending_wrap()`
-flag rather than its own column bookkeeping. Consequences (all handled by the engine's
-accounting, for free):
+The detector keys on **cursor movement**, not on `is_cursor_pending_wrap()` alone.
+The pending-wrap flag is necessary but not sufficient: verified against ghostty's
+print logic (`examples/ghostty/src/terminal/Terminal.zig`), a wide glyph that won't
+fit in the last column wraps via a `spacer_head` *without* pending-wrap having been
+set, and a wrap at the bottom margin *scrolls* rather than advancing the row. The
+position-based test covers both, plus ordinary deferred wrap, using only `cursor_x`
+/ `cursor_y` polling. Consequences (all handled by the engine's accounting, for
+free):
 
 - **Deferred wrap**: a glyph at the last column followed by a *control* sequence (e.g.
-  a cursor reposition) does not wrap — no spurious break, because we only inject before
-  printables and the reposition clears the pending-wrap flag.
+  a cursor reposition) does not move the cursor (no row change, no leftward move) — no
+  spurious break; the next printable that actually wraps gets the break.
 - **Wide chars / combining marks / grapheme clusters**: the engine wraps internally
-  when a wide glyph won't fit and sets the flag earlier; our check fires before its
-  lead byte.
-- **Tabs** advancing past the edge set the pending-wrap flag; the next printable wraps.
-- **UTF-8 multibyte and mid-escape**: `vt_at_boundary()` gates injection to parser
-  ground state, so we never splice inside a sequence or a multibyte glyph.
+  when a wide glyph won't fit (spacer_head + wrap); the post-feed cursor move detects
+  it. Zero-width combining marks leave the cursor unmoved → no break.
+- **Tabs** advancing toward the edge are C0 controls on the forward path; they never
+  themselves wrap, and a printable that wraps afterward is caught by the detector.
+- **UTF-8 multibyte and mid-escape**: `vt_at_boundary()` delimits glyph and sequence
+  boundaries, so we never splice inside a sequence or a multibyte glyph, and state
+  persists across `process` chunk boundaries.
 
 "Starts a printable glyph" means: at a parser boundary, a byte that begins a printable
 (>= 0x20, != 0x7f, including UTF-8 lead bytes) rather than a control/escape.
