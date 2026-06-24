@@ -194,13 +194,23 @@ impl WrapInjector {
 }
 
 pub(super) struct AutowrapHandler {
+    inj: WrapInjector,
     server_cols: u32,
     server_rows: u32,
 }
 
 impl AutowrapHandler {
     pub(super) fn new(server_cols: u32, server_rows: u32) -> Result<Self> {
-        Ok(Self { server_cols, server_rows })
+        Ok(Self {
+            inj: WrapInjector::new(server_cols, server_rows)?,
+            server_cols,
+            server_rows,
+        })
+    }
+
+    fn fits_client(&self) -> bool {
+        let (client_cols, client_rows) = super::get_terminal_size();
+        super::server_fits_client(self.server_cols, self.server_rows, client_cols, client_rows)
     }
 }
 
@@ -331,25 +341,84 @@ mod tests {
         // A bottom too large to parse as u32 must still clamp, not pass through.
         assert_eq!(run_bytes(4, 3, &[b"\x1b[1;99999999999r"]), b"\x1b[1;3r");
     }
+
+    use super::super::{EventResult, PtyEvent, RenderMode, RenderModeHandler};
+
+    #[test]
+    fn falls_back_to_cell_when_client_too_small_on_resize() {
+        // Server grows wider than the client on resize -> hand off to cell mode.
+        // get_terminal_size() reads the real terminal; to keep this deterministic
+        // we drive the Resize arm with a server size guaranteed larger than any
+        // plausible test terminal.
+        let mut h = AutowrapHandler::new(80, 24).unwrap();
+        let mut out = Vec::new();
+        let r = h.on_pty_event(PtyEvent::Resize { cols: 100_000, rows: 100_000 }, &mut out).unwrap();
+        match r {
+            EventResult::ChangeRenderMode(RenderMode::Cell) => {}
+            _ => panic!("expected fallback to Cell"),
+        }
+    }
 }
 
 impl super::RenderModeHandler for AutowrapHandler {
     fn init(&mut self, refresh_data: &[u8], buffered: &[(u64, Vec<u8>)], out: &mut Vec<u8>) -> Result<super::EventResult> {
-        out.extend_from_slice(refresh_data);
+        if !self.fits_client() {
+            return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
+        }
+        self.inj.reset(self.server_cols, self.server_rows)?;
+        self.inj.emit_region_setup(out);
+        self.inj.process(refresh_data, out);
         for (_gen, data) in buffered {
-            out.extend_from_slice(data);
+            self.inj.process(data, out);
         }
         Ok(super::EventResult::Continue)
     }
 
     fn on_pty_event(&mut self, event: super::PtyEvent, out: &mut Vec<u8>) -> Result<super::EventResult> {
-        if let super::PtyEvent::Stream { data, .. } = event {
-            out.extend_from_slice(data);
+        match event {
+            super::PtyEvent::Stream { data, .. } => {
+                self.inj.process(data, out);
+            }
+            super::PtyEvent::Refresh { cols, rows, data, .. } => {
+                self.server_cols = cols;
+                self.server_rows = rows;
+                if !self.fits_client() {
+                    return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
+                }
+                // Refresh is a full reset/redraw: rebuild the tracking terminal
+                // and re-emit the region setup before replaying the repaint.
+                self.inj.reset(cols, rows)?;
+                self.inj.emit_region_setup(out);
+                self.inj.process(data, out);
+            }
+            super::PtyEvent::Resize { cols, rows } => {
+                self.server_cols = cols;
+                self.server_rows = rows;
+                if !self.fits_client() {
+                    return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
+                }
+                // No repaint data accompanies a Resize; just rebuild the tracking
+                // terminal to the new server size. The server sends a Refresh
+                // shortly after, which re-emits setup and repaints.
+                self.inj.reset(cols, rows)?;
+            }
+            super::PtyEvent::Closed => {}
         }
         Ok(super::EventResult::Continue)
     }
 
-    fn on_sigwinch(&mut self, _cols: u32, _rows: u32, _out: &mut Vec<u8>) -> Result<super::EventResult> {
+    fn on_sigwinch(&mut self, cols: u32, rows: u32, _out: &mut Vec<u8>) -> Result<super::EventResult> {
+        if !super::server_fits_client(self.server_cols, self.server_rows, cols, rows) {
+            return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
+        }
+        // The client width/height changed but the transformed stream is
+        // width-agnostic for any client >= server, so there is nothing to
+        // re-emit; the existing region setup and injected breaks remain valid.
         Ok(super::EventResult::Continue)
+    }
+
+    fn cleanup(&mut self, out: &mut Vec<u8>) {
+        // Release the vertical scroll region on detach.
+        out.extend_from_slice(b"\x1b[r");
     }
 }
