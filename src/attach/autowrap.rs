@@ -115,8 +115,14 @@ impl WrapInjector {
         if !top.iter().all(|c| c.is_ascii_digit()) || !bottom.iter().all(|c| c.is_ascii_digit()) {
             return None;
         }
-        let bottom_val: u32 = std::str::from_utf8(bottom).ok()?.parse().ok().unwrap_or(0);
-        if bottom.is_empty() || bottom_val <= self.server_rows {
+        if bottom.is_empty() {
+            return None; // default bottom = screen
+        }
+        let bottom_val: u32 = std::str::from_utf8(bottom)
+            .ok()?
+            .parse()
+            .unwrap_or(u32::MAX);
+        if bottom_val <= self.server_rows {
             return None; // already in-bounds (or default bottom = screen)
         }
         let top_str = std::str::from_utf8(top).ok()?;
@@ -318,6 +324,12 @@ mod tests {
     fn app_decstbm_reset_passes_through() {
         // A bare \x1b[r (reset scroll region) passes through unchanged.
         assert_eq!(run_bytes(4, 3, &[b"\x1b[r"]), b"\x1b[r");
+    }
+
+    #[test]
+    fn app_decstbm_overflow_bottom_is_clamped() {
+        // A bottom too large to parse as u32 must still clamp, not pass through.
+        assert_eq!(run_bytes(4, 3, &[b"\x1b[1;99999999999r"]), b"\x1b[1;3r");
     }
 }
 
