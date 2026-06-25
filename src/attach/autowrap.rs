@@ -1,24 +1,11 @@
 use anyhow::Result;
 use libghostty_vt::{Terminal, TerminalOptions};
 
-/// Where the classifier is between `process` calls.
-enum State {
-    /// Parser is at a clean boundary; next byte starts a fresh unit.
-    Ground,
-    /// Accumulating the bytes of one printable glyph (multi-byte UTF-8 or
-    /// base+combining run). `x0`/`y0` are the cursor position before the glyph.
-    InGlyph { x0: u16, y0: u16 },
-    /// Inside an escape/CSI/OSC sequence; bytes buffered in `seq` until boundary.
-    InEscape,
-}
-
 pub(super) struct WrapInjector {
     term: Terminal<'static, 'static>,
-    state: State,
-    /// Buffered bytes of the in-progress glyph, not yet emitted.
-    glyph: Vec<u8>,
-    /// Buffered bytes of the in-progress escape sequence, not yet emitted.
-    seq: Vec<u8>,
+    /// Partial trailing unit fed to `term` but not yet emitted, carried to the
+    /// next `process` call so a glyph split across calls is never sliced.
+    carry: Vec<u8>,
     server_rows: u32,
 }
 
@@ -30,9 +17,7 @@ impl WrapInjector {
                 rows: server_rows as u16,
                 max_scrollback: 0,
             })?,
-            state: State::Ground,
-            glyph: Vec::new(),
-            seq: Vec::new(),
+            carry: Vec::new(),
             server_rows,
         })
     }
@@ -54,93 +39,9 @@ impl WrapInjector {
             rows: server_rows as u16,
             max_scrollback: 0,
         })?;
-        self.state = State::Ground;
-        self.glyph.clear();
-        self.seq.clear();
+        self.carry.clear();
         self.server_rows = server_rows;
         Ok(())
-    }
-
-    /// True if `b`, at a parser boundary, begins a printable glyph (as opposed
-    /// to a C0 control or escape sequence). UTF-8 lead/continuation bytes and
-    /// invalid bytes are all >= 0x20; the parser/`vt_at_boundary` assembles them.
-    fn is_printable_start(b: u8) -> bool {
-        b >= 0x20 && b != 0x7f
-    }
-
-    /// Feed one byte to the tracking terminal.
-    fn feed(&mut self, b: u8) {
-        self.term.vt_write(&[b]);
-    }
-
-    /// Called when a complete glyph has been fed (parser back at boundary).
-    /// If feeding the glyph moved the cursor to a new row (row advanced) or back
-    /// toward the left edge (a wrap that scrolled at the bottom margin), the
-    /// server soft-wrapped — inject `\r\n` before the glyph so the wider client
-    /// wraps at the same point. Otherwise emit the glyph unchanged.
-    fn flush_glyph(&mut self, x0: u16, y0: u16, out: &mut Vec<u8>) {
-        let x1 = self.term.cursor_x().unwrap_or(x0);
-        let y1 = self.term.cursor_y().unwrap_or(y0);
-        let wrapped = y1 > y0 || x1 < x0;
-        if wrapped {
-            out.extend_from_slice(b"\r\n");
-        }
-        out.extend_from_slice(&self.glyph);
-        self.glyph.clear();
-    }
-
-    /// Emit a completed escape sequence (in `self.seq`), clamping a DECSTBM
-    /// bottom margin to the server row count. All other sequences pass verbatim.
-    fn emit_sequence(&mut self, out: &mut Vec<u8>) {
-        let seq = std::mem::take(&mut self.seq);
-        if let Some(clamped) = self.clamp_decstbm(&seq) {
-            out.extend_from_slice(&clamped);
-        } else {
-            out.extend_from_slice(&seq);
-        }
-    }
-
-    /// If `seq` is a DECSTBM (`\x1b[<top>;<bottom>r`, no private marker) whose
-    /// bottom exceeds `server_rows`, return a clamped rewrite. A bare `\x1b[r`
-    /// (reset) and in-bounds regions return `None` (emit verbatim).
-    fn clamp_decstbm(&self, seq: &[u8]) -> Option<Vec<u8>> {
-        // Must be CSI ... 'r' with a non-private parameter body.
-        if seq.len() < 3 || seq[0] != 0x1b || seq[1] != b'[' || *seq.last().unwrap() != b'r' {
-            return None;
-        }
-        let params = &seq[2..seq.len() - 1];
-        if params.first() == Some(&b'?') {
-            return None; // private mode, not DECSTBM
-        }
-        if params.is_empty() {
-            return None; // bare reset \x1b[r — pass through
-        }
-        // Parse "top;bottom" (either may be empty/absent).
-        let mut parts = params.split(|&c| c == b';');
-        let top = parts.next().unwrap_or(b"");
-        let bottom = parts.next().unwrap_or(b"");
-        if parts.next().is_some() {
-            return None; // more than two params: not a DECSTBM we model
-        }
-        // Validate digits only.
-        if !top.iter().all(|c| c.is_ascii_digit()) || !bottom.iter().all(|c| c.is_ascii_digit()) {
-            return None;
-        }
-        if bottom.is_empty() {
-            return None; // default bottom = screen
-        }
-        let bottom_val: u32 = std::str::from_utf8(bottom)
-            .ok()?
-            .parse()
-            .unwrap_or(u32::MAX);
-        if bottom_val <= self.server_rows {
-            return None; // already in-bounds (or default bottom = screen)
-        }
-        let top_str = std::str::from_utf8(top).ok()?;
-        let mut rewritten = Vec::new();
-        use std::io::Write as _;
-        write!(rewritten, "\x1b[{};{}r", top_str, self.server_rows).ok();
-        Some(rewritten)
     }
 
     /// Emit the DECSTBM that establishes the vertical scroll region the
@@ -151,53 +52,29 @@ impl WrapInjector {
     }
 
     pub(super) fn process(&mut self, input: &[u8], out: &mut Vec<u8>) {
-        for &b in input {
-            match self.state {
-                State::Ground => {
-                    if Self::is_printable_start(b) {
-                        let x0 = self.term.cursor_x().unwrap_or(0);
-                        let y0 = self.term.cursor_y().unwrap_or(0);
-                        self.glyph.push(b);
-                        self.feed(b);
-                        if self.term.vt_at_boundary() {
-                            self.flush_glyph(x0, y0, out);
-                            // stay in Ground
-                        } else {
-                            self.state = State::InGlyph { x0, y0 };
-                        }
-                    } else if b == 0x1b {
-                        self.seq.clear();
-                        self.seq.push(b);
-                        self.feed(b);
-                        // A lone ESC leaves the parser mid-sequence; if the
-                        // sequence is somehow already complete (it never is for
-                        // a bare ESC) we'd still be safe, but normally we wait.
-                        if self.term.vt_at_boundary() {
-                            self.emit_sequence(out);
-                        } else {
-                            self.state = State::InEscape;
-                        }
-                    } else {
-                        // Other C0 control (CR, LF, HT, BEL, BS, ...): forward.
-                        self.feed(b);
-                        out.push(b);
-                    }
+        // Prepend the carried partial-unit tail (already fed last call) and mark
+        // it as the skip prefix so it is not re-fed; it lives in `buf` only to
+        // keep one offset frame spanning the carry.
+        let mut buf = std::mem::take(&mut self.carry);
+        let mut skip = buf.len();
+        buf.extend_from_slice(input);
+
+        let mut emit = 0usize; // next unemitted offset within buf
+        loop {
+            let r = self.term.vt_write_until_wrap(&buf, skip);
+            match r.wrap {
+                Some(off) => {
+                    out.extend_from_slice(&buf[emit..off]); // up to wrapping glyph
+                    out.extend_from_slice(b"\r\n"); // injected break
+                    out.extend_from_slice(&buf[off..r.committed]); // the wrapping glyph
+                    emit = r.committed;
+                    skip = r.committed; // everything up to here is now fed
+                    // loop: more of buf may remain unfed past the wrap
                 }
-                State::InGlyph { x0, y0 } => {
-                    self.glyph.push(b);
-                    self.feed(b);
-                    if self.term.vt_at_boundary() {
-                        self.flush_glyph(x0, y0, out);
-                        self.state = State::Ground;
-                    }
-                }
-                State::InEscape => {
-                    self.seq.push(b);
-                    self.feed(b);
-                    if self.term.vt_at_boundary() {
-                        self.emit_sequence(out);
-                        self.state = State::Ground;
-                    }
+                None => {
+                    out.extend_from_slice(&buf[emit..r.committed]); // complete units
+                    self.carry = buf[r.committed..].to_vec(); // partial tail (already fed)
+                    break;
                 }
             }
         }
@@ -338,34 +215,23 @@ mod tests {
     }
 
     #[test]
+    fn wide_glyph_split_across_calls_not_sliced_at_wrap() {
+        // 世 (E4 B8 96) is 2 wide. "abc" leaves one column, so 世 wraps. The glyph
+        // arrives split across two process() calls. The break must land before the
+        // whole glyph — its bytes must never be sliced by the \r\n.
+        let mut wi = WrapInjector::new(4, 3).unwrap();
+        let mut out = Vec::new();
+        wi.process(b"abc\xe4", &mut out); // up to the first byte of 世
+        wi.process(b"\xb8\x96", &mut out); // the rest of 世
+        assert_eq!(out, "abc\r\n世".as_bytes());
+    }
+
+    #[test]
     fn region_setup_emits_decstbm() {
         let wi = WrapInjector::new(4, 3).unwrap();
         let mut out = Vec::new();
         wi.emit_region_setup(&mut out);
         assert_eq!(out, b"\x1b[1;3r");
-    }
-
-    #[test]
-    fn app_decstbm_bottom_is_clamped_to_server_rows() {
-        // App tries to set a scroll region 1..10 on a 3-row server; clamp to 1..3.
-        assert_eq!(run_bytes(4, 3, &[b"\x1b[1;10r"]), b"\x1b[1;3r");
-    }
-
-    #[test]
-    fn app_decstbm_within_bounds_passes_through() {
-        assert_eq!(run_bytes(4, 3, &[b"\x1b[2;3r"]), b"\x1b[2;3r");
-    }
-
-    #[test]
-    fn app_decstbm_reset_passes_through() {
-        // A bare \x1b[r (reset scroll region) passes through unchanged.
-        assert_eq!(run_bytes(4, 3, &[b"\x1b[r"]), b"\x1b[r");
-    }
-
-    #[test]
-    fn app_decstbm_overflow_bottom_is_clamped() {
-        // A bottom too large to parse as u32 must still clamp, not pass through.
-        assert_eq!(run_bytes(4, 3, &[b"\x1b[1;99999999999r"]), b"\x1b[1;3r");
     }
 
     use super::super::{EventResult, PtyEvent, RenderMode, RenderModeHandler};
