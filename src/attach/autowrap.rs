@@ -37,6 +37,17 @@ impl WrapInjector {
         })
     }
 
+    /// Tell the tracking terminal its dimensions changed, preserving cursor and
+    /// screen state (unlike `reset`, which rebuilds from scratch). Used on a
+    /// Resize event, which carries no repaint data: any Stream bytes that arrive
+    /// before the server's follow-up Refresh must still be tracked against the
+    /// real cursor position so wrap injection stays correct.
+    pub(super) fn resize(&mut self, server_cols: u32, server_rows: u32) -> Result<()> {
+        self.term.resize(server_cols as u16, server_rows as u16, 0, 0)?;
+        self.server_rows = server_rows;
+        Ok(())
+    }
+
     pub(super) fn reset(&mut self, server_cols: u32, server_rows: u32) -> Result<()> {
         self.term = Terminal::new(TerminalOptions {
             cols: server_cols as u16,
@@ -312,6 +323,21 @@ mod tests {
     }
 
     #[test]
+    fn resize_preserves_cursor_state_for_wrap_detection() {
+        // Print "abc" into a 4-col terminal (cursor at col 3), then resize the
+        // server to 5 cols. resize() must preserve the cursor so the next glyph
+        // wraps at the *new* width: "ab" fills cols 3..4 (deferred wrap at col 5)
+        // and "c" then wraps. A reset() would zero the cursor and mis-detect.
+        let mut wi = WrapInjector::new(4, 3).unwrap();
+        let mut out = Vec::new();
+        wi.process(b"abc", &mut out);
+        wi.resize(5, 3).unwrap();
+        wi.process(b"de", &mut out); // now at col 5 (cols 0..4 filled): pending wrap
+        wi.process(b"f", &mut out); // wraps
+        assert_eq!(out, b"abcde\r\nf");
+    }
+
+    #[test]
     fn region_setup_emits_decstbm() {
         let wi = WrapInjector::new(4, 3).unwrap();
         let mut out = Vec::new();
@@ -397,10 +423,11 @@ impl super::RenderModeHandler for AutowrapHandler {
                 if !self.fits_client() {
                     return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
                 }
-                // No repaint data accompanies a Resize; just rebuild the tracking
-                // terminal to the new server size. The server sends a Refresh
-                // shortly after, which re-emits setup and repaints.
-                self.inj.reset(cols, rows)?;
+                // No repaint data accompanies a Resize; resize the tracking
+                // terminal in place (preserving cursor/screen state) so any
+                // Stream bytes that arrive before the server's follow-up Refresh
+                // are tracked against the real cursor and wrap correctly.
+                self.inj.resize(cols, rows)?;
             }
             super::PtyEvent::Closed => {}
         }
