@@ -338,6 +338,43 @@ mod tests {
     }
 
     #[test]
+    fn wrap_with_left_margin_emits_cha() {
+        // App enables DECLRMM and sets left margin 2, right margin 4 on an
+        // 8-col server. Cursor to row 1 col 2; "abc" fills cols 2..4 (pending
+        // wrap at the right margin); "x" wraps to row 2 *column 2*, not column
+        // 1. The injected break must be \r\n followed by CHA to column 2.
+        let mut wi = WrapInjector::new(8, 4).unwrap();
+        let mut out = Vec::new();
+        wi.process(b"\x1b[?69h\x1b[2;4s\x1b[1;2Habcx", &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.ends_with("abc\r\n\x1b[2Gx"),
+            "expected break + CHA to the left margin before 'x', got {:?}", s
+        );
+    }
+
+    #[test]
+    fn wrap_without_margin_has_no_cha() {
+        // Plain wrap at column 1 must stay a bare \r\n (no redundant CHA).
+        assert_eq!(run_bytes(4, 3, &[b"abcde"]), b"abcd\r\ne");
+    }
+
+    #[test]
+    fn wide_char_wrap_with_left_margin_emits_cha() {
+        // Same margins; 世 (2 wide) can't fit in the last column and wraps to
+        // the left margin. left = cx_after - 2.
+        let mut wi = WrapInjector::new(8, 4).unwrap();
+        let mut out = Vec::new();
+        wi.process("\x1b[?69h\x1b[2;5s\x1b[1;4H".as_bytes(), &mut out).unwrap();
+        wi.process("a世".as_bytes(), &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.ends_with("a\r\n\x1b[2G世"),
+            "expected CHA to left margin before the wide glyph, got {:?}", s
+        );
+    }
+
+    #[test]
     fn region_setup_emits_decstbm() {
         let wi = WrapInjector::new(4, 3).unwrap();
         let mut out = Vec::new();
