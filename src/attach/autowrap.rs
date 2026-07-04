@@ -76,6 +76,15 @@ impl WrapInjector {
         write!(out, "\x1b[1;{}r", self.server_rows).ok();
     }
 
+    /// Region setup plus screen clear, for init/Refresh: DECSTBM homes the
+    /// cursor, then ED2 clears any stale client content (from a previous
+    /// render mode, or client columns/rows beyond the server's) before the
+    /// repaint is replayed.
+    pub(super) fn emit_screen_setup(&self, out: &mut Vec<u8>) {
+        self.emit_region_setup(out);
+        out.extend_from_slice(b"\x1b[2J");
+    }
+
     /// Emit any held unit bytes verbatim. Only valid at end-of-life (Closed or
     /// cleanup): after a mid-unit flush the classifier and the parser disagree,
     /// so `process` must not be called again.
@@ -469,6 +478,44 @@ mod tests {
     use super::super::{EventResult, PtyEvent, RenderMode, RenderModeHandler};
 
     #[test]
+    fn closed_flushes_held_bytes() {
+        // A partial CSI held for rewriting must not be swallowed when the PTY
+        // closes mid-sequence.
+        let mut h = AutowrapHandler::new(80, 24).unwrap();
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+        h.on_pty_event(PtyEvent::Stream { data: b"\x1b[5;10" }, &mut out).unwrap();
+        assert_eq!(out, b"", "partial CSI must be held");
+        h.on_pty_event(PtyEvent::Closed, &mut out).unwrap();
+        assert_eq!(out, b"\x1b[5;10", "Closed must flush the held bytes");
+    }
+
+    #[test]
+    fn cleanup_flushes_then_releases_region() {
+        let mut h = AutowrapHandler::new(80, 24).unwrap();
+        let mut out = Vec::new();
+        h.init(b"", &[], &mut out).unwrap();
+        out.clear();
+        h.on_pty_event(PtyEvent::Stream { data: b"ab\xc3" }, &mut out).unwrap(); // partial é
+        out.clear();
+        h.cleanup(&mut out);
+        assert_eq!(out, b"\xc3\x1b[r", "cleanup must flush the carry before releasing the region");
+    }
+
+    #[test]
+    fn screen_setup_sets_region_then_clears() {
+        // init/Refresh use this: DECSTBM (which homes) followed by ED2 so
+        // stale client content never survives a (re)attach. We test the
+        // injector method directly because handler.init consults the real
+        // terminal size, which is (0,0) in the test environment.
+        let wi = WrapInjector::new(80, 24).unwrap();
+        let mut out = Vec::new();
+        wi.emit_screen_setup(&mut out);
+        assert_eq!(out, b"\x1b[1;24r\x1b[2J");
+    }
+
+    #[test]
     fn falls_back_to_cell_when_client_too_small_on_resize() {
         // Server grows wider than the client on resize -> hand off to cell mode.
         // get_terminal_size() reads the real terminal; to keep this deterministic
@@ -490,7 +537,7 @@ impl super::RenderModeHandler for AutowrapHandler {
             return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
         }
         self.inj.reset(self.server_cols, self.server_rows)?;
-        self.inj.emit_region_setup(out);
+        self.inj.emit_screen_setup(out);
         self.inj.process(refresh_data, out)?;
         for (_gen, data) in buffered {
             self.inj.process(data, out)?;
@@ -512,7 +559,7 @@ impl super::RenderModeHandler for AutowrapHandler {
                 // Refresh is a full reset/redraw: rebuild the tracking terminal
                 // and re-emit the region setup before replaying the repaint.
                 self.inj.reset(cols, rows)?;
-                self.inj.emit_region_setup(out);
+                self.inj.emit_screen_setup(out);
                 self.inj.process(data, out)?;
             }
             super::PtyEvent::Resize { cols, rows } => {
@@ -527,7 +574,11 @@ impl super::RenderModeHandler for AutowrapHandler {
                 // are tracked against the real cursor and wrap correctly.
                 self.inj.resize(cols, rows)?;
             }
-            super::PtyEvent::Closed => {}
+            super::PtyEvent::Closed => {
+                // The stream is over; a partial unit held for wrap/rewrite
+                // inspection will never complete. Emit it verbatim.
+                self.inj.flush(out);
+            }
         }
         Ok(super::EventResult::Continue)
     }
@@ -543,7 +594,8 @@ impl super::RenderModeHandler for AutowrapHandler {
     }
 
     fn cleanup(&mut self, out: &mut Vec<u8>) {
-        // Release the vertical scroll region on detach.
+        // Flush any held partial unit, then release the vertical scroll region.
+        self.inj.flush(out);
         out.extend_from_slice(b"\x1b[r");
     }
 }
