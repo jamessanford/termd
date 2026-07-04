@@ -143,10 +143,49 @@ impl WrapInjector {
     }
 
     /// Pass a completed, held control unit to the client, rewriting the few
-    /// sequences that contend with our region setup. Filled in by the
-    /// DECSTBM/RIS/DECSTR task; passthrough until then.
-    fn rewrite_control(&self, _cx: u16, _cy: u16, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.unit);
+    /// sequences that contend with our region setup. Mirrors region.rs's
+    /// dispatch_csi, minus the DECSLRM/DECLRMM handling autowrap doesn't need.
+    fn rewrite_control(&self, cx: u16, cy: u16, out: &mut Vec<u8>) {
+        let u = &self.unit;
+        if u.as_slice() == b"\x1bc" {
+            // RIS: pass through (clears + homes the client), then re-establish
+            // the region. DECSTBM homes again, matching RIS's own homing.
+            out.extend_from_slice(u);
+            self.emit_region_setup(out);
+            return;
+        }
+        if u.starts_with(b"\x1b[") && u.len() >= 3 {
+            let body = &u[2..u.len() - 1];
+            let fin = *u.last().expect("unit non-empty");
+            if fin == b'p' && body.first() == Some(&b'!') {
+                // DECSTR: resets margins without moving the cursor. Re-emit the
+                // region (which homes the cursor) and put the cursor back where
+                // the tracked terminal says it is.
+                out.extend_from_slice(u);
+                self.emit_region_setup(out);
+                write!(out, "\x1b[{};{}H", cy + 1, cx + 1).ok();
+                return;
+            }
+            if fin == b'r' && body.iter().all(|&b| b.is_ascii_digit() || b == b';') {
+                // DECSTBM: the app's "full screen" is the server screen. Clamp
+                // the bottom margin so it never spills into client rows the
+                // server doesn't have.
+                let mut params = body
+                    .split(|&b| b == b';')
+                    .map(|s| std::str::from_utf8(s).ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0));
+                let top = params.next().filter(|&p| p != 0).unwrap_or(1);
+                let bottom = params.next().unwrap_or(0);
+                let bottom = if bottom == 0 || bottom > self.server_rows {
+                    self.server_rows
+                } else {
+                    bottom
+                };
+                let top = if top >= bottom { 1 } else { top };
+                write!(out, "\x1b[{};{}r", top, bottom).ok();
+                return;
+            }
+        }
+        out.extend_from_slice(u);
     }
 }
 
@@ -380,6 +419,51 @@ mod tests {
         let mut out = Vec::new();
         wi.emit_region_setup(&mut out);
         assert_eq!(out, b"\x1b[1;3r");
+    }
+
+    #[test]
+    fn app_decstbm_bottom_clamped_to_server_rows() {
+        // App asks for rows 1..50 on a 24-row server: clamp bottom to 24.
+        assert_eq!(run_bytes(80, 24, &[b"\x1b[1;50r"]), b"\x1b[1;24r");
+    }
+
+    #[test]
+    fn app_decstbm_full_reset_becomes_server_region() {
+        // Bare ESC[r means "full screen" to the app — which is the *server*
+        // screen, not the taller client. Rewrite to 1..server_rows.
+        assert_eq!(run_bytes(80, 24, &[b"\x1b[r"]), b"\x1b[1;24r");
+    }
+
+    #[test]
+    fn app_decstbm_within_bounds_passes() {
+        assert_eq!(run_bytes(80, 24, &[b"\x1b[5;20r"]), b"\x1b[5;20r");
+    }
+
+    #[test]
+    fn private_csi_r_not_rewritten() {
+        // ESC[?...r is DEC private mode *restore*, not DECSTBM.
+        assert_eq!(run_bytes(80, 24, &[b"\x1b[?1049r"]), b"\x1b[?1049r");
+    }
+
+    #[test]
+    fn ris_reestablishes_region() {
+        let out = run_bytes(80, 24, &[b"\x1bc"]);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("\x1bc"), "RIS passes through first");
+        assert!(s.contains("\x1b[1;24r"), "region setup must follow RIS");
+    }
+
+    #[test]
+    fn decstr_reestablishes_region_and_restores_cursor() {
+        // DECSTR resets margins but does NOT move the cursor; our re-emitted
+        // DECSTBM homes it, so a CUP back to the tracked position must follow.
+        let mut wi = WrapInjector::new(80, 24).unwrap();
+        let mut out = Vec::new();
+        wi.process(b"\x1b[5;10H\x1b[!p", &mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("\x1b[!p"), "DECSTR passes through");
+        assert!(s.contains("\x1b[1;24r"), "region setup follows DECSTR");
+        assert!(s.ends_with("\x1b[5;10H"), "cursor restored after region setup, got {:?}", s);
     }
 
     use super::super::{EventResult, PtyEvent, RenderMode, RenderModeHandler};
