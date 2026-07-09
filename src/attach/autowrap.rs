@@ -1,11 +1,27 @@
+use std::io::Write as _;
+
 use anyhow::Result;
 use libghostty_vt::{Terminal, TerminalOptions};
 
+/// Control units are held only this long (enough for any CSI we rewrite);
+/// longer control strings (OSC/DCS/APC payloads) stream out eagerly.
+const CONTROL_HOLD_MAX: usize = 64;
+
+#[derive(Clone, Copy, PartialEq)]
+enum UnitKind {
+    Printable,
+    Control { streamed: bool },
+}
+
 pub(super) struct WrapInjector {
     term: Terminal<'static, 'static>,
-    /// Partial trailing unit fed to `term` but not yet emitted, carried to the
-    /// next `process` call so a glyph split across calls is never sliced.
-    carry: Vec<u8>,
+    /// Bytes of the in-progress unit (a codepoint or an escape sequence).
+    /// Printable units are held whole so a break can be injected before them;
+    /// control units are held only up to CONTROL_HOLD_MAX for CSI rewriting.
+    unit: Vec<u8>,
+    kind: Option<UnitKind>,
+    prev_x: u16,
+    prev_y: u16,
     server_rows: u32,
 }
 
@@ -17,7 +33,10 @@ impl WrapInjector {
                 rows: server_rows as u16,
                 max_scrollback: 0,
             })?,
-            carry: Vec::new(),
+            unit: Vec::new(),
+            kind: None,
+            prev_x: 0,
+            prev_y: 0,
             server_rows,
         })
     }
@@ -30,6 +49,10 @@ impl WrapInjector {
     pub(super) fn resize(&mut self, server_cols: u32, server_rows: u32) -> Result<()> {
         self.term.resize(server_cols as u16, server_rows as u16, 0, 0)?;
         self.server_rows = server_rows;
+        // The resize may clamp the cursor; rebaseline so the next printable
+        // isn't misread as a wrap.
+        self.prev_x = self.term.cursor_x()?;
+        self.prev_y = self.term.cursor_y()?;
         Ok(())
     }
 
@@ -39,7 +62,10 @@ impl WrapInjector {
             rows: server_rows as u16,
             max_scrollback: 0,
         })?;
-        self.carry.clear();
+        self.unit.clear();
+        self.kind = None;
+        self.prev_x = 0;
+        self.prev_y = 0;
         self.server_rows = server_rows;
         Ok(())
     }
@@ -47,38 +73,91 @@ impl WrapInjector {
     /// Emit the DECSTBM that establishes the vertical scroll region the
     /// client must use: top margin always 1, bottom margin the server rows.
     pub(super) fn emit_region_setup(&self, out: &mut Vec<u8>) {
-        use std::io::Write as _;
         write!(out, "\x1b[1;{}r", self.server_rows).ok();
     }
 
-    pub(super) fn process(&mut self, input: &[u8], out: &mut Vec<u8>) {
-        // Prepend the carried partial-unit tail (already fed last call) and mark
-        // it as the skip prefix so it is not re-fed; it lives in `buf` only to
-        // keep one offset frame spanning the carry.
-        let mut buf = std::mem::take(&mut self.carry);
-        let mut skip = buf.len();
-        buf.extend_from_slice(input);
-
-        let mut emit = 0usize; // next unemitted offset within buf
-        loop {
-            let r = self.term.vt_write_until_wrap(&buf, skip);
-            match r.wrap {
-                Some(off) => {
-                    out.extend_from_slice(&buf[emit..off]); // up to wrapping glyph
-                    out.extend_from_slice(b"\r\n"); // injected break
-                    out.extend_from_slice(&buf[off..r.committed]); // the wrapping glyph
-                    emit = r.committed;
-                    skip = r.committed; // everything up to here is now fed
-                    // loop: more of buf may remain unfed past the wrap
-                }
-                None => {
-                    out.extend_from_slice(&buf[emit..r.committed]); // complete units
-                    self.carry = buf[r.committed..].to_vec(); // partial tail (already fed)
-                    break;
-                }
-            }
-        }
+    /// Emit any held unit bytes verbatim. Only valid at end-of-life (Closed or
+    /// cleanup): after a mid-unit flush the classifier and the parser disagree,
+    /// so `process` must not be called again.
+    pub(super) fn flush(&mut self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.unit);
+        self.unit.clear();
+        self.kind = None;
     }
+
+    pub(super) fn process(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        for &b in input {
+            let kind = *self.kind.get_or_insert(if b >= 0x20 && b != 0x7f {
+                UnitKind::Printable
+            } else {
+                UnitKind::Control { streamed: false }
+            });
+            self.term.vt_write(&[b]);
+            match kind {
+                UnitKind::Printable => self.unit.push(b),
+                UnitKind::Control { streamed: false } => {
+                    self.unit.push(b);
+                    if self.unit.len() > CONTROL_HOLD_MAX {
+                        // Too long to be a CSI we rewrite: stream from here on.
+                        out.extend_from_slice(&self.unit);
+                        self.unit.clear();
+                        self.kind = Some(UnitKind::Control { streamed: true });
+                    }
+                }
+                UnitKind::Control { streamed: true } => out.push(b),
+            }
+            if !self.term.vt_at_boundary() {
+                continue;
+            }
+            // A complete unit just landed.
+            let cx = self.term.cursor_x()?;
+            let cy = self.term.cursor_y()?;
+            match self.kind.take().expect("kind set above") {
+                UnitKind::Printable => {
+                    if cy > self.prev_y || cx < self.prev_x {
+                        // The glyph soft-wrapped on the server: inject a break,
+                        // then move to the column it actually landed on (the
+                        // left margin, which is column 1 unless the app set
+                        // DECSLRM — hence the CHA). Width comes from
+                        // unicode-width, which can disagree with ghostty on
+                        // ambiguous-width codepoints; acceptable drift.
+                        out.extend_from_slice(b"\r\n");
+                        let left = cx.saturating_sub(unit_width(&self.unit));
+                        if left > 0 {
+                            write!(out, "\x1b[{}G", left + 1).ok();
+                        }
+                    }
+                    out.extend_from_slice(&self.unit);
+                    self.unit.clear();
+                }
+                UnitKind::Control { streamed: false } => {
+                    self.rewrite_control(cx, cy, out);
+                    self.unit.clear();
+                }
+                UnitKind::Control { streamed: true } => {}
+            }
+            self.prev_x = cx;
+            self.prev_y = cy;
+        }
+        Ok(())
+    }
+
+    /// Pass a completed, held control unit to the client, rewriting the few
+    /// sequences that contend with our region setup. Filled in by the
+    /// DECSTBM/RIS/DECSTR task; passthrough until then.
+    fn rewrite_control(&self, _cx: u16, _cy: u16, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.unit);
+    }
+}
+
+/// Terminal-column width of the first codepoint of a printable unit.
+fn unit_width(unit: &[u8]) -> u16 {
+    use unicode_width::UnicodeWidthChar;
+    std::str::from_utf8(unit)
+        .ok()
+        .and_then(|s| s.chars().next())
+        .and_then(|c| c.width())
+        .unwrap_or(1) as u16
 }
 
 pub(super) struct AutowrapHandler {
@@ -110,7 +189,7 @@ mod tests {
         let mut wi = WrapInjector::new(server_cols, server_rows).unwrap();
         let mut out = Vec::new();
         for c in chunks {
-            wi.process(c, &mut out);
+            wi.process(c, &mut out).unwrap();
         }
         out
     }
@@ -130,6 +209,38 @@ mod tests {
     fn utf8_split_across_chunks_passes_through() {
         // "é" = 0xC3 0xA9 split across two process() calls.
         assert_eq!(run_bytes(80, 24, &[b"a\xc3", b"\xa9b"]), b"a\xc3\xa9b");
+    }
+
+    #[test]
+    fn long_osc_streams_eagerly() {
+        // An OSC payload longer than the control hold cap must be emitted
+        // before its terminator arrives — no unbounded buffering (gap 1).
+        let mut wi = WrapInjector::new(80, 24).unwrap();
+        let mut out = Vec::new();
+        let mut osc = b"\x1b]52;c;".to_vec();
+        osc.extend(std::iter::repeat(b'A').take(4096)); // no ST yet
+        wi.process(&osc, &mut out).unwrap();
+        assert!(
+            out.len() >= 4000,
+            "payload must stream out before the terminator, got {} bytes",
+            out.len()
+        );
+        // Terminator arrives later; everything matches the original stream.
+        wi.process(b"\x1b\\", &mut out).unwrap();
+        osc.extend_from_slice(b"\x1b\\");
+        assert_eq!(out, osc);
+    }
+
+    #[test]
+    fn carry_is_bounded() {
+        // Only an incomplete printable unit (max 4 bytes of UTF-8) or a short
+        // control prefix may be held across calls.
+        let mut wi = WrapInjector::new(80, 24).unwrap();
+        let mut out = Vec::new();
+        wi.process(b"ab\xf0\x9f\x98", &mut out).unwrap(); // incomplete 4-byte emoji
+        assert_eq!(out, b"ab");
+        wi.process(b"\x80", &mut out).unwrap(); // 😀 completes
+        assert_eq!(out, "ab😀".as_bytes());
     }
 
     // 4 columns wide, 3 rows tall server.
@@ -207,10 +318,10 @@ mod tests {
         // and "c" then wraps. A reset() would zero the cursor and mis-detect.
         let mut wi = WrapInjector::new(4, 3).unwrap();
         let mut out = Vec::new();
-        wi.process(b"abc", &mut out);
+        wi.process(b"abc", &mut out).unwrap();
         wi.resize(5, 3).unwrap();
-        wi.process(b"de", &mut out); // now at col 5 (cols 0..4 filled): pending wrap
-        wi.process(b"f", &mut out); // wraps
+        wi.process(b"de", &mut out).unwrap(); // now at col 5 (cols 0..4 filled): pending wrap
+        wi.process(b"f", &mut out).unwrap(); // wraps
         assert_eq!(out, b"abcde\r\nf");
     }
 
@@ -221,8 +332,8 @@ mod tests {
         // whole glyph — its bytes must never be sliced by the \r\n.
         let mut wi = WrapInjector::new(4, 3).unwrap();
         let mut out = Vec::new();
-        wi.process(b"abc\xe4", &mut out); // up to the first byte of 世
-        wi.process(b"\xb8\x96", &mut out); // the rest of 世
+        wi.process(b"abc\xe4", &mut out).unwrap(); // up to the first byte of 世
+        wi.process(b"\xb8\x96", &mut out).unwrap(); // the rest of 世
         assert_eq!(out, "abc\r\n世".as_bytes());
     }
 
@@ -259,9 +370,9 @@ impl super::RenderModeHandler for AutowrapHandler {
         }
         self.inj.reset(self.server_cols, self.server_rows)?;
         self.inj.emit_region_setup(out);
-        self.inj.process(refresh_data, out);
+        self.inj.process(refresh_data, out)?;
         for (_gen, data) in buffered {
-            self.inj.process(data, out);
+            self.inj.process(data, out)?;
         }
         Ok(super::EventResult::Continue)
     }
@@ -269,7 +380,7 @@ impl super::RenderModeHandler for AutowrapHandler {
     fn on_pty_event(&mut self, event: super::PtyEvent, out: &mut Vec<u8>) -> Result<super::EventResult> {
         match event {
             super::PtyEvent::Stream { data, .. } => {
-                self.inj.process(data, out);
+                self.inj.process(data, out)?;
             }
             super::PtyEvent::Refresh { cols, rows, data, .. } => {
                 self.server_cols = cols;
@@ -281,7 +392,7 @@ impl super::RenderModeHandler for AutowrapHandler {
                 // and re-emit the region setup before replaying the repaint.
                 self.inj.reset(cols, rows)?;
                 self.inj.emit_region_setup(out);
-                self.inj.process(data, out);
+                self.inj.process(data, out)?;
             }
             super::PtyEvent::Resize { cols, rows } => {
                 self.server_cols = cols;
