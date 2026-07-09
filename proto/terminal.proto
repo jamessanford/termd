@@ -15,29 +15,22 @@ service TerminalService {
   rpc Resize   (ResizeRequest)   returns (PtyItem);
   rpc SetTitle (SetTitleRequest) returns (PtyItem);
 
-  // Ask the daemon to (re)emit a full screen snapshot for a subscription. The
-  // snapshot is NOT returned here; it arrives on the matching Subscribe stream
-  // as a SubscribeEvent.refresh, ordered against live output. This call only
-  // acknowledges that the request was accepted (non-OK status if it wasn't).
+  // Refresh asks the daemon to emit the full screen snapshot.  The snapshot
+  // itself will be placed into the Subscribe stream as SubscribeEvent.refresh.
   rpc Refresh (RefreshRequest) returns (google.protobuf.Empty);
 
-  // Page the scrollback for a subscription's viewport. Unlike live output and
-  // refresh snapshots, scrollback paging is a self-contained request/response
-  // (its own paradigm, not interleaved with the stream), so the rows come back
-  // here rather than on the Subscribe stream.
+  // Scrollback returns a viewport snapshot.  The rows come back here
+  // rather than on the Subscribe stream, as scrollback is a different "mode".
   rpc Scrollback (ScrollbackRequest) returns (ScrollbackResponse);
 
-  // ---- Data plane: one bidi stream per subscribed PTY ----
-  // The stream's lifetime IS the subscription: the first client frame must be
-  // a SubscribeStart; closing the stream unsubscribes. The stream is scoped to
-  // a single PTY, so no per-frame pty_id is needed. Subscription failures are
-  // reported by erroring the stream with a gRPC status.
+  // Subscribe begins watching a PTY and streams the PTY as the response
+  // until unsubscribe.  The first client frame must be SubscribeStart.
   rpc Subscribe (stream SubscribeFrame) returns (stream SubscribeEvent);
 }
 
 // ============================ Shared types ============================
 
-// Terminal dimensions. cols/rows always travel together; pixel dimensions for
+// Size is the dimensions of a terminal PTY.  pixel dimensions for
 // image protocols (sixel/kitty) can be added here later.
 message Size { uint32 cols = 1; uint32 rows = 2; }
 
@@ -70,7 +63,6 @@ message DestroyRequest { uint64 pty_id = 1; }
 message ResizeRequest  { uint64 pty_id = 1; Size size = 2; }
 message SetTitleRequest{ uint64 pty_id = 1; string title = 2; }
 
-// Targets a live subscription by the id the client chose in SubscribeStart.
 message RefreshRequest { uint64 pty_id = 1; string subscriber_id = 2; }
 
 enum ScrollbackOpKind {
@@ -121,8 +113,7 @@ message SubscribeEvent {
   }
 }
 
-// First event on every Subscribe stream. The client must receive this to learn
-// its subscriber_id before it can call Refresh/Scrollback for this stream.
+// SubscribeReady is the first event on every Subscribe stream.
 message SubscribeReady { string subscriber_id = 1; }
 
 message StreamData { bytes data = 1; }
@@ -152,7 +143,7 @@ message Resized            { Size size = 1; }
 message TitleChanged       { string title = 1; }
 message Exited             { int32 exit_code = 1; }
 message SubscribersChanged { repeated SubscriberInfo subscribers = 1; }
-// This subscriber lagged the broadcast and stream data was lost. The client
-// should call Refresh to resynchronize; the snapshot arrives in order on this
-// same stream as a RefreshData.
+
+// DataLost means the subscriber lagged and stream data was potentially lost.
+// The client should call Refresh to resynchronize.
 message DataLost           {}
