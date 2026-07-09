@@ -127,8 +127,9 @@ message RefreshData {
   bool  degraded = 3;
 }
 
-// Out-of-band subscription state changes, ordered within the stream. Each
-// variant carries exactly the payload its change implies.
+// StreamMetadata is an out-of-band subscription state change, ordered
+// within the stream.  Each variant carries exactly the payload its
+// change implies.
 message StreamMetadata {
   oneof event {
     Resized            resized             = 1;
