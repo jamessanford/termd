@@ -229,6 +229,72 @@ impl AutowrapHandler {
     }
 }
 
+impl super::RenderModeHandler for AutowrapHandler {
+    fn init(&mut self, refresh_data: &[u8], out: &mut Vec<u8>) -> Result<super::EventResult> {
+        if !self.fits_client() {
+            return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
+        }
+        self.inj.reset(self.server_cols, self.server_rows)?;
+        self.inj.emit_screen_setup(out);
+        self.inj.process(refresh_data, out)?;
+        Ok(super::EventResult::Continue)
+    }
+
+    fn on_pty_event(&mut self, event: super::PtyEvent, out: &mut Vec<u8>) -> Result<super::EventResult> {
+        match event {
+            super::PtyEvent::Stream { data, .. } => {
+                self.inj.process(data, out)?;
+            }
+            super::PtyEvent::Refresh { cols, rows, data, .. } => {
+                self.server_cols = cols;
+                self.server_rows = rows;
+                if !self.fits_client() {
+                    return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
+                }
+                // Refresh is a full reset/redraw: rebuild the tracking terminal
+                // and re-emit the region setup before replaying the repaint.
+                self.inj.reset(cols, rows)?;
+                self.inj.emit_screen_setup(out);
+                self.inj.process(data, out)?;
+            }
+            super::PtyEvent::Resize { cols, rows } => {
+                self.server_cols = cols;
+                self.server_rows = rows;
+                if !self.fits_client() {
+                    return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
+                }
+                // No repaint data accompanies a Resize; resize the tracking
+                // terminal in place (preserving cursor/screen state) so any
+                // Stream bytes that arrive before the server's follow-up Refresh
+                // are tracked against the real cursor and wrap correctly.
+                self.inj.resize(cols, rows)?;
+            }
+            super::PtyEvent::Closed => {
+                // The stream is over; a partial unit held for wrap/rewrite
+                // inspection will never complete. Emit it verbatim.
+                self.inj.flush(out);
+            }
+        }
+        Ok(super::EventResult::Continue)
+    }
+
+    fn on_sigwinch(&mut self, cols: u32, rows: u32, _out: &mut Vec<u8>) -> Result<super::EventResult> {
+        if !super::server_fits_client(self.server_cols, self.server_rows, cols, rows) {
+            return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
+        }
+        // The client width/height changed but the transformed stream is
+        // width-agnostic for any client >= server, so there is nothing to
+        // re-emit; the existing region setup and injected breaks remain valid.
+        Ok(super::EventResult::Continue)
+    }
+
+    fn cleanup(&mut self, out: &mut Vec<u8>) {
+        // Flush any held partial unit, then release the vertical scroll region.
+        self.inj.flush(out);
+        out.extend_from_slice(b"\x1b[r");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,7 +332,7 @@ mod tests {
         let mut wi = WrapInjector::new(80, 24).unwrap();
         let mut out = Vec::new();
         let mut osc = b"\x1b]52;c;".to_vec();
-        osc.extend(std::iter::repeat(b'A').take(4096)); // no ST yet
+        osc.extend(std::iter::repeat_n(b'A', 4096)); // no ST yet
         wi.process(&osc, &mut out).unwrap();
         assert!(
             out.len() >= 4000,
@@ -528,71 +594,5 @@ mod tests {
             EventResult::ChangeRenderMode(RenderMode::Cell) => {}
             _ => panic!("expected fallback to Cell"),
         }
-    }
-}
-
-impl super::RenderModeHandler for AutowrapHandler {
-    fn init(&mut self, refresh_data: &[u8], out: &mut Vec<u8>) -> Result<super::EventResult> {
-        if !self.fits_client() {
-            return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
-        }
-        self.inj.reset(self.server_cols, self.server_rows)?;
-        self.inj.emit_screen_setup(out);
-        self.inj.process(refresh_data, out)?;
-        Ok(super::EventResult::Continue)
-    }
-
-    fn on_pty_event(&mut self, event: super::PtyEvent, out: &mut Vec<u8>) -> Result<super::EventResult> {
-        match event {
-            super::PtyEvent::Stream { data, .. } => {
-                self.inj.process(data, out)?;
-            }
-            super::PtyEvent::Refresh { cols, rows, data, .. } => {
-                self.server_cols = cols;
-                self.server_rows = rows;
-                if !self.fits_client() {
-                    return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
-                }
-                // Refresh is a full reset/redraw: rebuild the tracking terminal
-                // and re-emit the region setup before replaying the repaint.
-                self.inj.reset(cols, rows)?;
-                self.inj.emit_screen_setup(out);
-                self.inj.process(data, out)?;
-            }
-            super::PtyEvent::Resize { cols, rows } => {
-                self.server_cols = cols;
-                self.server_rows = rows;
-                if !self.fits_client() {
-                    return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
-                }
-                // No repaint data accompanies a Resize; resize the tracking
-                // terminal in place (preserving cursor/screen state) so any
-                // Stream bytes that arrive before the server's follow-up Refresh
-                // are tracked against the real cursor and wrap correctly.
-                self.inj.resize(cols, rows)?;
-            }
-            super::PtyEvent::Closed => {
-                // The stream is over; a partial unit held for wrap/rewrite
-                // inspection will never complete. Emit it verbatim.
-                self.inj.flush(out);
-            }
-        }
-        Ok(super::EventResult::Continue)
-    }
-
-    fn on_sigwinch(&mut self, cols: u32, rows: u32, _out: &mut Vec<u8>) -> Result<super::EventResult> {
-        if !super::server_fits_client(self.server_cols, self.server_rows, cols, rows) {
-            return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
-        }
-        // The client width/height changed but the transformed stream is
-        // width-agnostic for any client >= server, so there is nothing to
-        // re-emit; the existing region setup and injected breaks remain valid.
-        Ok(super::EventResult::Continue)
-    }
-
-    fn cleanup(&mut self, out: &mut Vec<u8>) {
-        // Flush any held partial unit, then release the vertical scroll region.
-        self.inj.flush(out);
-        out.extend_from_slice(b"\x1b[r");
     }
 }

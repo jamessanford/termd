@@ -14,12 +14,6 @@ use termd::{
     server,
 };
 
-/// Columns/rows for a `PtyItem`, treating a missing `size` as 0x0.
-fn item_size(item: &PtyItem) -> (u32, u32) {
-    let s = item.size.unwrap_or_default();
-    (s.cols, s.rows)
-}
-
 /// A `std::io::Write` wrapper that attempts the underlying write but never
 /// reports an error. Used for the daemon's tracing output so that a stdout/stderr
 /// gone bad (EIO after the controlling terminal disappears) degrades to dropped
@@ -102,7 +96,7 @@ enum Cmd {
         #[arg(long)]
         debug: bool,
         /// Rendering strategy for terminal output
-        #[arg(long, value_enum, default_value_t = attach::RenderMode::Region)]
+        #[arg(long, value_enum, default_value_t = attach::RenderMode::Autowrap)]
         render_mode: attach::RenderMode,
     },
     /// List active PTYs
@@ -213,7 +207,7 @@ async fn main() -> Result<()> {
                 items.sort_by_key(|p| p.sort_order);
                 println!("{:>3} {:<16} {:>5} {:>5}  TITLE", "#", "ID", "COLS", "ROWS");
                 for item in items {
-                    let (cols, rows) = item_size(&item);
+                    let (cols, rows) = attach::item_size(&item);
                     println!(
                         "{:>3} {:016x} {:>5} {:>5}  {}",
                         item.sort_order, item.pty_id, cols, rows, item.title
@@ -255,7 +249,7 @@ async fn main() -> Result<()> {
         Cmd::Send { pty_id, text, conn, token } => {
             let mut client = connect_client(conn.destination(), token).await?;
             let item = resolve_pty_item(&mut client, &pty_id).await?;
-            let (cols, rows) = item_size(&item);
+            let (cols, rows) = attach::item_size(&item);
             // No standalone write RPC remains: open a Subscribe stream, send the
             // bytes as a Write frame, then close it.
             use tokio::sync::mpsc;
