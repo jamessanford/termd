@@ -7,8 +7,8 @@
 perf record -g -F 999 -p <PID> -o perf.data -- sleep 10 &
 PERF_PID=$!
 sleep 1
-LD_LIBRARY_PATH=target/debug/build/libghostty-vt-sys-b3b8792ea556457c/out/ghostty-install/lib \
-  ./target/debug/termd send <PTY_PREFIX> 'du'
+# note: send injects text verbatim — include the newline to actually run the command
+./target/debug/termd send <PTY_PREFIX> $'du\n'
 wait $PERF_PID
 
 # Generate flamegraph
