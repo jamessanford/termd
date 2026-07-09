@@ -277,15 +277,12 @@ impl RegionHandler {
 }
 
 impl super::RenderModeHandler for RegionHandler {
-    fn init(&mut self, refresh_data: &[u8], buffered: &[(u64, Vec<u8>)], out: &mut Vec<u8>) -> Result<super::EventResult> {
+    fn init(&mut self, refresh_data: &[u8], out: &mut Vec<u8>) -> Result<super::EventResult> {
         if !super::server_fits_client(self.filter.server_cols, self.filter.server_rows, self.filter.client_cols, self.filter.client_rows) {
             return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
         }
         self.filter.emit_region_setup(out);
         self.filter.filter(refresh_data, out);
-        for (_gen, data) in buffered {
-            self.filter.filter(data, out);
-        }
         Ok(super::EventResult::Continue)
     }
 
@@ -580,7 +577,7 @@ mod tests {
     fn region_init_emits_setup_and_data() {
         let mut h = RegionHandler::new(24, 80, 40, 120);
         let mut out = Vec::new();
-        let result = h.init(b"hello", &[], &mut out).unwrap();
+        let result = h.init(b"hello", &mut out).unwrap();
         assert!(matches!(result, EventResult::Continue));
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("\x1b[1;24r"), "should emit DECSTBM");
@@ -591,26 +588,15 @@ mod tests {
     fn region_init_too_small_returns_change_mode() {
         let mut h = RegionHandler::new(24, 80, 20, 60);
         let mut out = Vec::new();
-        let result = h.init(b"hello", &[], &mut out).unwrap();
+        let result = h.init(b"hello", &mut out).unwrap();
         assert!(matches!(result, EventResult::ChangeRenderMode(RenderMode::Cell)));
-    }
-
-    #[test]
-    fn region_init_replays_buffered() {
-        let mut h = RegionHandler::new(24, 80, 40, 120);
-        let mut out = Vec::new();
-        let buffered = vec![(2, b"world".to_vec())];
-        h.init(b"hello", &buffered, &mut out).unwrap();
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("hello"));
-        assert!(s.contains("world"));
     }
 
     #[test]
     fn region_stream_filters_data() {
         let mut h = RegionHandler::new(24, 80, 40, 120);
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
 
         let result = h.on_pty_event(PtyEvent::Stream { data: b"test" }, &mut out).unwrap();
@@ -622,7 +608,7 @@ mod tests {
     fn region_refresh_updates_filter_and_re_emits_setup() {
         let mut h = RegionHandler::new(24, 80, 40, 120);
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
 
         let result = h.on_pty_event(
@@ -639,7 +625,7 @@ mod tests {
     fn region_refresh_too_large_switches_to_cell() {
         let mut h = RegionHandler::new(24, 80, 40, 120);
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
 
         let result = h.on_pty_event(
@@ -653,7 +639,7 @@ mod tests {
     fn region_resize_too_large_switches_to_cell() {
         let mut h = RegionHandler::new(24, 80, 40, 120);
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
 
         let result = h.on_pty_event(
@@ -667,7 +653,7 @@ mod tests {
     fn region_sigwinch_too_small_switches_to_cell() {
         let mut h = RegionHandler::new(24, 80, 40, 120);
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
 
         let result = h.on_sigwinch(60, 20, &mut out).unwrap();
@@ -681,7 +667,7 @@ mod tests {
         // (re-emitting would needlessly reset the cursor).
         let mut h = RegionHandler::new(24, 80, 40, 120);
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
 
         let result = h.on_sigwinch(200, 50, &mut out).unwrap();
@@ -697,7 +683,7 @@ mod tests {
         // setup and repaints. The terminal is left untouched here.
         let mut h = RegionHandler::new(24, 80, 40, 120);
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
 
         let result = h.on_sigwinch(80, 40, &mut out).unwrap();
@@ -712,7 +698,7 @@ mod tests {
         // DECLRMM must flip on. Same as above — request a refresh, emit nothing inline.
         let mut h = RegionHandler::new(24, 80, 40, 80);
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
 
         let result = h.on_sigwinch(120, 40, &mut out).unwrap();
@@ -725,7 +711,7 @@ mod tests {
     fn region_cleanup_resets_margins() {
         let mut h = RegionHandler::new(24, 80, 40, 120);
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
 
         h.cleanup(&mut out);
@@ -737,7 +723,7 @@ mod tests {
     fn region_cleanup_disables_declrmm_when_active() {
         let mut h = RegionHandler::new(24, 80, 40, 120);
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
 
         h.cleanup(&mut out);

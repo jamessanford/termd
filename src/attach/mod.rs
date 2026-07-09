@@ -50,7 +50,7 @@ pub(super) enum EventResult {
 }
 
 pub(super) trait RenderModeHandler {
-    fn init(&mut self, refresh_data: &[u8], buffered: &[(u64, Vec<u8>)], out: &mut Vec<u8>) -> anyhow::Result<EventResult>;
+    fn init(&mut self, refresh_data: &[u8], out: &mut Vec<u8>) -> anyhow::Result<EventResult>;
     fn on_pty_event(&mut self, event: PtyEvent, out: &mut Vec<u8>) -> anyhow::Result<EventResult>;
     fn on_sigwinch(&mut self, cols: u32, rows: u32, out: &mut Vec<u8>) -> anyhow::Result<EventResult>;
     fn cleanup(&mut self, _out: &mut Vec<u8>) {}
@@ -74,18 +74,38 @@ fn create_handler(
 }
 
 enum RunOutcome {
+    /// Transport error on the Subscribe stream: the connection is suspect, so
+    /// retry it with the reconnect banner/backoff.
     ServerClosed,
     OutputClosed,
     PtyClosed,
+    /// Drop and reopen the Subscribe stream for the current PTY (SIGWINCH refit
+    /// / DataLost resync), or a graceful per-PTY stream close with the transport
+    /// still healthy. Reopens + repaints quietly, with no reconnect banner.
+    Resubscribe,
     Action(InputAction),
 }
 
 use termd::proto::{
-    terminal_command::Command, terminal_response::Response,
+    subscribe_event::Event, subscribe_frame::Frame, stream_metadata,
     CreateRequest, DestroyRequest, ListRequest, PtyItem, RefreshRequest, ResizeRequest,
-    SubscribeRequest, UnsubscribeRequest, WriteRequest,
-    TerminalCommand, StreamMetadataReason,
+    Size, StreamMetadata, SubscribeEvent, SubscribeFrame, SubscribeStart, WriteData,
 };
+
+/// Columns/rows for a `PtyItem`, treating a missing `size` as 0x0.
+pub(super) fn item_size(item: &PtyItem) -> (u32, u32) {
+    let s = item.size.unwrap_or_default();
+    (s.cols, s.rows)
+}
+
+/// A live Subscribe stream for the current PTY: the up-channel sender (first send
+/// is `Start`, then `Write`), the down-channel event stream, and the server-assigned
+/// `subscriber_id` (needed by `refresh`/`scrollback`).
+pub(super) struct Subscription {
+    pub frame_tx: mpsc::Sender<SubscribeFrame>,
+    pub event_rx: tonic::Streaming<SubscribeEvent>,
+    pub subscriber_id: String,
+}
 
 mod autowrap;
 mod cell;
@@ -206,121 +226,112 @@ fn move_terminal_end() {
     let _ = std::io::stdout().flush();
 }
 
+/// Open a fresh Subscribe stream for `pty_id`, send the `Start` frame with the
+/// client's current viewport size, and read the first event — which must be the
+/// server's `Ready` carrying the `subscriber_id`. Returns the live `Subscription`.
+/// Transport/protocol failures surface as `Err`.
 async fn subscribe(
-    cmd_tx:  &mpsc::Sender<TerminalCommand>,
-    resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
-    pty_id:  u64,
-) -> anyhow::Result<bool> {
+    client: &mut AuthedClient,
+    pty_id: u64,
+) -> anyhow::Result<Subscription> {
     let (cols, rows) = get_terminal_size();
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest {
+    let (frame_tx, frame_rx) = mpsc::channel::<SubscribeFrame>(64);
+    frame_tx.send(SubscribeFrame {
+        frame: Some(Frame::Start(SubscribeStart {
             pty_id,
             hostname: hostname::get().unwrap_or_default().to_string_lossy().into_owned(),
-            cols,
-            rows,
+            size: Some(Size { cols, rows }),
         })),
     }).await?;
-    loop {
-        match resp_rx.message().await? {
-            None => anyhow::bail!("server disconnected during subscribe"),
-            Some(r) => match r.response {
-                Some(Response::Subscribe(c)) if c.pty_id == pty_id && c.success => return Ok(true),
-                Some(Response::Subscribe(c)) if c.pty_id == pty_id => {
-                    show_error(&format!("subscribe failed: {}", c.error.unwrap_or_default())).await;
-                    return Ok(false);
-                }
-                _ => {}
-            }
-        }
-    }
+    let mut event_rx = client
+        .subscribe(ReceiverStream::new(frame_rx))
+        .await?
+        .into_inner();
+    let subscriber_id = match event_rx.message().await? {
+        Some(SubscribeEvent { event: Some(Event::Ready(ready)) }) => ready.subscriber_id,
+        Some(_) => anyhow::bail!("subscribe: first event was not Ready"),
+        None => anyhow::bail!("server disconnected during subscribe"),
+    };
+    Ok(Subscription { frame_tx, event_rx, subscriber_id })
 }
 
-/// A PTY event buffered after the refresh snapshot: its generation and raw bytes.
-type BufferedEvent = (u64, Vec<u8>);
+/// Result of a refresh: the rendered screen bytes plus its (cols, rows). The
+/// snapshot is the authoritative base; the server sequences it after the data it
+/// subsumes, so the client renders only the snapshot and resumes on the data that
+/// follows it.
+type RefreshSnapshot = (u32, u32, Vec<u8>);
 
-/// Result of a refresh: the refresh generation, the rendered screen bytes, and
-/// any events that arrived (and were buffered) after that snapshot.
-type RefreshSnapshot = (u64, Vec<u8>, Vec<BufferedEvent>);
-
-// Returns Ok(None) if the server returned an error for this PTY (e.g. reader thread dead).
-// Returns Ok(Some(...)) on success. Returns Err on transport failure.
+// Returns Ok(None) if the server reported this subscription is gone (the Subscribe
+// stream ended before a Refresh arrived). Returns Ok(Some(...)) on success.
+// Returns Err on transport failure.
 async fn request_refresh(
-    cmd_tx:  &mpsc::Sender<TerminalCommand>,
-    resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
-    pty_id:  u64,
+    client: &mut AuthedClient,
+    sub:    &mut Subscription,
+    pty_id: u64,
 ) -> anyhow::Result<Option<RefreshSnapshot>> {
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Refresh(RefreshRequest { pty_id })),
+    client.refresh(RefreshRequest {
+        pty_id,
+        subscriber_id: sub.subscriber_id.clone(),
     }).await?;
-    let mut buffered: Vec<BufferedEvent> = Vec::new();
     loop {
-        match resp_rx.message().await? {
-            None => anyhow::bail!("server disconnected during refresh"),
-            Some(r) => match r.response {
-                Some(Response::Refresh(rf)) if rf.pty_id == pty_id => return Ok(Some((rf.generation, rf.data, buffered))),
-                Some(Response::Stream(s))   if s.pty_id  == pty_id => buffered.push((s.generation, s.data)),
-                Some(Response::Command(c)) if c.pty_id == pty_id && !c.success => return Ok(None),
-                _ => {}
+        match sub.event_rx.message().await? {
+            None => return Ok(None),
+            Some(SubscribeEvent { event: Some(Event::Refresh(rf)) }) => {
+                let s = rf.size.unwrap_or_default();
+                return Ok(Some((s.cols, s.rows, rf.data)));
             }
+            // Discard everything that precedes the snapshot. The server emits the
+            // snapshot inline, ordered after the data it subsumes, so any Data here
+            // is already reflected in the snapshot — replaying it would double-apply.
+            // Metadata (incl Exited) is likewise consumed up to the Refresh; if the
+            // PTY exited, the stream then closes and the render loop's next
+            // message() returns None, driving teardown.
+            Some(_) => {}
         }
     }
 }
 
 async fn fetch_list(
-    cmd_tx:   &mpsc::Sender<TerminalCommand>,
-    resp_rx:  &mut tonic::Streaming<termd::proto::TerminalResponse>,
+    client:   &mut AuthedClient,
     pty_list: &mut Vec<PtyItem>,
 ) -> anyhow::Result<()> {
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::List(ListRequest {})),
-    }).await?;
-    loop {
-        match resp_rx.message().await? {
-            None => anyhow::bail!("server disconnected during list"),
-            Some(r) => if let Some(Response::List(lr)) = r.response {
-                *pty_list = lr.items;
-                pty_list.sort_by_key(|p| p.sort_order);
-                return Ok(());
-            }
-        }
-    }
+    let resp = client.list(ListRequest {}).await?;
+    *pty_list = resp.into_inner().items;
+    pty_list.sort_by_key(|p| p.sort_order);
+    Ok(())
 }
 
 // Fetches updated pty_list. Returns false and shows an error message
 // if the fetch fails; the caller should continue 'session.
 async fn ensure_list(
-    cmd_tx:   &mpsc::Sender<TerminalCommand>,
-    resp_rx:  &mut tonic::Streaming<termd::proto::TerminalResponse>,
+    client:   &mut AuthedClient,
     pty_list: &mut Vec<PtyItem>,
 ) -> bool {
-    if let Err(e) = fetch_list(cmd_tx, resp_rx, pty_list).await {
+    if let Err(e) = fetch_list(client, pty_list).await {
         show_error(&e.to_string()).await;
         return false;
     }
     true
 }
 
+/// True if `err` is a gRPC `NotFound` Status (the PTY no longer exists), as
+/// opposed to a transport failure. `subscribe`/control errors carry the
+/// underlying `tonic::Status` through `anyhow`, so we downcast to inspect it.
+fn is_pty_gone(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<tonic::Status>()
+        .is_some_and(|s| s.code() == tonic::Code::NotFound)
+}
+
 async fn destroy_and_drain(
-    cmd_tx:  &mpsc::Sender<TerminalCommand>,
-    resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
-    pty_id:  u64,
+    client: &mut AuthedClient,
+    pty_id: u64,
 ) -> anyhow::Result<()> {
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Destroy(DestroyRequest { pty_id })),
-    }).await?;
-    loop {
-        match resp_rx.message().await? {
-            None => anyhow::bail!("server disconnected"),
-            Some(r) => if let Some(Response::Command(c)) = r.response {
-                if c.pty_id != pty_id { continue; }
-                if !c.success {
-                    anyhow::bail!("Failed to destroy PTY: {}", c.error.unwrap_or_default());
-                }
-                break;
-            }
-        }
+    match client.destroy(DestroyRequest { pty_id }).await {
+        Ok(_) => Ok(()),
+        // Already gone is success.
+        Err(status) if status.code() == tonic::Code::NotFound => Ok(()),
+        Err(status) => anyhow::bail!("Failed to destroy PTY: {}", status.message()),
     }
-    Ok(())
 }
 
 async fn recent_pty<'a>(list: &'a [PtyItem], previous_pty_id: &Option<u64>, current_pty_id: u64) -> Option<&'a PtyItem> {
@@ -354,19 +365,15 @@ fn prev_pty(list: &[PtyItem], current_id: u64) -> Option<&PtyItem> {
     Some(&list[(pos + list.len() - 1) % list.len()])
 }
 
-// Unsubscribes from the current PTY, updates session state.
-async fn switch_pty(
-    cmd_tx:          &mpsc::Sender<TerminalCommand>,
+// Updates session state to point at `new_item`. The caller is responsible for
+// dropping the current Subscribe stream (which unsubscribes server-side) and
+// opening a new one for the target PTY.
+fn switch_pty(
     current_pty_id:  &mut u64,
     current_item:    &mut PtyItem,
     previous_pty_id: &mut Option<u64>,
     new_item:        PtyItem,
 ) {
-    let _ = cmd_tx.send(TerminalCommand {
-        command: Some(Command::Unsubscribe(UnsubscribeRequest {
-            pty_id: *current_pty_id,
-        })),
-    }).await;
     *previous_pty_id = Some(std::mem::replace(current_pty_id, new_item.pty_id));
     *current_item = new_item;
 }
@@ -386,12 +393,13 @@ fn draw_list(items: &[PtyItem], selected: usize) {
         let title = if item.title.is_empty() { &item.pts_name } else { &item.title };
         let pty_id_hex = format!("{:016x}", item.pty_id);
         let title_trunc: String = title.chars().take(32).collect();
+        let (cols, rows) = item_size(item);
         let line = format!(
             " {:>3}  {:<16}  {:<32}  {}x{}\r\n",
             item.sort_order,
             pty_id_hex,
             title_trunc,
-            item.cols, item.rows,
+            cols, rows,
         );
         out.extend_from_slice(line.as_bytes());
         if i == selected { out.extend_from_slice(b"\x1b[0m"); }
@@ -401,14 +409,13 @@ fn draw_list(items: &[PtyItem], selected: usize) {
 }
 
 async fn show_list(
-    cmd_tx:          &mpsc::Sender<TerminalCommand>,
-    resp_rx:         &mut tonic::Streaming<termd::proto::TerminalResponse>,
+    client:          &mut AuthedClient,
     pty_list:        &mut Vec<PtyItem>,
     current_pty_id:  u64,
     stdin:           &mut tokio::io::Stdin,
 ) -> anyhow::Result<Option<u64>> {
     // Returns Some(new_pty_id) on selection, None on cancel.
-    if let Err(e) = fetch_list(cmd_tx, resp_rx, pty_list).await {
+    if let Err(e) = fetch_list(client, pty_list).await {
         show_error(&e.to_string()).await;
         return Ok(None);
     }
@@ -507,7 +514,6 @@ fn draw_idle() {
 // screens (show_list/help/scrollback), which read stdin raw and can't trigger
 // them. Returns a RunOutcome for the shared dispatch in `run`.
 async fn run_idle(
-    resp_rx: &mut tonic::Streaming<termd::proto::TerminalResponse>,
     stdin:   &mut tokio::io::Stdin,
     input:   &mut input::InputProcessor,
 ) -> anyhow::Result<RunOutcome> {
@@ -516,13 +522,6 @@ async fn run_idle(
     let mut input_buf = [0u8; 256];
     loop {
         tokio::select! {
-            msg = resp_rx.message() => {
-                // No subscription here, so any PTY traffic is stale — ignore it.
-                // Only a closed/errored stream matters.
-                if !matches!(msg, Ok(Some(_))) {
-                    return Ok(RunOutcome::ServerClosed);
-                }
-            }
             result = stdin.read(&mut input_buf) => {
                 let n = match result {
                     Ok(0) | Err(_) => return Ok(RunOutcome::Action(InputAction::Detach)),
@@ -550,23 +549,21 @@ fn reconnect_status(msg: &str) {
     let _ = out.flush();
 }
 
-/// Re-establish the bidirectional command/response stream after a transport
-/// failure, retrying with capped exponential backoff until it succeeds. A
-/// freshly opened stream can report success before the underlying connection is
-/// actually usable (lazily-reconnecting tonic `Channel`s do this), so we confirm
-/// liveness with a `List` round-trip before handing the stream back — otherwise
-/// a dead-but-"Ok" stream would spin the caller's reconnect path with no delay.
+/// Re-establish a working link to the server after a transport failure, retrying
+/// with capped exponential backoff until a request succeeds. The unary client owns
+/// a lazily-reconnecting tonic `Channel`, which can report success before the
+/// underlying connection is actually usable, so we confirm liveness with a real
+/// `List` round-trip (which also re-runs the per-stream auth handshake) before
+/// returning — otherwise a dead-but-"Ok" link would spin the caller's reconnect
+/// path with no delay.
 ///
 /// While waiting between attempts the user can press Ctrl-C or `q` to give up.
-/// Returns the fresh `(cmd_tx, resp_rx)` once connected, or `None` if the user
-/// aborted (or stdin closed). Re-subscribing and repainting is the caller's job.
+/// Returns `Some(())` once the link is back, or `None` if the user aborted (or
+/// stdin closed). Re-subscribing and repainting is the caller's job.
 async fn reconnect(
     client: &mut AuthedClient,
     stdin:  &mut tokio::io::Stdin,
-) -> Option<(
-    mpsc::Sender<TerminalCommand>,
-    tonic::Streaming<termd::proto::TerminalResponse>,
-)> {
+) -> Option<()> {
     let mut backoff = std::time::Duration::from_millis(500);
     let max_backoff = std::time::Duration::from_secs(5);
     let mut buf = [0u8; 8];
@@ -576,21 +573,10 @@ async fn reconnect(
         reconnect_status(&format!(
             "Connection lost — reconnecting (attempt {attempt})…  Ctrl-C/q to quit"
         ));
-        let (cmd_tx, cmd_rx) = mpsc::channel::<TerminalCommand>(64);
-        let probe = match client.stream(ReceiverStream::new(cmd_rx)).await {
-            Ok(resp) => {
-                let mut resp_rx = resp.into_inner();
-                let mut throwaway = Vec::new();
-                // A real round-trip also re-runs the per-stream auth handshake,
-                // so a successful List confirms the link is genuinely back.
-                fetch_list(&cmd_tx, &mut resp_rx, &mut throwaway)
-                    .await
-                    .map(|()| (cmd_tx, resp_rx))
-            }
-            Err(status) => Err(anyhow::anyhow!("{}", status.message())),
-        };
+        let mut throwaway = Vec::new();
+        let probe = fetch_list(client, &mut throwaway).await;
         match probe {
-            Ok(conn) => return Some(conn),
+            Ok(()) => return Some(()),
             Err(e) => reconnect_status(&format!(
                 "Reconnect failed: {e} — retrying in {:.1}s  (Ctrl-C/q to quit)",
                 backoff.as_secs_f32(),
@@ -619,19 +605,14 @@ pub async fn run(
         return run_debug(client, item.pty_id).await;
     }
 
-    let (mut cmd_tx, cmd_rx) = mpsc::channel::<TerminalCommand>(64);
-    let mut resp_rx = client
-        .stream(ReceiverStream::new(cmd_rx))
-        .await?
-        .into_inner();
-
     let _guard = setup_raw_mode()?;
 
     let mut current_pty_id = item.pty_id;
     let mut current_item = item;
     let mut pty_list: Vec<PtyItem> = Vec::new();
     let mut previous_pty_id: Option<u64> = None;
-    let mut subscribed_pty_id: Option<u64> = None;
+    // The single active Subscribe stream for the current PTY (None = idle/unsubscribed).
+    let mut sub: Option<Subscription> = None;
 
     let upgrade_to = match mode {
         RenderMode::Region => Some(RenderMode::Region),
@@ -645,27 +626,24 @@ pub async fn run(
     let mut out = Vec::new();
     let mut skip_subscribe = false;
 
-    // On a transport failure, re-establish the stream (retrying with backoff)
-    // and restart the session loop so we re-subscribe and repaint the current
-    // PTY. If the user aborts the reconnect, leave the session cleanly.
-    // The loop label is passed in because `macro_rules!` labels are hygienic and
-    // can't otherwise see the caller's `'session`.
+    // On a transport failure, confirm the link is back (retrying with backoff) and
+    // restart the session loop so we re-subscribe and repaint the current PTY. If
+    // the user aborts the reconnect, leave the session cleanly. The loop label is
+    // passed in because `macro_rules!` labels are hygienic and can't otherwise see
+    // the caller's `'session`.
     macro_rules! do_reconnect {
         ($lt:lifetime) => {
             match reconnect(client, &mut stdin).await {
-                Some((tx, rx)) => {
-                    cmd_tx = tx;
-                    resp_rx = rx;
-                    subscribed_pty_id = None;
+                Some(()) => {
+                    sub = None;
                     continue $lt;
                 }
                 None => break $lt,
             }
         };
     }
-    // Unwrap a command-helper Result, treating any Err as a transport failure
-    // that triggers a reconnect. (Helpers signal logical failures as Ok values,
-    // so Err is always the stream going away.)
+    // Unwrap a control-helper Result, treating any Err as a transport failure that
+    // triggers a reconnect.
     macro_rules! reconnect_or_break {
         ($lt:lifetime, $e:expr) => {
             match $e {
@@ -676,41 +654,51 @@ pub async fn run(
     }
 
     'session: loop {
-        let (refresh_gen, refresh_bytes, buffered): RefreshSnapshot = 'refresh: {
+        let (refresh_cols, refresh_rows, refresh_bytes): (u32, u32, Vec<u8>) = 'refresh: {
         if skip_subscribe {
             skip_subscribe = false;
-            break 'refresh (0, vec![], vec![]);
+            sub = None;
+            break 'refresh (0, 0, vec![]);
         }
 
-        let subscribe_ok = if subscribed_pty_id != Some(current_pty_id) {
-            let ok = reconnect_or_break!('session, subscribe(&cmd_tx, &mut resp_rx, current_pty_id).await);
-            if ok { subscribed_pty_id = Some(current_pty_id); }
-            ok
-        } else {
-            true
-        };
+        // (Re)open the Subscribe stream for the current PTY if needed. Switching
+        // PTYs and resubscribes set `sub = None` so we always open a fresh stream
+        // for the current PTY here.
+        if sub.is_none() {
+            match subscribe(client, current_pty_id).await {
+                Ok(s) => sub = Some(s),
+                // PTY is gone: leave `sub = None` so the gone-PTY branch below
+                // routes to the list (no reconnect banner — the transport is up).
+                Err(e) if is_pty_gone(&e) => {}
+                // Transport failure: retry the connection with backoff.
+                Err(_) => do_reconnect!('session),
+            }
+        }
 
-        let refresh_result = if subscribe_ok {
-            reconnect_or_break!('session, request_refresh(&cmd_tx, &mut resp_rx, current_pty_id).await)
+        let refresh_result = if let Some(s) = sub.as_mut() {
+            reconnect_or_break!('session, request_refresh(client, s, current_pty_id).await)
         } else {
+            // subscribe() reported the PTY is gone; fall into the gone branch.
             None
         };
 
         match refresh_result {
-            Some(triple) => triple,
+            Some((cols, rows, bytes)) => (cols, rows, bytes),
             None => {
-                subscribed_pty_id = None;
+                // Subscription is gone (the PTY closed, or subscribe found it
+                // already gone). Tear it down and let the user pick a new one.
+                sub = None;
                 pty_list.clear();
-                let _ = destroy_and_drain(&cmd_tx, &mut resp_rx, current_pty_id).await;
-                match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, current_pty_id, &mut stdin).await? {
+                let _ = destroy_and_drain(client, current_pty_id).await;
+                match show_list(client, &mut pty_list, current_pty_id, &mut stdin).await? {
                     Some(new_id) => {
                         if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-                            switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
+                            switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                             pty_list.clear();
                         }
                         continue 'session;
                     }
-                    None => (0, vec![], vec![]),  // Wait for user to tell us what to do next.
+                    None => { skip_subscribe = true; (0, 0, vec![]) }
                 }
             }
         }
@@ -719,32 +707,31 @@ pub async fn run(
         // screen and wait for the user to act. run_idle routes input through the
         // same InputProcessor/InputAction path as the render loop, so the shared
         // dispatch below handles either outcome identically.
-        let outcome: RunOutcome = if subscribed_pty_id != Some(current_pty_id) {
-            run_idle(&mut resp_rx, &mut stdin, &mut input).await?
-        } else {
-            let mut current_refresh_gen = refresh_gen;
-            // True while a lag-recovery Refresh request is in flight, so a
-            // persistently slow link can't amplify lag into a refresh storm.
-            let mut refresh_pending = false;
-
-            let buffered: Vec<_> = buffered.into_iter()
-                .filter(|(gen, _)| *gen > current_refresh_gen)
-                .collect();
+        let outcome: RunOutcome = if let Some(sub) = sub.as_mut() {
+            // `sub` here is the live `&mut Subscription` for the render loop; its
+            // fields are borrowed directly. The idle branch below runs when there
+            // is no subscription.
+            // The refresh carries the authoritative server size for this PTY.
+            if refresh_cols > 0 && refresh_rows > 0 {
+                current_item.size = Some(Size { cols: refresh_cols, rows: refresh_rows });
+            }
+            let (item_cols, item_rows) = item_size(&current_item);
 
             let mut handler: Box<dyn RenderModeHandler> = create_handler(
-                dispatch_mode, current_item.cols, current_item.rows, upgrade_to,
+                dispatch_mode, item_cols, item_rows, upgrade_to,
             )?;
 
             out.clear();
-            if let EventResult::ChangeRenderMode(new_mode) = handler.init(&refresh_bytes, &buffered, &mut out)? {
+            if let EventResult::ChangeRenderMode(new_mode) = handler.init(&refresh_bytes, &mut out)? {
                 handler.cleanup(&mut out);
                 if !out.is_empty() {
                     stdout.write_all(&out)?;
                     out.clear();
                 }
                 dispatch_mode = new_mode;
-                handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, upgrade_to)?;
-                handler.init(&refresh_bytes, &buffered, &mut out)?;
+                let (c, r) = item_size(&current_item);
+                handler = create_handler(dispatch_mode, c, r, upgrade_to)?;
+                handler.init(&refresh_bytes, &mut out)?;
             }
             if !out.is_empty() {
                 stdout.write_all(&out)?;
@@ -755,72 +742,86 @@ pub async fn run(
             let mut refresh_debounce = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(86400)));
             let mut debounce_active = false;
             let mut input_buf = [0u8; 256];
+            // True while a lag-recovery Refresh request is in flight, so a
+            // persistently slow link can't amplify lag into a refresh storm.
+            let mut refresh_pending = false;
 
             loop {
                 out.clear();
                 let mut change_mode: Option<(RenderMode, Vec<u8>)> = None;
 
                 tokio::select! {
-                    msg = resp_rx.message() => {
+                    msg = sub.event_rx.message() => {
                         match msg {
-                            Ok(Some(r)) => match r.response {
-                                Some(Response::Stream(s)) if s.pty_id == current_pty_id && s.generation > current_refresh_gen => {
+                            Ok(Some(SubscribeEvent { event: Some(ev) })) => match ev {
+                                Event::Data(s) => {
                                     let result = handler.on_pty_event(PtyEvent::Stream { data: &s.data }, &mut out)?;
                                     if let EventResult::ChangeRenderMode(m) = result {
                                         change_mode = Some((m, vec![]));
                                     }
                                 }
-                                Some(Response::Refresh(rf)) if rf.pty_id == current_pty_id => {
-                                    current_refresh_gen = rf.generation;
+                                Event::Refresh(rf) => {
                                     refresh_pending = false;
-                                    current_item.cols = rf.cols;
-                                    current_item.rows = rf.rows;
+                                    let s = rf.size.unwrap_or_default();
+                                    if s.cols > 0 && s.rows > 0 {
+                                        current_item.size = Some(s);
+                                    }
                                     let result = handler.on_pty_event(
-                                        PtyEvent::Refresh { cols: rf.cols, rows: rf.rows, data: &rf.data },
+                                        PtyEvent::Refresh { cols: s.cols, rows: s.rows, data: &rf.data },
                                         &mut out,
                                     )?;
                                     if let EventResult::ChangeRenderMode(m) = result {
                                         change_mode = Some((m, rf.data));
                                     }
                                 }
-                                Some(Response::Metadata(m)) if m.pty_id == current_pty_id => {
-                                    if m.reason == StreamMetadataReason::Resize as i32 {
-                                        if let Some(ref mi) = m.item {
-                                            if mi.cols > 0 && mi.rows > 0 {
-                                                current_item.cols = mi.cols;
-                                                current_item.rows = mi.rows;
-                                                let result = handler.on_pty_event(
-                                                    PtyEvent::Resize { cols: mi.cols, rows: mi.rows },
-                                                    &mut out,
-                                                )?;
-                                                if let EventResult::ChangeRenderMode(m) = result {
-                                                    change_mode = Some((m, vec![]));
-                                                }
+                                Event::Metadata(StreamMetadata { event: Some(me) }) => match me {
+                                    stream_metadata::Event::Resized(r) => {
+                                        let s = r.size.unwrap_or_default();
+                                        if s.cols > 0 && s.rows > 0 {
+                                            current_item.size = Some(s);
+                                            let result = handler.on_pty_event(
+                                                PtyEvent::Resize { cols: s.cols, rows: s.rows },
+                                                &mut out,
+                                            )?;
+                                            if let EventResult::ChangeRenderMode(m) = result {
+                                                change_mode = Some((m, vec![]));
                                             }
                                         }
-                                    } else if m.reason == StreamMetadataReason::Closed as i32 {
+                                    }
+                                    stream_metadata::Event::TitleChanged(t) => {
+                                        current_item.title = t.title;
+                                    }
+                                    stream_metadata::Event::Exited(_) => {
                                         handler.on_pty_event(PtyEvent::Closed, &mut out)?;
                                         input.reset();
                                         break RunOutcome::PtyClosed;
-                                    } else if m.reason == StreamMetadataReason::DataLost as i32 {
-                                        // We lagged the server's broadcast and lost stream
-                                        // bytes; the screen may be corrupt. Ask for a full
-                                        // snapshot — every render mode recovers completely
-                                        // from a Refresh, and the generation filter drops
-                                        // any straggler chunks from before the snapshot.
+                                    }
+                                    stream_metadata::Event::SubscribersChanged(_) => {}
+                                    // We lagged the server's broadcast and lost stream
+                                    // bytes; the screen may be corrupt. Ask for a full
+                                    // snapshot — every render mode recovers completely
+                                    // from a Refresh, which the server sequences inline
+                                    // on this stream after the data it subsumes.
+                                    stream_metadata::Event::DataLost(_) => {
                                         if !refresh_pending {
                                             refresh_pending = true;
-                                            let _ = cmd_tx.send(TerminalCommand {
-                                                command: Some(Command::Refresh(RefreshRequest {
-                                                    pty_id: current_pty_id,
-                                                })),
+                                            let _ = client.refresh(RefreshRequest {
+                                                pty_id: current_pty_id,
+                                                subscriber_id: sub.subscriber_id.clone(),
                                             }).await;
                                         }
                                     }
-                                }
+                                },
                                 _ => {}
                             },
-                            _ => { break RunOutcome::ServerClosed; }
+                            // Ready never reappears mid-stream; ignore empty events.
+                            Ok(Some(_)) => {}
+                            // Graceful per-PTY stream close (transport still up,
+                            // e.g. the server reaped this stream): quietly reopen
+                            // + repaint rather than flashing the reconnect banner.
+                            Ok(None) => { break RunOutcome::Resubscribe; }
+                            // Transport error: the connection is suspect → reconnect.
+                            Err(_) => { break RunOutcome::ServerClosed; }
                         }
                     }
                     result = stdin.read(&mut input_buf) => {
@@ -830,11 +831,8 @@ pub async fn run(
                         };
                         let r = input.process(&input_buf[..n]);
                         if !r.write.is_empty() {
-                            let _ = cmd_tx.send(TerminalCommand {
-                                command: Some(Command::Write(WriteRequest {
-                                    pty_id: current_pty_id,
-                                    data: r.write,
-                                })),
+                            let _ = sub.frame_tx.send(SubscribeFrame {
+                                frame: Some(Frame::Write(WriteData { data: r.write })),
                             }).await;
                         }
                         if let Some(a) = r.action {
@@ -857,51 +855,37 @@ pub async fn run(
                         }
                     }
                     _ = &mut refresh_debounce, if debounce_active => {
-                        debounce_active = false;
-                        // Re-subscribe with the current size so the server can refit the PTY
-                        // to all subscribers. handle_subscribe upserts (it's idempotent for an
-                        // already-subscribed client) and recomputes best-fit; if it resizes, the
-                        // resulting Resize broadcast re-renders us.
-                        let (cols, rows) = get_terminal_size();
-                        let _ = cmd_tx.send(TerminalCommand {
-                            command: Some(Command::Subscribe(SubscribeRequest {
-                                pty_id: current_pty_id,
-                                hostname: hostname::get().unwrap_or_default().to_string_lossy().into_owned(),
-                                cols,
-                                rows,
-                            })),
-                        }).await;
-                        // Always refresh regardless of whether the size changed: a SIGWINCH storm
-                        // can leave the user's terminal visually garbled even when it settles back
-                        // to the same dimensions, so we repaint unconditionally.
-                        let _ = cmd_tx.send(TerminalCommand {
-                            command: Some(Command::Refresh(RefreshRequest {
-                                pty_id: current_pty_id,
-                            })),
-                        }).await;
+                        // Reopen the Subscribe stream with the current viewport size so the
+                        // server can refit the PTY to all subscribers (apply_subscribe keys
+                        // off the SubscribeStart size). The 'session loop will re-subscribe
+                        // and repaint. Even if the size didn't change, a SIGWINCH storm can
+                        // garble the terminal, so the unconditional repaint is desirable.
+                        break RunOutcome::Resubscribe;
                     }
                 }
 
                 if let Some((new_mode, refresh_data)) = change_mode {
                     handler.cleanup(&mut out);
                     dispatch_mode = new_mode;
-                    handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, upgrade_to)?;
-                    let init_result = handler.init(&refresh_data, &[], &mut out)?;
+                    let (c, r) = item_size(&current_item);
+                    handler = create_handler(dispatch_mode, c, r, upgrade_to)?;
+                    let init_result = handler.init(&refresh_data, &mut out)?;
                     if let EventResult::ChangeRenderMode(fallback) = init_result {
                         handler.cleanup(&mut out);
                         dispatch_mode = fallback;
-                        handler = create_handler(dispatch_mode, current_item.cols, current_item.rows, upgrade_to)?;
-                        handler.init(&refresh_data, &[], &mut out)?;
+                        let (c, r) = item_size(&current_item);
+                        handler = create_handler(dispatch_mode, c, r, upgrade_to)?;
+                        handler.init(&refresh_data, &mut out)?;
                     }
                     // A SIGWINCH-driven switch hands off empty data and doesn't resize the
                     // server, so no Refresh follows on its own — the new handler would paint
                     // a stale/blank screen. Request one so a full repaint comes down the pipe.
-                    // (Resize-driven switches are also empty but already get a server Refresh;
-                    // an extra request there is a harmless idempotent repaint.) We only reach
-                    // this branch with a live subscription, so the PTY is always there to ask.
+                    // We only reach this branch with a live subscription, so the PTY is always
+                    // there to ask.
                     if refresh_data.is_empty() {
-                        let _ = cmd_tx.send(TerminalCommand {
-                            command: Some(Command::Refresh(RefreshRequest { pty_id: current_pty_id })),
+                        let _ = client.refresh(RefreshRequest {
+                            pty_id: current_pty_id,
+                            subscriber_id: sub.subscriber_id.clone(),
                         }).await;
                     }
                 }
@@ -911,6 +895,8 @@ pub async fn run(
                     let _ = stdout.flush();
                 }
             }
+        } else {
+            run_idle(&mut stdin, &mut input).await?
         };
 
         match outcome {
@@ -922,19 +908,30 @@ pub async fn run(
             }
             RunOutcome::OutputClosed => {
                 // Our own stdout died (the client terminal went away). Reconnecting
-                // the server stream wouldn't help — just exit cleanly.
+                // wouldn't help — just exit cleanly.
                 reset_terminal_modes();
                 break 'session;
             }
+            RunOutcome::Resubscribe => {
+                // Drop the current Subscribe stream (server reaps it) and reopen it
+                // for the same PTY with the current size on the next 'session pass.
+                // Reached by SIGWINCH refit, DataLost resync, or a graceful stream
+                // close while the transport is healthy — none of which warrant the
+                // reconnect banner. If the PTY is actually gone, the reopen's
+                // refresh returns None and routes to the list.
+                reset_terminal_modes();
+                sub = None;
+                continue 'session;
+            }
             RunOutcome::PtyClosed => {
                 reset_terminal_modes();
-                subscribed_pty_id = None;
+                sub = None;
                 pty_list.clear();
-                let _ = destroy_and_drain(&cmd_tx, &mut resp_rx, current_pty_id).await;
-                match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, current_pty_id, &mut stdin).await? {
+                let _ = destroy_and_drain(client, current_pty_id).await;
+                match show_list(client, &mut pty_list, current_pty_id, &mut stdin).await? {
                     Some(new_id) => {
                         if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-                            switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
+                            switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                             pty_list.clear();
                         }
                     }
@@ -948,20 +945,20 @@ pub async fn run(
                     InputAction::Detach => break 'session,
 
                     InputAction::Destroy => {
-                        if let Err(e) = destroy_and_drain(&cmd_tx, &mut resp_rx, current_pty_id).await {
+                        if let Err(e) = destroy_and_drain(client, current_pty_id).await {
                             show_error(&e.to_string()).await;
                             continue 'session;
                         }
-                        subscribed_pty_id = None;
+                        sub = None;
                         pty_list.clear();
-                        let auto_target = if ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                        let auto_target = if ensure_list(client, &mut pty_list).await {
                             recent_pty(&pty_list, &previous_pty_id, current_pty_id).await.cloned()
                         } else {
                             None
                         };
                         match auto_target {
                             Some(target) if target.pty_id != current_pty_id => {
-                                switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
+                                switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                                 pty_list.clear();
                             }
                             _ => { skip_subscribe = true; }
@@ -970,98 +967,86 @@ pub async fn run(
 
                     InputAction::ForceResize => {
                         let (cols, rows) = get_terminal_size();
-                        let _ = cmd_tx.send(TerminalCommand {
-                            command: Some(Command::Resize(ResizeRequest {
-                                pty_id: current_pty_id, cols, rows,
-                            })),
+                        let _ = client.resize(ResizeRequest {
+                            pty_id: current_pty_id,
+                            size: Some(Size { cols, rows }),
                         }).await;
                     }
 
                     InputAction::ForceRefresh => {
-                        let _ = cmd_tx.send(TerminalCommand {
-                            command: Some(Command::Refresh(RefreshRequest {
+                        if let Some(s) = sub.as_ref() {
+                            let _ = client.refresh(RefreshRequest {
                                 pty_id: current_pty_id,
-                            })),
-                        }).await;
+                                subscriber_id: s.subscriber_id.clone(),
+                            }).await;
+                        }
                     }
 
                     InputAction::Create => {
                         let (cols, rows) = get_terminal_size();
-                        reconnect_or_break!('session, cmd_tx.send(TerminalCommand {
-                            command: Some(Command::Create(CreateRequest {
-                                cols, rows, command: None,
-                            })),
+                        let created = reconnect_or_break!('session, client.create(CreateRequest {
+                            size: Some(Size { cols, rows }),
+                            command: None,
                         }).await);
-                        'create: loop {
-                            match resp_rx.message().await {
-                                Ok(Some(r)) => if let Some(Response::Create(cr)) = r.response {
-                                    match cr.item {
-                                        Some(new_item) => {
-                                            switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, new_item).await;
-                                            break 'create;
-                                        }
-                                        None => {
-                                            show_error("Failed to create new PTY").await;
-                                            pty_list.clear();
-                                            continue 'session;
-                                        }
-                                    }
-                                },
-                                // Stream closed (None) or errored: reconnect and restart the session.
-                                _ => do_reconnect!('session),
-                            }
-                        }
+                        let new_item = created.into_inner();
+                        sub = None;
+                        switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, new_item);
                         pty_list.clear();
                     }
 
                     InputAction::SwitchNext => {
-                        if !ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                        if !ensure_list(client, &mut pty_list).await {
                             continue 'session;
                         }
                         if let Some(target) = next_pty(&pty_list, current_pty_id).cloned() {
                             if target.pty_id != current_pty_id {
-                                switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
+                                sub = None;
+                                switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                             }
                         }
                     }
 
                     InputAction::SwitchPrevious => {
-                        if !ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                        if !ensure_list(client, &mut pty_list).await {
                             continue 'session;
                         }
                         if let Some(target) = prev_pty(&pty_list, current_pty_id).cloned() {
                             if target.pty_id != current_pty_id {
-                                switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
+                                sub = None;
+                                switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                             }
                         }
                     }
 
                     InputAction::SwitchRecent => {
-                        if ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                        if ensure_list(client, &mut pty_list).await {
                             if let Some(target) = recent_pty(&pty_list, &previous_pty_id, current_pty_id).await.cloned() {
                                 if target.pty_id != current_pty_id {
-                                    switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
+                                    sub = None;
+                                    switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                                 }
                             }
                         }
                     }
 
                     InputAction::SwitchIndex(n) => {
-                        if !ensure_list(&cmd_tx, &mut resp_rx, &mut pty_list).await {
+                        if !ensure_list(client, &mut pty_list).await {
                             continue 'session;
                         }
                         if let Some(target) = pty_list.get(n as usize).cloned() {
                             if target.pty_id != current_pty_id {
-                                switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
+                                sub = None;
+                                switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                             }
                         }
                     }
 
                     InputAction::ShowList => {
-                        match show_list(&cmd_tx, &mut resp_rx, &mut pty_list, current_pty_id, &mut stdin).await? {
+                        match show_list(client, &mut pty_list, current_pty_id, &mut stdin).await? {
                             Some(new_id) if new_id != current_pty_id => {
                                 if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-                                    switch_pty(&cmd_tx, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target).await;
+                                    sub = None;
+                                    switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                                     pty_list.clear();
                                 }
                             }
@@ -1071,22 +1056,24 @@ pub async fn run(
 
                     InputAction::ShowInfo => {
                         let (client_cols, client_rows) = get_terminal_size();
+                        let (server_cols, server_rows) = item_size(&current_item);
                         show_info(&format!(
                             "requested={mode:?} actual={dispatch_mode:?} pty={current_pty_id:016x} \
                              server={server_cols}x{server_rows} client={client_cols}x{client_rows}",
-                            server_cols = current_item.cols,
-                            server_rows = current_item.rows,
                         )).await;
                     }
 
                     InputAction::ShowScrollback => {
-                        scrollback::show_scrollback(
-                            &cmd_tx,
-                            &mut resp_rx,
-                            current_pty_id,
-                            current_item.rows,
-                            &mut stdin,
-                        ).await?;
+                        if let Some(s) = sub.as_ref() {
+                            let (_, rows) = item_size(&current_item);
+                            scrollback::show_scrollback(
+                                client,
+                                current_pty_id,
+                                s.subscriber_id.clone(),
+                                rows,
+                                &mut stdin,
+                            ).await?;
+                        }
                     }
 
                     InputAction::ShowHelp => {
@@ -1103,62 +1090,32 @@ pub async fn run(
 }
 
 async fn run_debug(client: &mut AuthedClient, pty_id: u64) -> Result<()> {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<TerminalCommand>(64);
-    let mut resp_rx = client
-        .stream(ReceiverStream::new(cmd_rx))
-        .await?
-        .into_inner();
+    // Open the Subscribe stream and read the Ready event for the subscriber_id.
+    let mut sub = subscribe(client, pty_id).await?;
+    eprintln!("[Subscribe pty_id={:016x} subscriber_id={}]", pty_id, sub.subscriber_id);
 
-    // Subscribe
-    let (cols, rows) = get_terminal_size();
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest {
-            pty_id,
-            hostname: hostname::get().unwrap_or_default().to_string_lossy().into_owned(),
-            cols,
-            rows,
-        })),
+    // Request refresh (the snapshot arrives in-order on the Subscribe stream).
+    client.refresh(RefreshRequest {
+        pty_id,
+        subscriber_id: sub.subscriber_id.clone(),
     }).await?;
 
+    // Main debug receive loop — print events to stderr, no rendering.
     loop {
-        match resp_rx.message().await? {
-            None => { eprintln!("server disconnected during subscribe"); return Ok(()); }
-            Some(r) => if let Some(Response::Subscribe(s)) = r.response {
-                if s.success {
-                    eprintln!("[Subscribe pty_id={:016x} subscriber_id={}]", s.pty_id, s.subscriber_id);
-                } else {
-                    eprintln!("subscribe failed: {}", s.error.unwrap_or_default());
-                    return Ok(());
-                }
-                break;
-            }
-        }
-    }
-
-    // Request refresh
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Refresh(RefreshRequest { pty_id })),
-    }).await?;
-
-    // Main debug receive loop — print events to stderr, no rendering
-    loop {
-        match resp_rx.message().await {
-            Ok(Some(r)) => match r.response {
-                Some(Response::Stream(s)) => {
-                    eprintln!("[Stream gen={} len={}]", s.generation, s.data.len());
-                }
-                Some(Response::Refresh(rf)) => {
-                    eprintln!("[Refresh gen={} len={}]", rf.generation, rf.data.len());
-                }
-                Some(Response::Metadata(m)) => {
-                    eprintln!("[Metadata reason={} gen={} pty_id={:016x}]", m.reason, m.generation, m.pty_id);
-                    if m.reason == StreamMetadataReason::Closed as i32 {
-                        eprintln!("[Connection closed]");
+        match sub.event_rx.message().await {
+            Ok(Some(SubscribeEvent { event: Some(ev) })) => match ev {
+                Event::Ready(r) => eprintln!("[Ready subscriber_id={}]", r.subscriber_id),
+                Event::Data(s) => eprintln!("[Data len={}]", s.data.len()),
+                Event::Refresh(rf) => eprintln!("[Refresh len={} degraded={}]", rf.data.len(), rf.degraded),
+                Event::Metadata(StreamMetadata { event }) => {
+                    eprintln!("[Metadata {event:?}]");
+                    if matches!(event, Some(stream_metadata::Event::Exited(_))) {
+                        eprintln!("[PTY exited]");
                         break;
                     }
                 }
-                _ => {}
             },
+            Ok(Some(_)) => {}
             _ => { eprintln!("[Connection closed]"); break; }
         }
     }

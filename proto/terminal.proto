@@ -1,136 +1,158 @@
 syntax = "proto3";
 import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
 
 package terminal;
 
 service TerminalService {
-  rpc Stream(stream TerminalCommand) returns (stream TerminalResponse);
+  // ---- Control plane: unary CRUD over the same HTTP/2 connection ----
+  // Failures are reported via gRPC status (NOT_FOUND, INVALID_ARGUMENT, ...),
+  // not in-band success flags. Mutations return the resulting entity so the
+  // caller sees the applied state without round-tripping through the stream.
+  rpc List     (ListRequest)     returns (ListResponse);
+  rpc Create   (CreateRequest)   returns (PtyItem);
+  rpc Destroy  (DestroyRequest)  returns (google.protobuf.Empty);
+  rpc Resize   (ResizeRequest)   returns (PtyItem);
+  rpc SetTitle (SetTitleRequest) returns (PtyItem);
+
+  // Ask the daemon to (re)emit a full screen snapshot for a subscription. The
+  // snapshot is NOT returned here; it arrives on the matching Subscribe stream
+  // as a SubscribeEvent.refresh, ordered against live output. This call only
+  // acknowledges that the request was accepted (non-OK status if it wasn't).
+  rpc Refresh (RefreshRequest) returns (google.protobuf.Empty);
+
+  // Page the scrollback for a subscription's viewport. Unlike live output and
+  // refresh snapshots, scrollback paging is a self-contained request/response
+  // (its own paradigm, not interleaved with the stream), so the rows come back
+  // here rather than on the Subscribe stream.
+  rpc Scrollback (ScrollbackRequest) returns (ScrollbackResponse);
+
+  // ---- Data plane: one bidi stream per subscribed PTY ----
+  // The stream's lifetime IS the subscription: the first client frame must be
+  // a SubscribeStart; closing the stream unsubscribes. The stream is scoped to
+  // a single PTY, so no per-frame pty_id is needed. Subscription failures are
+  // reported by erroring the stream with a gRPC status.
+  rpc Subscribe (stream SubscribeFrame) returns (stream SubscribeEvent);
 }
 
-message TerminalCommand {
-  oneof command {
-    ListRequest        list        = 1;
-    CreateRequest      create      = 2;
-    DestroyRequest     destroy     = 3;
-    SubscribeRequest   subscribe   = 4;
-    UnsubscribeRequest unsubscribe = 5;
-    WriteRequest       write       = 6;
-    ResizeRequest      resize      = 7;
-    SetTitleRequest    set_title   = 8;
-    RefreshRequest     refresh     = 9;
-    ScrollbackRequest  scrollback  = 10;
-  }
-}
+// ============================ Shared types ============================
 
-message ListRequest        {}
-message CreateRequest      { uint32 cols = 1; uint32 rows = 2; optional string command = 3; }
-message DestroyRequest     { uint64 pty_id = 1; }
-message SubscribeRequest   { uint64 pty_id = 1; string hostname = 2; uint32 cols = 3; uint32 rows = 4; }
-message UnsubscribeRequest { uint64 pty_id = 1; }
-message WriteRequest       { uint64 pty_id = 1; bytes data = 2; }
-message ResizeRequest      { uint64 pty_id = 1; uint32 cols = 2; uint32 rows = 3; }
-message SetTitleRequest    { uint64 pty_id = 1; string title = 2; }
-message RefreshRequest     { uint64 pty_id = 1; }
-enum ScrollbackOp {
-  SCROLLBACK_OP_OPEN  = 0;  // place pin at the live tail (row_offset 0); amount ignored
-  SCROLLBACK_OP_MOVE  = 1;  // move pin by `amount` rows; + = older/up, - = newer/down
-  SCROLLBACK_OP_CLOSE = 2;  // remove the pin; no data returned
-}
-
-message ScrollbackRequest {
-  uint64       pty_id    = 1;
-  reserved                 2;   // was row_offset
-  // Viewport height in rows.
-  uint32       row_count = 3;
-  ScrollbackOp op        = 4;
-  // MOVE only; signed row delta (+ older / up, - newer / down).
-  sint32       amount    = 5;
-}
-
-message TerminalResponse {
-  oneof response {
-    ListResponse       list       = 1;
-    CreateResponse     create     = 2;
-    CommandResponse    command    = 3;
-    StreamData         stream     = 4;
-    RefreshResponse    refresh    = 5;
-    StreamMetadata     metadata   = 6;
-    ScrollbackResponse scrollback = 7;
-    SubscribeResponse  subscribe  = 8;
-  }
-}
+// Terminal dimensions. cols/rows always travel together; pixel dimensions for
+// image protocols (sixel/kitty) can be added here later.
+message Size { uint32 cols = 1; uint32 rows = 2; }
 
 message PtyItem {
-  uint64                    pty_id      = 1;
-  string                    hostname    = 2;
-  string                    pts_name    = 3;
-  uint32                    cols        = 4;
-  uint32                    rows        = 5;
-  string                    title       = 6;
-  reserved                                7;
-  google.protobuf.Timestamp created_at        = 8;
-  repeated SubscriberInfo   subscribers       = 9;
-  optional google.protobuf.Timestamp last_subscribed_at = 10;
-  uint32                    sort_order  = 11;
-}
-
-message ListResponse    { repeated PtyItem items = 1; }
-message CreateResponse  { PtyItem item = 1; }
-message CommandResponse { uint64 pty_id = 1; bool success = 2; optional string error = 3; }
-message StreamData      { uint64 pty_id = 1; uint64 generation = 2; bytes data = 3; }
-message RefreshResponse {
-  uint64 pty_id     = 1;
-  uint64 generation = 2;
-  bytes  data       = 3;
-  reserved            4;
-  reserved            5;
-  uint32 cols       = 6;
-  uint32 rows       = 7;
-  // True when the daemon was forced to snapshot mid-sequence by the refresh
-  // stall timeout (the app went idle inside an escape sequence). The render is
-  // best-effort and may resume a client on an orphaned sequence tail; the client
-  // decides whether to request a clean refresh later. See docs/REFRESH.md.
-  bool   degraded   = 8;
-}
-
-message ScrollbackResponse {
-  uint64 pty_id                = 1;
-  uint64 generation            = 2;
-  bytes  data                  = 3;
-  uint32 total_scrollback_rows = 4;
-  // Viewport bottom-edge distance from the live tail (0 = tail).
-  uint32 row_offset            = 5;
+  uint64                    pty_id             = 1;
+  string                    hostname           = 2;
+  string                    pts_name           = 3;
+  Size                      size               = 4;
+  string                    title              = 5;
+  google.protobuf.Timestamp created_at         = 6;
+  repeated SubscriberInfo   subscribers        = 7;
+  optional google.protobuf.Timestamp last_subscribed_at = 8;
+  uint32                    sort_order         = 9;
 }
 
 message SubscriberInfo {
   string                    subscriber_id = 1;
   string                    hostname      = 2;
-  uint32                    cols          = 3;
-  uint32                    rows          = 4;
-  google.protobuf.Timestamp created_at    = 5;
+  Size                      size          = 3;
+  google.protobuf.Timestamp created_at    = 4;
 }
 
-message SubscribeResponse {
-  uint64          pty_id        = 1;
-  bool            success       = 2;
-  optional string error         = 3;
-  string          subscriber_id = 4;
+// ======================= Control plane messages =======================
+
+message ListRequest    {}
+message ListResponse   { repeated PtyItem items = 1; }
+
+message CreateRequest  { Size size = 1; optional string command = 2; }
+message DestroyRequest { uint64 pty_id = 1; }
+message ResizeRequest  { uint64 pty_id = 1; Size size = 2; }
+message SetTitleRequest{ uint64 pty_id = 1; string title = 2; }
+
+// Targets a live subscription by the id the client chose in SubscribeStart.
+message RefreshRequest { uint64 pty_id = 1; string subscriber_id = 2; }
+
+enum ScrollbackOpKind {
+  SCROLLBACK_OPEN  = 0;  // place pin at the live tail (row_offset 0); amount ignored
+  SCROLLBACK_MOVE  = 1;  // move pin by `amount` rows; + = older/up, - = newer/down
+  SCROLLBACK_CLOSE = 2;  // remove the pin; no rows returned
 }
 
-enum StreamMetadataReason {
-  RESIZE              = 0;
-  CLOSED              = 1;
-  TITLE_CHANGED       = 2;
-  SUBSCRIBERS_CHANGED = 3;
-  // This subscriber lagged the server's broadcast and stream data was lost.
-  // The client should request a Refresh to resynchronize its screen.
-  DATA_LOST           = 4;
+message ScrollbackRequest {
+  uint64           pty_id        = 1;
+  string           subscriber_id = 2;
+  ScrollbackOpKind kind          = 3;
+  uint32           row_count     = 4;  // viewport height in rows
+  sint32           amount        = 5;  // MOVE only; + older/up, - newer/down
 }
 
+message ScrollbackResponse {
+  bytes  data                  = 1;  // empty for CLOSE
+  uint32 total_scrollback_rows = 2;
+  uint32 row_offset            = 3;  // viewport bottom-edge distance from tail (0 = tail)
+}
+
+// ===================== Data plane: client -> server ====================
+
+message SubscribeFrame {
+  oneof frame {
+    SubscribeStart start = 1;  // must be the first frame, exactly once
+    WriteData      write = 2;  // bytes to the PTY; ordered w.r.t. the stream
+  }
+}
+
+message SubscribeStart {
+  uint64 pty_id   = 1;
+  string hostname = 2;
+  Size   size     = 3;
+}
+
+message WriteData { bytes data = 1; }
+
+// ===================== Data plane: server -> client ====================
+
+message SubscribeEvent {
+  oneof event {
+    SubscribeReady ready    = 1;  // first frame; carries the server-assigned id
+    StreamData     data     = 2;  // live PTY output
+    StreamMetadata metadata = 3;  // out-of-band state changes
+    RefreshData    refresh  = 4;  // snapshot emitted in response to Refresh
+  }
+}
+
+// First event on every Subscribe stream. The client must receive this to learn
+// its subscriber_id before it can call Refresh/Scrollback for this stream.
+message SubscribeReady { string subscriber_id = 1; }
+
+message StreamData { bytes data = 1; }
+
+message RefreshData {
+  bytes data     = 1;
+  Size  size     = 2;
+  // True when the daemon was forced to snapshot mid-sequence by the refresh
+  // stall timeout (the app went idle inside an escape sequence). Best-effort;
+  // the client may request a clean refresh later. See docs/REFRESH.md.
+  bool  degraded = 3;
+}
+
+// Out-of-band subscription state changes, ordered within the stream. Each
+// variant carries exactly the payload its change implies.
 message StreamMetadata {
-  uint64               pty_id      = 1;
-  PtyItem              item        = 2;
-  StreamMetadataReason reason      = 3;
-  optional int32       exit_code   = 4;
-  uint64               generation  = 5;
+  oneof event {
+    Resized            resized             = 1;
+    TitleChanged       title_changed       = 2;
+    Exited             exited              = 3;
+    SubscribersChanged subscribers_changed = 4;
+    DataLost           data_lost           = 5;
+  }
 }
+
+message Resized            { Size size = 1; }
+message TitleChanged       { string title = 1; }
+message Exited             { int32 exit_code = 1; }
+message SubscribersChanged { repeated SubscriberInfo subscribers = 1; }
+// This subscriber lagged the broadcast and stream data was lost. The client
+// should call Refresh to resynchronize; the snapshot arrives in order on this
+// same stream as a RefreshData.
+message DataLost           {}

@@ -16,10 +16,11 @@ use hyper_util::rt::TokioIo;
 use termd::pty::PtyRegistry;
 use termd::server::make_service;
 use termd::proto::terminal_service_client::TerminalServiceClient;
-use termd::proto::terminal_command::Command;
-use termd::proto::terminal_response::Response;
-use termd::proto::{TerminalCommand, ListRequest, CreateRequest, DestroyRequest};
-use termd::proto::{PtyItem, SubscribeRequest, UnsubscribeRequest};
+use termd::proto::{
+    ListRequest, CreateRequest, DestroyRequest, Size,
+    PtyItem, SubscribeFrame, SubscribeEvent, SubscribeStart,
+    subscribe_frame, subscribe_event,
+};
 
 const TEST_TOKEN: &str = "test-token";
 
@@ -41,9 +42,11 @@ const TEST_TOKEN: &str = "test-token";
 //                                       assert terminal count + per-terminal subscriber
 //                                       counts, then drop the fresh client.
 //
-// Client model: one client == one long-lived bidi `stream` RPC. All of that
-// client's subscribe/unsubscribe/create commands are multiplexed over its single
-// stream; dropping the stream removes every subscription it held.
+// Client model: one client == one authed gRPC channel. Under the new protocol
+// each subscription is its OWN per-PTY Subscribe stream; a client holds one such
+// stream per terminal it is subscribed to. Unsubscribe = drop that stream.
+// Control ops (create/destroy/list) are unary calls on the channel. Dropping the
+// whole client tears down every Subscribe stream it held (i.e. all its subs).
 //
 // `verify` polls until the expected state is reached (or a timeout fires) because
 // subscriber removal on disconnect is eventual on the server side.
@@ -102,110 +105,89 @@ impl TestServer {
     }
 }
 
-// A single long-lived client connection: one bidi `stream` RPC over which all of
-// this client's commands are sent. `grpc` is retained to keep the channel alive.
+// One held subscription: the per-PTY Subscribe stream's up-channel and its event
+// stream. Dropping this drops the stream, which unsubscribes on the server.
+struct Subscription {
+    _frame_tx: mpsc::Sender<SubscribeFrame>,
+    _events: tonic::Streaming<SubscribeEvent>,
+}
+
+// A single client: an authed gRPC channel plus the set of Subscribe streams it
+// currently holds, keyed by pty_id. Control ops are unary; each subscription is
+// its own stream.
 struct Client {
     name: String,
-    _grpc: AuthedClient,
-    cmd_tx: mpsc::Sender<TerminalCommand>,
-    resp: tonic::Streaming<termd::proto::TerminalResponse>,
+    grpc: AuthedClient,
+    subs: HashMap<u64, Subscription>,
 }
 
 impl Client {
     async fn connect(socket: &Path, name: &str) -> Client {
-        let mut grpc = connect_grpc(socket).await;
-        let (cmd_tx, cmd_rx) = mpsc::channel::<TerminalCommand>(64);
-        let resp = grpc
-            .stream(ReceiverStream::new(cmd_rx))
-            .await
-            .unwrap()
-            .into_inner();
-        Client { name: name.to_string(), _grpc: grpc, cmd_tx, resp }
-    }
-
-    async fn send(&self, cmd: Command) {
-        self.cmd_tx
-            .send(TerminalCommand { command: Some(cmd) })
-            .await
-            .expect("client command stream closed unexpectedly");
-    }
-
-    // Reads responses off this client's stream until `f` yields a value, skipping
-    // interleaved broadcast traffic (stream data, metadata, etc.).
-    async fn drain_until<R>(&mut self, mut f: impl FnMut(Response) -> Option<R>) -> R {
-        loop {
-            let msg = self.resp.message().await.unwrap().unwrap();
-            if let Some(r) = f(msg.response.unwrap()) {
-                return r;
-            }
-        }
+        let grpc = connect_grpc(socket).await;
+        Client { name: name.to_string(), grpc, subs: HashMap::new() }
     }
 
     async fn create_terminal(&mut self) -> u64 {
-        self.send(Command::Create(CreateRequest { cols: 80, rows: 24, command: None }))
-            .await;
-        tokio::time::timeout(
+        let item = tokio::time::timeout(
             Duration::from_secs(5),
-            self.drain_until(|r| match r {
-                Response::Create(c) => Some(c.item.unwrap().pty_id),
-                _ => None,
-            }),
+            self.grpc.create(CreateRequest { size: Some(Size { cols: 80, rows: 24 }), command: None }),
         )
         .await
-        .expect("timed out waiting for CreateResponse")
+        .expect("timed out waiting for Create")
+        .expect("create failed")
+        .into_inner();
+        item.pty_id
     }
 
     async fn destroy_terminal(&mut self, pty_id: u64) {
-        self.send(Command::Destroy(DestroyRequest { pty_id }))
-            .await;
         tokio::time::timeout(
             Duration::from_secs(5),
-            self.drain_until(|r| match r {
-                Response::Command(c) if c.success && c.pty_id == pty_id => Some(()),
-                _ => None,
-            }),
+            self.grpc.destroy(DestroyRequest { pty_id }),
         )
         .await
-        .expect("timed out waiting for DestroyResponse")
+        .expect("timed out waiting for Destroy")
+        .expect("destroy failed");
     }
 
+    // Open a per-PTY Subscribe stream, send Start, await Ready, and retain the
+    // stream so the subscription stays live until `unsubscribe`/client drop.
     async fn subscribe(&mut self, pty_id: u64) {
-        let hostname = self.name.clone();
-        self.send(Command::Subscribe(SubscribeRequest { pty_id, hostname, cols: 80, rows: 24 }))
-            .await;
-        tokio::time::timeout(
+        let (frame_tx, frame_rx) = mpsc::channel::<SubscribeFrame>(16);
+        frame_tx.send(SubscribeFrame {
+            frame: Some(subscribe_frame::Frame::Start(SubscribeStart {
+                pty_id,
+                hostname: self.name.clone(),
+                size: Some(Size { cols: 80, rows: 24 }),
+            })),
+        }).await.unwrap();
+
+        let mut events = tokio::time::timeout(
             Duration::from_secs(5),
-            self.drain_until(|r| match r {
-                Response::Subscribe(s) if s.success && s.pty_id == pty_id => Some(()),
-                _ => None,
-            }),
+            self.grpc.subscribe(ReceiverStream::new(frame_rx)),
         )
         .await
-        .expect("timed out waiting for SubscribeResponse");
+        .expect("timed out opening Subscribe stream")
+        .expect("subscribe failed")
+        .into_inner();
+
+        match tokio::time::timeout(Duration::from_secs(5), events.message()).await {
+            Ok(Ok(Some(SubscribeEvent { event: Some(subscribe_event::Event::Ready(_)) }))) => {}
+            other => panic!("expected Ready as first subscribe event, got {other:?}"),
+        }
+
+        self.subs.insert(pty_id, Subscription { _frame_tx: frame_tx, _events: events });
     }
 
-    // Fire-and-forget: removal is observed by the next `verify` poll.
-    async fn unsubscribe(&self, pty_id: u64) {
-        self.send(Command::Unsubscribe(UnsubscribeRequest { pty_id })).await;
+    // Drop the per-PTY Subscribe stream; removal is observed by the next `verify`.
+    fn unsubscribe(&mut self, pty_id: u64) {
+        self.subs.remove(&pty_id);
     }
 }
 
-// One-shot: open a fresh gRPC client, send a single ListRequest, return the items,
-// then drop the client (the whole connection is torn down when this returns).
+// One-shot: open a fresh gRPC client, unary List, return the items, then drop it.
 async fn fresh_list(socket: &Path) -> Vec<PtyItem> {
     let mut grpc = connect_grpc(socket).await;
-    let (tx, rx) = mpsc::channel::<TerminalCommand>(1);
-    tx.send(TerminalCommand { command: Some(Command::List(ListRequest {})) })
-        .await
-        .unwrap();
-    drop(tx);
-    let mut stream = grpc.stream(ReceiverStream::new(rx)).await.unwrap().into_inner();
-    loop {
-        match stream.message().await.unwrap().unwrap().response.unwrap() {
-            Response::List(l) => return l.items,
-            _ => continue,
-        }
-    }
+    grpc.list(ListRequest {}).await.unwrap().into_inner().items
 }
 
 struct World {
@@ -241,21 +223,21 @@ impl World {
         self.clients.get_mut(client).expect("unknown client").subscribe(pty_id).await;
     }
 
-    async fn unsubscribe(&self, client: &str, term: &str) {
+    fn unsubscribe(&mut self, client: &str, term: &str) {
         let pty_id = *self.terminals.get(term).expect("unknown terminal");
-        self.clients.get(client).expect("unknown client").unsubscribe(pty_id).await;
+        self.clients.get_mut(client).expect("unknown client").unsubscribe(pty_id);
     }
 
-    // Abrupt connection loss: drop everything immediately.
+    // Abrupt connection loss: drop the client (and all its Subscribe streams).
     fn drop_connection(&mut self, client: &str) {
         self.clients.remove(client).expect("unknown client");
     }
 
-    // Graceful close: half-close the command stream first, then drop.
-    async fn close_connection(&mut self, client: &str) {
-        let c = self.clients.remove(client).expect("unknown client");
-        drop(c.cmd_tx); // signal end-of-commands to the server
-        // `c.resp` / `c._grpc` drop here, tearing down the connection.
+    // Graceful close: under the per-PTY-stream model there is no single command
+    // stream to half-close; dropping the client tears down every Subscribe stream
+    // it held and closes the channel.
+    fn close_connection(&mut self, client: &str) {
+        self.clients.remove(client).expect("unknown client");
     }
 
     // Spin up a fresh gRPC client, ListRequest, and assert the terminal count and
@@ -321,7 +303,7 @@ async fn test_multi_client_subscription_lifecycle() {
     w.verify(&[("X", 1)]).await;
 
     // A: Unsubscribe from terminal X
-    w.unsubscribe("A", "X").await;
+    w.unsubscribe("A", "X");
     w.verify(&[("X", 0)]).await;
 
     // A: Create terminal Y
@@ -333,7 +315,7 @@ async fn test_multi_client_subscription_lifecycle() {
     w.verify(&[("X", 0), ("Y", 1)]).await;
 
     // A: Unsubscribe from terminal Y
-    w.unsubscribe("A", "Y").await;
+    w.unsubscribe("A", "Y");
     w.verify(&[("X", 0), ("Y", 0)]).await;
 
     // A: Subscribe to terminal X  (A is left open, subscribed to X)
@@ -345,16 +327,16 @@ async fn test_multi_client_subscription_lifecycle() {
     w.subscribe("D", "Z").await;
     w.connect("E").await;
     w.subscribe("E", "X").await;
-    w.unsubscribe("E", "X").await;
+    w.unsubscribe("E", "X");
     w.subscribe("E", "Z").await;
     w.destroy("E", "Z").await;
-    w.close_connection("D").await;
-    w.close_connection("E").await;
+    w.close_connection("D");
+    w.close_connection("E");
     w.connect("D").await;
     w.subscribe("D", "X").await;
-    w.unsubscribe("D", "X").await;
+    w.unsubscribe("D", "X");
     w.subscribe("D", "Y").await;
-    w.unsubscribe("D", "Y").await;
+    w.unsubscribe("D", "Y");
 
     w.verify(&[("X", 1), ("Y", 0)]).await;
 
@@ -364,7 +346,7 @@ async fn test_multi_client_subscription_lifecycle() {
 
     // B: Unsubscribe from terminal X, then B: Subscribe to terminal Y
     // (NOTE: no VERIFY between these two steps)
-    w.unsubscribe("B", "X").await;
+    w.unsubscribe("B", "X");
     w.subscribe("B", "Y").await;
     w.verify(&[("X", 1), ("Y", 1)]).await;
 
@@ -374,19 +356,19 @@ async fn test_multi_client_subscription_lifecycle() {
     w.verify(&[("X", 1), ("Y", 1), ("Z", 1)]).await;
 
     // C: Unsubscribe terminal Z, then C: Subscribe terminal X
-    w.unsubscribe("C", "Z").await;
+    w.unsubscribe("C", "Z");
     w.subscribe("C", "X").await;
     w.verify(&[("X", 2), ("Y", 1), ("Z", 0)]).await;
 
     // A: Suddenly drop connection A  (A was subscribed to X)
     w.drop_connection("A");
     // B: Unsubscribe terminal Y, then B: Close connection
-    w.unsubscribe("B", "Y").await;
-    w.close_connection("B").await;
+    w.unsubscribe("B", "Y");
+    w.close_connection("B");
     w.verify(&[("X", 1), ("Y", 0), ("Z", 0)]).await;
 
     // C: Unsubscribe terminal X, then C: Close connection
-    w.unsubscribe("C", "X").await;
-    w.close_connection("C").await;
+    w.unsubscribe("C", "X");
+    w.close_connection("C");
     w.verify(&[("X", 0), ("Y", 0), ("Z", 0)]).await;
 }

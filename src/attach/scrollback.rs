@@ -1,29 +1,27 @@
 use std::io::Write as IoWrite;
 
 use anyhow::Result;
-use tokio::sync::mpsc;
 
 use termd::proto::{
-    terminal_command::Command,
-    terminal_response::Response,
-    ScrollbackOp, ScrollbackRequest, ScrollbackResponse,
-    TerminalCommand, TerminalResponse,
+    ScrollbackOpKind, ScrollbackRequest, ScrollbackResponse,
 };
+
+use crate::AuthedClient;
 
 // This is a fairly naive version of scrollback, more a proof of concept.
 // Right now the scrollback pages get "dumped" out to the screen, instead
 // of rendered (they probably need to go through cell/region formatters)
 pub(super) async fn show_scrollback(
-    cmd_tx:  &mpsc::Sender<TerminalCommand>,
-    resp_rx: &mut tonic::Streaming<TerminalResponse>,
-    pty_id:  u64,
-    rows:    u32,
-    stdin:   &mut tokio::io::Stdin,
+    client:        &mut AuthedClient,
+    pty_id:        u64,
+    subscriber_id: String,
+    rows:          u32,
+    stdin:         &mut tokio::io::Stdin,
 ) -> Result<()> {
     let _ = std::io::stdout().write_all(b"\x1b[?1049h");
     let _ = std::io::stdout().flush();
 
-    let result = run_scrollback(cmd_tx, resp_rx, pty_id, rows, stdin).await;
+    let result = run_scrollback(client, pty_id, &subscriber_id, rows, stdin).await;
 
     let _ = std::io::stdout().write_all(b"\x1b[?1049l");
     let _ = std::io::stdout().flush();
@@ -36,31 +34,31 @@ pub(super) async fn show_scrollback(
 
 /// Map a raw input chunk to a scrollback intent. `rows` is the viewport height
 /// (a page). Returns None for keys that exit the pager.
-fn key_to_op(buf: &[u8], rows: u32) -> Option<(ScrollbackOp, i32)> {
+fn key_to_op(buf: &[u8], rows: u32) -> Option<(ScrollbackOpKind, i32)> {
     let page = rows as i32;
     match buf {
-        [0x1b, b'[', b'A', ..] => Some((ScrollbackOp::Move, 1)),   // Up: older
-        [0x1b, b'[', b'B', ..] => Some((ScrollbackOp::Move, -1)),  // Down: newer
-        [0x02] | [b'b']        => Some((ScrollbackOp::Move, page)),  // Ctrl-B / b: page older
-        [0x06] | [b'f']        => Some((ScrollbackOp::Move, -page)), // Ctrl-F / f: page newer
-        [b'g']                 => Some((ScrollbackOp::Move, i32::MAX)), // g: oldest (server clamps)
-        [b'G']                 => Some((ScrollbackOp::Open, 0)),     // G: jump to live tail
+        [0x1b, b'[', b'A', ..] => Some((ScrollbackOpKind::ScrollbackMove, 1)),   // Up: older
+        [0x1b, b'[', b'B', ..] => Some((ScrollbackOpKind::ScrollbackMove, -1)),  // Down: newer
+        [0x02] | [b'b']        => Some((ScrollbackOpKind::ScrollbackMove, page)),  // Ctrl-B / b: page older
+        [0x06] | [b'f']        => Some((ScrollbackOpKind::ScrollbackMove, -page)), // Ctrl-F / f: page newer
+        [b'g']                 => Some((ScrollbackOpKind::ScrollbackMove, i32::MAX)), // g: oldest (server clamps)
+        [b'G']                 => Some((ScrollbackOpKind::ScrollbackOpen, 0)),     // G: jump to live tail
         _ => None,
     }
 }
 
 async fn run_scrollback(
-    cmd_tx:  &mpsc::Sender<TerminalCommand>,
-    resp_rx: &mut tonic::Streaming<TerminalResponse>,
-    pty_id:  u64,
-    rows:    u32,
-    stdin:   &mut tokio::io::Stdin,
+    client:        &mut AuthedClient,
+    pty_id:        u64,
+    subscriber_id: &str,
+    rows:          u32,
+    stdin:         &mut tokio::io::Stdin,
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
     let mut buf = [0u8; 8];
 
     // Enter: place the pin at the live tail.
-    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, ScrollbackOp::Open, 0, rows).await?;
+    let resp = fetch_scrollback(client, pty_id, subscriber_id, ScrollbackOpKind::ScrollbackOpen, 0, rows).await?;
     let total = resp.total_scrollback_rows;
 
     if total == 0 {
@@ -70,7 +68,7 @@ async fn run_scrollback(
         let _ = std::io::stdout().flush();
         let _ = stdin.read(&mut buf).await;
         // No pin to release in the empty case, but CLOSE is harmless/cheap.
-        let _ = fetch_scrollback(cmd_tx, resp_rx, pty_id, ScrollbackOp::Close, 0, 0).await;
+        let _ = fetch_scrollback(client, pty_id, subscriber_id, ScrollbackOpKind::ScrollbackClose, 0, 0).await;
         return Ok(());
     }
 
@@ -92,11 +90,11 @@ async fn run_scrollback(
             ).await.ok().and_then(|r| r.ok());
             match extra {
                 Some(2) if rest[0] == b'[' && rest[1] == b'A' => {
-                    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, ScrollbackOp::Move, 1, rows).await?;
+                    let resp = fetch_scrollback(client, pty_id, subscriber_id, ScrollbackOpKind::ScrollbackMove, 1, rows).await?;
                     display_page(&resp.data, resp.row_offset, resp.total_scrollback_rows, rows);
                 }
                 Some(2) if rest[0] == b'[' && rest[1] == b'B' => {
-                    let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, ScrollbackOp::Move, -1, rows).await?;
+                    let resp = fetch_scrollback(client, pty_id, subscriber_id, ScrollbackOpKind::ScrollbackMove, -1, rows).await?;
                     display_page(&resp.data, resp.row_offset, resp.total_scrollback_rows, rows);
                 }
                 _ => break, // bare ESC: exit
@@ -110,45 +108,32 @@ async fn run_scrollback(
         }
 
         if let Some((op, amount)) = key_to_op(chunk, rows) {
-            let resp = fetch_scrollback(cmd_tx, resp_rx, pty_id, op, amount, rows).await?;
+            let resp = fetch_scrollback(client, pty_id, subscriber_id, op, amount, rows).await?;
             display_page(&resp.data, resp.row_offset, resp.total_scrollback_rows, rows);
         }
     }
 
     // Exit: release the pin (best-effort).
-    let _ = fetch_scrollback(cmd_tx, resp_rx, pty_id, ScrollbackOp::Close, 0, 0).await;
+    let _ = fetch_scrollback(client, pty_id, subscriber_id, ScrollbackOpKind::ScrollbackClose, 0, 0).await;
     Ok(())
 }
 
 async fn fetch_scrollback(
-    cmd_tx:     &mpsc::Sender<TerminalCommand>,
-    resp_rx:    &mut tonic::Streaming<TerminalResponse>,
-    pty_id:     u64,
-    op:         ScrollbackOp,
-    amount:     i32,
-    row_count:  u32,
+    client:        &mut AuthedClient,
+    pty_id:        u64,
+    subscriber_id: &str,
+    kind:          ScrollbackOpKind,
+    amount:        i32,
+    row_count:     u32,
 ) -> Result<ScrollbackResponse> {
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Scrollback(ScrollbackRequest {
-            pty_id,
-            op: op as i32,
-            amount,
-            row_count,
-        })),
+    let resp = client.scrollback(ScrollbackRequest {
+        pty_id,
+        subscriber_id: subscriber_id.to_string(),
+        kind: kind as i32,
+        row_count,
+        amount,
     }).await?;
-    loop {
-        match resp_rx.message().await? {
-            None => anyhow::bail!("server disconnected during scrollback fetch"),
-            Some(r) => match r.response {
-                Some(Response::Scrollback(s)) if s.pty_id == pty_id => return Ok(s),
-                Some(Response::Stream(s))     if s.pty_id == pty_id => {}
-                Some(Response::Command(c)) if c.pty_id == pty_id && !c.success => {
-                    anyhow::bail!("scrollback error: {}", c.error.unwrap_or_default())
-                }
-                _ => {}
-            }
-        }
-    }
+    Ok(resp.into_inner())
 }
 
 fn display_page(data: &[u8], row_offset: u32, total: u32, rows: u32) {
@@ -175,30 +160,30 @@ mod tests {
 
     #[test]
     fn key_up_moves_one_row_older() {
-        assert_eq!(key_to_op(&[0x1b, b'[', b'A'], 24), Some((ScrollbackOp::Move, 1)));
+        assert_eq!(key_to_op(&[0x1b, b'[', b'A'], 24), Some((ScrollbackOpKind::ScrollbackMove, 1)));
     }
 
     #[test]
     fn key_down_moves_one_row_newer() {
-        assert_eq!(key_to_op(&[0x1b, b'[', b'B'], 24), Some((ScrollbackOp::Move, -1)));
+        assert_eq!(key_to_op(&[0x1b, b'[', b'B'], 24), Some((ScrollbackOpKind::ScrollbackMove, -1)));
     }
 
     #[test]
     fn key_page_back_moves_a_screenful_older() {
-        assert_eq!(key_to_op(&[0x02], 24), Some((ScrollbackOp::Move, 24)));   // Ctrl-B
-        assert_eq!(key_to_op(b"b", 24), Some((ScrollbackOp::Move, 24)));
+        assert_eq!(key_to_op(&[0x02], 24), Some((ScrollbackOpKind::ScrollbackMove, 24)));   // Ctrl-B
+        assert_eq!(key_to_op(b"b", 24), Some((ScrollbackOpKind::ScrollbackMove, 24)));
     }
 
     #[test]
     fn key_page_forward_moves_a_screenful_newer() {
-        assert_eq!(key_to_op(&[0x06], 24), Some((ScrollbackOp::Move, -24)));  // Ctrl-F
-        assert_eq!(key_to_op(b"f", 24), Some((ScrollbackOp::Move, -24)));
+        assert_eq!(key_to_op(&[0x06], 24), Some((ScrollbackOpKind::ScrollbackMove, -24)));  // Ctrl-F
+        assert_eq!(key_to_op(b"f", 24), Some((ScrollbackOpKind::ScrollbackMove, -24)));
     }
 
     #[test]
     fn key_home_jumps_to_oldest_end_jumps_to_tail() {
-        assert_eq!(key_to_op(b"g", 24), Some((ScrollbackOp::Move, i32::MAX)));   // g: top
-        assert_eq!(key_to_op(b"G", 24), Some((ScrollbackOp::Open, 0)));          // G: tail
+        assert_eq!(key_to_op(b"g", 24), Some((ScrollbackOpKind::ScrollbackMove, i32::MAX)));   // g: top
+        assert_eq!(key_to_op(b"G", 24), Some((ScrollbackOpKind::ScrollbackOpen, 0)));          // G: tail
     }
 
     #[test]

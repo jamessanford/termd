@@ -50,13 +50,9 @@ impl CellHandler {
 }
 
 impl super::RenderModeHandler for CellHandler {
-    fn init(&mut self, refresh_data: &[u8], buffered: &[(u64, Vec<u8>)], out: &mut Vec<u8>) -> Result<super::EventResult> {
+    fn init(&mut self, refresh_data: &[u8], out: &mut Vec<u8>) -> Result<super::EventResult> {
         self.lt.terminal.vt_write(refresh_data);
         render_dirty(&self.lt.terminal, &mut self.lt.render_state, &mut self.lt.row_iter, &mut self.lt.cell_iter, true, out)?;
-        for (_gen, data) in buffered {
-            self.lt.terminal.vt_write(data);
-            render_dirty(&self.lt.terminal, &mut self.lt.render_state, &mut self.lt.row_iter, &mut self.lt.cell_iter, false, out)?;
-        }
         Ok(super::EventResult::Continue)
     }
 
@@ -261,30 +257,16 @@ mod tests {
     fn cell_init_renders_content() {
         let mut h = CellHandler::new(80, 24, None).unwrap();
         let mut out = Vec::new();
-        let result = h.init(b"Hello", &[], &mut out).unwrap();
+        let result = h.init(b"Hello", &mut out).unwrap();
         assert!(matches!(result, EventResult::Continue));
         assert!(!out.is_empty(), "init should render refresh data");
-    }
-
-    #[test]
-    fn cell_init_replays_buffered() {
-        let mut h = CellHandler::new(80, 24, None).unwrap();
-        let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
-        let initial_len = out.len();
-
-        let buffered = vec![(2, b"World".to_vec())];
-        out.clear();
-        let mut h2 = CellHandler::new(80, 24, None).unwrap();
-        h2.init(b"", &buffered, &mut out).unwrap();
-        assert!(out.len() > initial_len, "init with buffered should produce more output");
     }
 
     #[test]
     fn cell_stream_renders_dirty() {
         let mut h = CellHandler::new(80, 24, None).unwrap();
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
 
         let result = h.on_pty_event(PtyEvent::Stream { data: b"Test" }, &mut out).unwrap();
@@ -296,7 +278,7 @@ mod tests {
     fn cell_refresh_resizes_and_renders() {
         let mut h = CellHandler::new(80, 24, None).unwrap();
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
 
         let result = h.on_pty_event(
@@ -311,7 +293,7 @@ mod tests {
     fn cell_no_upgrade_when_not_allowed() {
         let mut h = CellHandler::new(80, 24, None).unwrap();
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
 
         let result = h.on_pty_event(
@@ -325,7 +307,7 @@ mod tests {
     fn cell_sigwinch_re_renders() {
         let mut h = CellHandler::new(80, 24, None).unwrap();
         let mut out = Vec::new();
-        h.init(b"Hello", &[], &mut out).unwrap();
+        h.init(b"Hello", &mut out).unwrap();
         out.clear();
 
         let result = h.on_sigwinch(120, 40, &mut out).unwrap();

@@ -6,14 +6,19 @@ use tonic::Request;
 
 use termd::{
     proto::{
-        terminal_command::Command, terminal_response::Response,
         CreateRequest, DestroyRequest, ListRequest, PtyItem, ResizeRequest,
-        TerminalCommand, WriteRequest,
+        Size,
         terminal_service_client::TerminalServiceClient,
     },
     pty::PtyRegistry,
     server,
 };
+
+/// Columns/rows for a `PtyItem`, treating a missing `size` as 0x0.
+fn item_size(item: &PtyItem) -> (u32, u32) {
+    let s = item.size.unwrap_or_default();
+    (s.cols, s.rows)
+}
 
 /// A `std::io::Write` wrapper that attempts the underlying write but never
 /// reports an error. Used for the daemon's tracing output so that a stdout/stderr
@@ -201,102 +206,90 @@ async fn main() -> Result<()> {
 
         Cmd::List { conn, token, verbose } => {
             let mut client = connect_client(conn.destination(), token).await?;
-            let resp = send_recv(&mut client, Command::List(ListRequest {})).await?;
-            match resp.response {
-                Some(Response::List(l)) => {
-                    if l.items.is_empty() {
-                        println!("No active PTYs.");
-                    } else {
-                        let mut items = l.items;
-                        items.sort_by_key(|p| p.sort_order);
-                        println!("{:>3} {:<16} {:>5} {:>5}  TITLE", "#", "ID", "COLS", "ROWS");
-                        for item in items {
+            let mut items = client.list(ListRequest {}).await?.into_inner().items;
+            if items.is_empty() {
+                println!("No active PTYs.");
+            } else {
+                items.sort_by_key(|p| p.sort_order);
+                println!("{:>3} {:<16} {:>5} {:>5}  TITLE", "#", "ID", "COLS", "ROWS");
+                for item in items {
+                    let (cols, rows) = item_size(&item);
+                    println!(
+                        "{:>3} {:016x} {:>5} {:>5}  {}",
+                        item.sort_order, item.pty_id, cols, rows, item.title
+                    );
+                    if verbose {
+                        for sub in &item.subscribers {
+                            let s = sub.size.unwrap_or_default();
                             println!(
-                                "{:>3} {:016x} {:>5} {:>5}  {}",
-                                item.sort_order, item.pty_id, item.cols, item.rows, item.title
+                                "    ( {:<36} {} {}x{} )",
+                                sub.subscriber_id, sub.hostname, s.cols, s.rows
                             );
-                            if verbose {
-                                for sub in &item.subscribers {
-                                    println!(
-                                        "    ( {:<36} {} {}x{} )",
-                                        sub.subscriber_id, sub.hostname, sub.cols, sub.rows
-                                    );
-                                }
-                            }
                         }
                     }
                 }
-                other => eprintln!("unexpected response: {other:?}"),
             }
         }
 
         Cmd::Create { cols, rows, cmd, conn, token } => {
             let mut client = connect_client(conn.destination(), token).await?;
-            let resp = send_recv(
-                &mut client,
-                Command::Create(CreateRequest { cols, rows, command: cmd }),
-            )
-            .await?;
-            match resp.response {
-                Some(Response::Create(c)) => {
-                    println!("{}", c.item.map(|i| format!("{:016x}", i.pty_id)).unwrap_or_default());
-                }
-                other => eprintln!("unexpected response: {other:?}"),
-            }
+            let item = client.create(CreateRequest {
+                size: Some(Size { cols, rows }),
+                command: cmd,
+            }).await?.into_inner();
+            println!("{:016x}", item.pty_id);
         }
 
         Cmd::Destroy { pty_id, conn, token } => {
             let mut client = connect_client(conn.destination(), token).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
-            let resp = send_recv(
-                &mut client,
-                Command::Destroy(DestroyRequest { pty_id }),
-            )
-            .await?;
-            match resp.response {
-                Some(Response::Command(c)) => {
-                    if c.success {
-                        println!("destroyed {:016x}", pty_id);
-                    } else {
-                        eprintln!("error: {}", c.error.unwrap_or_default());
-                        std::process::exit(1);
-                    }
+            match client.destroy(DestroyRequest { pty_id }).await {
+                Ok(_) => println!("destroyed {:016x}", pty_id),
+                Err(status) => {
+                    eprintln!("error: {}", status.message());
+                    std::process::exit(1);
                 }
-                other => eprintln!("unexpected response: {other:?}"),
             }
         }
 
         Cmd::Send { pty_id, text, conn, token } => {
             let mut client = connect_client(conn.destination(), token).await?;
-            let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
-            let data = text.into_bytes();
-            let resp = send_recv(&mut client, Command::Write(WriteRequest { pty_id, data })).await?;
-            match resp.response {
-                Some(Response::Command(c)) if !c.success => {
-                    eprintln!("error: {}", c.error.unwrap_or_default());
-                    std::process::exit(1);
-                }
-                _ => {}
-            }
+            let item = resolve_pty_item(&mut client, &pty_id).await?;
+            let (cols, rows) = item_size(&item);
+            // No standalone write RPC remains: open a Subscribe stream, send the
+            // bytes as a Write frame, then close it.
+            use tokio::sync::mpsc;
+            use tokio_stream::wrappers::ReceiverStream;
+            use termd::proto::{subscribe_frame::Frame, SubscribeFrame, SubscribeStart, WriteData};
+            let (tx, rx) = mpsc::channel::<SubscribeFrame>(2);
+            tx.send(SubscribeFrame {
+                frame: Some(Frame::Start(SubscribeStart {
+                    pty_id: item.pty_id,
+                    hostname: hostname::get().unwrap_or_default().to_string_lossy().into_owned(),
+                    size: Some(Size { cols, rows }),
+                })),
+            }).await?;
+            tx.send(SubscribeFrame {
+                frame: Some(Frame::Write(WriteData { data: text.into_bytes() })),
+            }).await?;
+            let mut events = client.subscribe(ReceiverStream::new(rx)).await?.into_inner();
+            // Wait for Ready so the server has accepted the stream (and our Write).
+            let _ = events.message().await?;
+            drop(tx);
         }
 
         Cmd::Resize { pty_id, cols, rows, conn, token } => {
             let mut client = connect_client(conn.destination(), token).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
-            let resp = send_recv(
-                &mut client,
-                Command::Resize(ResizeRequest { pty_id, cols, rows }),
-            ).await?;
-            match resp.response {
-                Some(Response::Command(c)) => {
-                    if c.success {
-                        println!("resized {:016x} to {}x{}", pty_id, cols, rows);
-                    } else {
-                        eprintln!("error: {}", c.error.unwrap_or_default());
-                        std::process::exit(1);
-                    }
+            match client.resize(ResizeRequest {
+                pty_id,
+                size: Some(Size { cols, rows }),
+            }).await {
+                Ok(_) => println!("resized {:016x} to {}x{}", pty_id, cols, rows),
+                Err(status) => {
+                    eprintln!("error: {}", status.message());
+                    std::process::exit(1);
                 }
-                other => eprintln!("unexpected response: {other:?}"),
             }
         }
 
@@ -318,13 +311,7 @@ async fn resolve_pty_id(client: &mut AuthedClient, prefix: &str) -> Result<u64> 
 }
 
 async fn resolve_pty_item(client: &mut AuthedClient, prefix: &str) -> Result<PtyItem> {
-    use termd::proto::terminal_response::Response;
-
-    let resp = send_recv(client, Command::List(ListRequest {})).await?;
-    let items = match resp.response {
-        Some(Response::List(l)) => l.items,
-        other => return Err(anyhow::anyhow!("unexpected list response: {other:?}")),
-    };
+    let items = client.list(ListRequest {}).await?.into_inner().items;
     let prefix_lower = prefix.to_ascii_lowercase();
     let matches: Vec<_> = items.iter().filter(|i| format!("{:016x}", i.pty_id).starts_with(&prefix_lower)).collect();
     match matches.len() {
@@ -346,23 +333,16 @@ fn pick_best_pty(items: &[PtyItem]) -> Option<&PtyItem> {
 }
 
 async fn auto_select_or_create(client: &mut AuthedClient) -> Result<PtyItem> {
-    let resp = send_recv(client, Command::List(ListRequest {})).await?;
-    let items = match resp.response {
-        Some(Response::List(l)) => l.items,
-        other => return Err(anyhow::anyhow!("unexpected list response: {other:?}")),
-    };
+    let items = client.list(ListRequest {}).await?.into_inner().items;
     if let Some(best) = pick_best_pty(&items) {
         return Ok(best.clone());
     }
     let (cols, rows) = attach::get_terminal_size();
-    let resp = send_recv(
-        client,
-        Command::Create(CreateRequest { cols, rows, command: None }),
-    ).await?;
-    match resp.response {
-        Some(Response::Create(c)) => c.item.ok_or_else(|| anyhow::anyhow!("server returned empty CreateResponse")),
-        other => Err(anyhow::anyhow!("unexpected create response: {other:?}")),
-    }
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols, rows }),
+        command: None,
+    }).await?.into_inner();
+    Ok(item)
 }
 
 async fn connect_client(dest: Destination, token: Option<String>) -> Result<AuthedClient> {
@@ -394,20 +374,3 @@ async fn connect_client(dest: Destination, token: Option<String>) -> Result<Auth
     Ok(TerminalServiceClient::with_interceptor(channel, interceptor))
 }
 
-async fn send_recv(
-    client: &mut AuthedClient,
-    cmd: Command,
-) -> Result<termd::proto::TerminalResponse> {
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
-
-    let (tx, rx) = mpsc::channel(1);
-    tx.send(TerminalCommand { command: Some(cmd) }).await?;
-    drop(tx);
-
-    let mut stream = client.stream(ReceiverStream::new(rx)).await?.into_inner();
-    stream
-        .message()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("empty response from server"))
-}

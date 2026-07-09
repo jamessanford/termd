@@ -483,7 +483,7 @@ mod tests {
         // closes mid-sequence.
         let mut h = AutowrapHandler::new(80, 24).unwrap();
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
         h.on_pty_event(PtyEvent::Stream { data: b"\x1b[5;10" }, &mut out).unwrap();
         assert_eq!(out, b"", "partial CSI must be held");
@@ -495,7 +495,7 @@ mod tests {
     fn cleanup_flushes_then_releases_region() {
         let mut h = AutowrapHandler::new(80, 24).unwrap();
         let mut out = Vec::new();
-        h.init(b"", &[], &mut out).unwrap();
+        h.init(b"", &mut out).unwrap();
         out.clear();
         h.on_pty_event(PtyEvent::Stream { data: b"ab\xc3" }, &mut out).unwrap(); // partial é
         out.clear();
@@ -532,16 +532,13 @@ mod tests {
 }
 
 impl super::RenderModeHandler for AutowrapHandler {
-    fn init(&mut self, refresh_data: &[u8], buffered: &[(u64, Vec<u8>)], out: &mut Vec<u8>) -> Result<super::EventResult> {
+    fn init(&mut self, refresh_data: &[u8], out: &mut Vec<u8>) -> Result<super::EventResult> {
         if !self.fits_client() {
             return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
         }
         self.inj.reset(self.server_cols, self.server_rows)?;
         self.inj.emit_screen_setup(out);
         self.inj.process(refresh_data, out)?;
-        for (_gen, data) in buffered {
-            self.inj.process(data, out)?;
-        }
         Ok(super::EventResult::Continue)
     }
 

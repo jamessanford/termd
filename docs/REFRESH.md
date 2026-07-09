@@ -3,18 +3,28 @@
 ## Overview
 
 A refresh is a full screen redraw the daemon renders from its own libghostty
-`Terminal` (`do_refresh` in `src/pty.rs`) and hands to clients so they can paint
+`Terminal` (`do_refresh` in `src/pty/snapshot.rs`) and hands to clients so they can paint
 the current state without replaying the whole byte history. It reaches clients
 two ways:
 
-- **On-demand reply** — a client sends `RefreshRequest`; the reader thread
-  answers over a oneshot (`commands.rs::handle_refresh`).
-- **Broadcast** — on resize and primary↔alternate screen switch the reader
-  pushes `PtyEvent::Refresh` to every subscriber (`server.rs`).
+- **Per-subscriber (unary `Refresh` RPC)** — a client sends `RefreshRequest`; the
+  reader renders the snapshot and emits it **inline on the data broadcast** as
+  `PtyEvent::RefreshFor { subscriber_id, .. }` (`pty/mod.rs::deliver_refresh` →
+  `flush_refreshes`). Each Subscribe forwarding task forwards it only if the id is
+  its own. The unary RPC just acks; the snapshot arrives on the stream.
+- **Broadcast** — on resize and primary↔alternate screen switch the reader pushes
+  `PtyEvent::Refresh` to every subscriber (`server.rs`).
 
-After applying a refresh at generation `G`, a client drops every `Stream` chunk
-with `generation <= G` and resumes at `> G` (see `current_refresh_gen` in
-`src/attach/mod.rs`). The refresh is the client's sync baseline.
+Ordering is the key invariant: the snapshot rides the **same ordered channel** as
+the PTY data, sequenced by the single authority (the reader) at generation `G`. So
+on the wire a subscriber sees `[…data ≤G…][snapshot][…data >G…]`. The client
+therefore treats the snapshot as the authoritative baseline — it **discards
+everything received before the snapshot** (subsumed by it) and resumes on the data
+that follows. No generation is exposed on the wire and the client does no dedup;
+`generation` stays internal to `src/pty/`, used only to pin the snapshot at a clean
+boundary (below). Emitting the snapshot inline rather than on a side channel is
+what guarantees this order — a separate channel could let `>G` data overtake the
+snapshot. See the commit history around `RefreshFor` for the bug this fixed.
 
 ## Why refreshes are pinned at a VT ground boundary
 

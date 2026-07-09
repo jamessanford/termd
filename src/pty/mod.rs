@@ -58,9 +58,6 @@ pub enum MetadataReason {
     Closed,
     TitleChanged,
     SubscribersChanged,
-    /// Synthesized per-subscriber by the forwarding task on broadcast lag —
-    /// never emitted by the reader thread.
-    DataLost,
 }
 
 #[derive(Clone, Debug)]
@@ -74,7 +71,14 @@ pub struct PtyMetadata {
 #[derive(Debug, Clone)]
 pub enum PtyEvent {
     Data(PtyChunk),
+    /// Broadcast refresh — a full snapshot for ALL subscribers (resize / screen
+    /// switch). Every Subscribe stream forwards it.
     Refresh(Arc<RefreshData>),
+    /// Per-subscriber refresh — a full snapshot addressed to ONE subscriber (the
+    /// unary `Refresh` RPC). It rides the data broadcast so it stays ordered with
+    /// the PTY data; each Subscribe stream forwards it only if `subscriber_id`
+    /// matches its own, and drops it otherwise.
+    RefreshFor { subscriber_id: String, data: Arc<RefreshData> },
     Metadata(Arc<PtyMetadata>),
 }
 
@@ -162,10 +166,6 @@ impl PtyHandle {
         self.shared.info()
     }
 
-    pub(crate) fn shared(&self) -> Arc<PtyShared> {
-        self.shared.clone()
-    }
-
     pub fn subscribe(&self) -> broadcast::Receiver<PtyEvent> {
         self.tx.subscribe()
     }
@@ -219,10 +219,25 @@ impl PtyHandle {
         *self.shared.title.lock().unwrap() = title.to_string();
     }
 
+    /// Render a snapshot and return it (no inline broadcast). Used for direct /
+    /// in-process snapshotting.
     pub async fn refresh(&self) -> Result<RefreshData> {
+        self.request_refresh(None).await
+    }
+
+    /// Render a fresh snapshot and emit it inline on the data broadcast addressed
+    /// to `subscriber_id` (as `PtyEvent::RefreshFor`). Because it rides the same
+    /// ordered channel as the PTY data, the reader sequences it correctly relative
+    /// to that data — no side channel, so no cross-channel reordering. The owning
+    /// Subscribe stream forwards it; all others drop it.
+    pub async fn deliver_refresh(&self, subscriber_id: &str) -> Result<()> {
+        self.request_refresh(Some(subscriber_id.to_owned())).await.map(|_| ())
+    }
+
+    async fn request_refresh(&self, subscriber_id: Option<String>) -> Result<RefreshData> {
         let (tx, rx) = oneshot::channel();
         self.req_tx
-            .send(ReaderRequest::Refresh { reply: tx })
+            .send(ReaderRequest::Refresh { subscriber_id, reply: tx })
             .map_err(|_| anyhow!("PTY reader thread is dead"))?;
         self.wake();
         rx.await.map_err(|_| anyhow!("PTY reader thread dropped refresh response"))?
@@ -613,7 +628,7 @@ mod subscriber_tests {
     fn shared_info_reflects_title_and_dims() {
         let h = make_handle();
         h.set_title("new-title");
-        let info = h.shared().info();
+        let info = h.info();
         assert_eq!(info.title, "new-title");
         assert_eq!((info.cols, info.rows), (80, 24));
         assert!(info.subscribers.is_some());

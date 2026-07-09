@@ -35,6 +35,11 @@ pub(crate) enum ReaderRequest {
         reply: oneshot::Sender<Result<()>>,
     },
     Refresh {
+        /// `Some(id)` is the unary-refresh path: besides replying, the reader
+        /// emits the snapshot inline on the data broadcast as
+        /// `PtyEvent::RefreshFor` addressed to that subscriber, keeping it
+        /// ordered with the PTY data. `None` just renders and replies.
+        subscriber_id: Option<String>,
         reply: oneshot::Sender<Result<RefreshData>>,
     },
     Scrollback {
@@ -115,6 +120,13 @@ fn flush_pending(master: &File, pending_out: &mut Vec<u8>) {
     }
 }
 
+/// A refresh queued behind a VT ground boundary. Mirrors the fields of
+/// `ReaderRequest::Refresh`.
+struct PendingRefresh {
+    subscriber_id: Option<String>,
+    reply: oneshot::Sender<Result<RefreshData>>,
+}
+
 /// Service deferred refreshes — the on-demand (attach) replies and the
 /// resize/screen-switch broadcast. Callers gate this on `vt_at_boundary()` so the
 /// snapshot is taken at a VT ground boundary: the pinned generation then names a
@@ -128,7 +140,7 @@ fn flush_refreshes(
     terminal: &Terminal<'static, 'static>,
     generation: &AtomicU64,
     tx: &broadcast::Sender<PtyEvent>,
-    pending_replies: &mut Vec<oneshot::Sender<Result<RefreshData>>>,
+    pending_replies: &mut Vec<PendingRefresh>,
     pending_broadcast: &mut bool,
     degraded: bool,
 ) {
@@ -139,20 +151,28 @@ fn flush_refreshes(
     match do_refresh(terminal, refresh_gen) {
         Ok(mut data) => {
             data.degraded = degraded; // true only on the stall-timeout path
+            let data = Arc::new(data);
 
-            for reply in pending_replies.drain(..) {
-                let _ = reply.send(Ok(data.clone()));
-            }
+            // Broadcast refresh (resize / screen switch) — for every subscriber.
             if *pending_broadcast {
                 *pending_broadcast = false;
-                let _ = tx.send(PtyEvent::Refresh(Arc::new(data)));
+                let _ = tx.send(PtyEvent::Refresh(data.clone()));
+            }
+            // Per-subscriber (unary) refreshes — emit each snapshot INLINE on the
+            // data broadcast, addressed to its subscriber, so it stays ordered
+            // with the PTY data. Then ack the RPC via the reply channel.
+            for req in pending_replies.drain(..) {
+                if let Some(sid) = req.subscriber_id {
+                    let _ = tx.send(PtyEvent::RefreshFor { subscriber_id: sid, data: data.clone() });
+                }
+                let _ = req.reply.send(Ok((*data).clone()));
             }
         }
         Err(e) => {
             tracing::debug!("PTY reader: deferred refresh failed: {e}");
             *pending_broadcast = false;
-            for reply in pending_replies.drain(..) {
-                let _ = reply.send(Err(anyhow!("refresh failed: {e}")));
+            for req in pending_replies.drain(..) {
+                let _ = req.reply.send(Err(anyhow!("refresh failed: {e}")));
             }
         }
     }
@@ -186,7 +206,7 @@ fn process_read(
     batch: Bytes,
     generation: &AtomicU64,
     tx: &broadcast::Sender<PtyEvent>,
-    pending_replies: &mut Vec<oneshot::Sender<Result<RefreshData>>>,
+    pending_replies: &mut Vec<PendingRefresh>,
     pending_broadcast: &mut bool,
 ) -> u64 {
     // Stamp the next generation onto a raw chunk and broadcast it; returns the gen.
@@ -282,7 +302,7 @@ pub(super) struct Reader {
     // snapshot never pins a generation in the middle of an escape sequence (which
     // would leave an attaching client resuming on an orphaned sequence tail). The
     // live broadcast path is untouched — only refresh emission waits for ground.
-    pending_replies: Vec<oneshot::Sender<Result<RefreshData>>>,
+    pending_replies: Vec<PendingRefresh>,
     pending_broadcast_refresh: bool,
     prev_title: String,
     prev_screen: Screen,
@@ -493,9 +513,9 @@ impl Reader {
             ReaderRequest::Resize { cols, rows, reply } => {
                 let _ = reply.send(self.apply_resize(cols, rows));
             }
-            ReaderRequest::Refresh { reply } => {
+            ReaderRequest::Refresh { subscriber_id, reply } => {
                 // Queued; serviced only at a VT ground boundary (or stall timeout).
-                self.pending_replies.push(reply);
+                self.pending_replies.push(PendingRefresh { subscriber_id, reply });
             }
             ReaderRequest::Scrollback { subscriber_id, op, amount, row_count, reply } => {
                 let gen = self.shared.generation.load(Ordering::Relaxed);
@@ -563,17 +583,30 @@ impl Reader {
         self.exit_code = status.as_ref().and_then(|s| s.code());
 
         // Refreshes deferred at exit: the terminal is final, render directly
-        // without waiting for a boundary.
-        for reply in self.pending_replies.drain(..) {
+        // without waiting for a boundary. Emit inline for addressed requests too
+        // (a still-reading owner can render it; harmless otherwise), then reply.
+        for req in self.pending_replies.drain(..) {
             let gen = self.shared.generation.load(Ordering::Relaxed);
-            let _ = reply.send(do_refresh(&self.terminal, gen));
+            let result = do_refresh(&self.terminal, gen);
+            if let (Some(sid), Ok(data)) = (req.subscriber_id, &result) {
+                let _ = self.tx.send(PtyEvent::RefreshFor {
+                    subscriber_id: sid, data: Arc::new(data.clone()),
+                });
+            }
+            let _ = req.reply.send(result);
         }
         // One drain for everything still queued — replaces the per-channel loops.
         while let Ok(req) = self.req_rx.try_recv() {
             let gen = self.shared.generation.load(Ordering::Relaxed);
             match req {
-                ReaderRequest::Refresh { reply } => {
-                    let _ = reply.send(do_refresh(&self.terminal, gen));
+                ReaderRequest::Refresh { subscriber_id, reply } => {
+                    let result = do_refresh(&self.terminal, gen);
+                    if let (Some(sid), Ok(data)) = (subscriber_id, &result) {
+                        let _ = self.tx.send(PtyEvent::RefreshFor {
+                            subscriber_id: sid, data: Arc::new(data.clone()),
+                        });
+                    }
+                    let _ = reply.send(result);
                 }
                 ReaderRequest::Scrollback { subscriber_id, op, amount, row_count, reply } => {
                     let cols = self.shared.cols.load(Ordering::Relaxed);
@@ -832,7 +865,7 @@ mod process_read_tests {
 
         // Stall flush: a waiting reply + a pending broadcast, degraded=true.
         let (reply_tx, mut reply_rx) = oneshot::channel();
-        let mut replies = vec![reply_tx];
+        let mut replies = vec![PendingRefresh { subscriber_id: None, reply: reply_tx }];
         let mut pending = true;
         flush_refreshes(&t, &generation, &tx, &mut replies, &mut pending, true);
 
@@ -845,7 +878,7 @@ mod process_read_tests {
 
         // Boundary-clean flush: degraded=false.
         let (reply_tx, mut reply_rx) = oneshot::channel();
-        let mut replies = vec![reply_tx];
+        let mut replies = vec![PendingRefresh { subscriber_id: None, reply: reply_tx }];
         let mut pending = true;
         flush_refreshes(&t, &generation, &tx, &mut replies, &mut pending, false);
 
