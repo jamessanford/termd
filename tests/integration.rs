@@ -10,36 +10,119 @@ use termd::pty::PtyRegistry;
 use termd::pty::{MetadataReason, PtyEvent};
 use termd::server::make_service;
 use termd::proto::terminal_service_client::TerminalServiceClient;
-use termd::proto::{TerminalCommand, terminal_command};
-use termd::proto::{ListRequest, CreateRequest, DestroyRequest};
+use termd::proto::{
+    ListRequest, CreateRequest, DestroyRequest, ResizeRequest, RefreshRequest,
+    ScrollbackRequest, ScrollbackOpKind, Size,
+    SubscribeFrame, SubscribeEvent, SubscribeStart, WriteData,
+    subscribe_frame, subscribe_event, stream_metadata,
+};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 const TEST_TOKEN: &str = "test-token";
 
-async fn send_recv<T>(
+// A live Subscribe stream: the up-channel (frame_tx) and the down-channel
+// (event stream), plus the server-assigned subscriber_id learned from the
+// first Ready event. Dropping `frame_tx` (and the event stream) unsubscribes.
+struct Sub {
+    frame_tx: mpsc::Sender<SubscribeFrame>,
+    events: tonic::Streaming<SubscribeEvent>,
+    subscriber_id: String,
+}
+
+// Open a Subscribe stream for `pty_id` at the given size, send the mandatory
+// Start frame, and read the first event, asserting it is Ready. Returns the
+// live stream handles + subscriber_id.
+async fn subscribe<T>(
     client: &mut TerminalServiceClient<T>,
-    cmd: terminal_command::Command,
-) -> termd::proto::TerminalResponse
+    pty_id: u64,
+    cols: u32,
+    rows: u32,
+) -> Sub
 where
     T: tonic::client::GrpcService<tonic::body::Body>,
     T::Error: Into<tonic::codegen::StdError>,
     T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
 {
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
+    let (frame_tx, frame_rx) = mpsc::channel::<SubscribeFrame>(16);
+    frame_tx.send(SubscribeFrame {
+        frame: Some(subscribe_frame::Frame::Start(SubscribeStart {
+            pty_id,
+            hostname: "tester".into(),
+            size: Some(Size { cols, rows }),
+        })),
+    }).await.unwrap();
 
-    let (tx, rx) = mpsc::channel(1);
-    tx.send(TerminalCommand { command: Some(cmd) }).await.unwrap();
-    drop(tx);
-
-    let mut stream = client.stream(ReceiverStream::new(rx)).await.unwrap().into_inner();
-    stream.message().await.unwrap().unwrap()
+    let mut events = client.subscribe(ReceiverStream::new(frame_rx)).await.unwrap().into_inner();
+    let subscriber_id = match events.message().await.unwrap() {
+        Some(SubscribeEvent { event: Some(subscribe_event::Event::Ready(r)) }) => {
+            assert!(!r.subscriber_id.is_empty(), "subscriber_id must not be empty");
+            r.subscriber_id
+        }
+        other => panic!("expected Ready as first event, got {other:?}"),
+    };
+    Sub { frame_tx, events, subscriber_id }
 }
 
-// Returns (TempDir, client). Caller must hold TempDir for the test duration —
-// dropping it removes the socket file and kills the server.
+// Read events off `sub` until `f` yields Some, with a bounded timeout. Skips
+// interleaved traffic (data/metadata/etc.). Panics on timeout or stream end.
+async fn read_until<R>(
+    sub: &mut Sub,
+    secs: u64,
+    mut f: impl FnMut(subscribe_event::Event) -> Option<R>,
+) -> R {
+    tokio::time::timeout(Duration::from_secs(secs), async {
+        loop {
+            match sub.events.message().await {
+                Ok(Some(SubscribeEvent { event: Some(ev) })) => {
+                    if let Some(r) = f(ev) {
+                        return r;
+                    }
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("subscribe stream ended before expected event"),
+                Err(e) => panic!("subscribe stream error: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for expected subscribe event")
+}
+
+// Build an authed client over its OWN independent channel/connection to the
+// given socket. Each call is a separate H2 connection — dropping the returned
+// client tears that connection down (used to replicate `termd send`'s process
+// exit, where there is no shared connection kept alive afterward).
+async fn connect_client(
+    socket: std::path::PathBuf,
+) -> TerminalServiceClient<tonic::service::interceptor::InterceptedService<Channel, impl tonic::service::Interceptor>> {
+    let socket_path = socket.clone();
+    let channel = Endpoint::try_from("http://[::]:1").unwrap()
+        .connect_with_connector(service_fn(move |_| {
+            let path = socket_path.clone();
+            async move {
+                tokio::net::UnixStream::connect(path).await.map(TokioIo::new)
+            }
+        }))
+        .await
+        .unwrap();
+
+    TerminalServiceClient::with_interceptor(channel, |mut req: Request<()>| {
+        req.metadata_mut().insert(
+            "x-auth-token",
+            TEST_TOKEN.parse().unwrap(),
+        );
+        Ok(req)
+    })
+}
+
+// Returns (TempDir, socket_path, client). Caller must hold TempDir for the test
+// duration — dropping it removes the socket file and kills the server. The
+// socket_path lets a test open additional independent connections via
+// `connect_client`.
 #[allow(dead_code)]
-async fn test_server() -> (tempfile::TempDir, TerminalServiceClient<tonic::service::interceptor::InterceptedService<Channel, impl tonic::service::Interceptor>>) {
+async fn test_server() -> (tempfile::TempDir, std::path::PathBuf, TerminalServiceClient<tonic::service::interceptor::InterceptedService<Channel, impl tonic::service::Interceptor>>) {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("termd.sock");
     let registry = Arc::new(PtyRegistry::new());
@@ -55,25 +138,8 @@ async fn test_server() -> (tempfile::TempDir, TerminalServiceClient<tonic::servi
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let socket_path = socket.clone();
-    let channel = Endpoint::try_from("http://[::]:1").unwrap()
-        .connect_with_connector(service_fn(move |_| {
-            let path = socket_path.clone();
-            async move {
-                tokio::net::UnixStream::connect(path).await.map(TokioIo::new)
-            }
-        }))
-        .await
-        .unwrap();
-
-    let client = TerminalServiceClient::with_interceptor(channel, |mut req: Request<()>| {
-        req.metadata_mut().insert(
-            "x-auth-token",
-            TEST_TOKEN.parse().unwrap(),
-        );
-        Ok(req)
-    });
-    (dir, client)
+    let client = connect_client(socket.clone()).await;
+    (dir, socket, client)
 }
 
 #[tokio::test]
@@ -105,12 +171,7 @@ async fn test_auth_rejects_missing_token() {
         .unwrap();
 
     let mut client = TerminalServiceClient::new(channel);
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-    let _ = tx.send(TerminalCommand {
-        command: Some(terminal_command::Command::List(ListRequest {})),
-    }).await;
-    drop(tx);
-    let result = client.stream(tokio_stream::wrappers::ReceiverStream::new(rx)).await;
+    let result = client.list(ListRequest {}).await;
     assert!(result.is_err());
     let status = result.unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
@@ -238,68 +299,67 @@ async fn test_refresh_returns_screen_data() {
     );
 }
 
+// The unary-refresh snapshot must be emitted INLINE on the data broadcast,
+// addressed to the requesting subscriber (PtyEvent::RefreshFor) — not on a side
+// channel. Riding the same ordered channel as the PTY data is what keeps the
+// snapshot correctly sequenced relative to that data. A subscriber listening on
+// the broadcast must therefore observe a RefreshFor for its own id.
+#[tokio::test]
+async fn test_unary_refresh_emits_inline_on_broadcast() {
+    let registry = PtyRegistry::new();
+    let handle = registry.create(80, 24, None).unwrap();
+    let mut rx = handle.subscribe();
+
+    handle.deliver_refresh("sub-inline").await.unwrap();
+
+    let mut found = false;
+    while let Ok(ev) = rx.try_recv() {
+        if let PtyEvent::RefreshFor { subscriber_id, data } = ev {
+            if subscriber_id == "sub-inline" {
+                assert!(!data.data.is_empty(), "inline snapshot data should not be empty");
+                found = true;
+                break;
+            }
+        }
+    }
+    assert!(found, "unary refresh must emit RefreshFor inline on the data broadcast");
+}
+
 #[tokio::test]
 async fn test_list_empty() {
-    let (_dir, mut client) = test_server().await;
-    let resp = send_recv(&mut client, terminal_command::Command::List(ListRequest {})).await;
-    match resp.response.unwrap() {
-        termd::proto::terminal_response::Response::List(l) => assert!(l.items.is_empty()),
-        other => panic!("unexpected: {other:?}"),
-    }
+    let (_dir, _socket, mut client) = test_server().await;
+    let resp = client.list(ListRequest {}).await.unwrap().into_inner();
+    assert!(resp.items.is_empty());
 }
 
 #[tokio::test]
 async fn test_create_and_list() {
-    let (_dir, mut client) = test_server().await;
+    let (_dir, _socket, mut client) = test_server().await;
 
-    let resp = send_recv(&mut client, terminal_command::Command::Create(CreateRequest {
-        cols: 80, rows: 24, command: None,
-    })).await;
-    let pty_id = match resp.response.unwrap() {
-        termd::proto::terminal_response::Response::Create(c) => c.item.unwrap().pty_id,
-        other => panic!("unexpected: {other:?}"),
-    };
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
     assert!(pty_id != 0);
 
-    let resp = send_recv(&mut client, terminal_command::Command::List(ListRequest {})).await;
-    match resp.response.unwrap() {
-        termd::proto::terminal_response::Response::List(l) => {
-            assert_eq!(l.items.len(), 1);
-            assert_eq!(l.items[0].pty_id, pty_id);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
+    let resp = client.list(ListRequest {}).await.unwrap().into_inner();
+    assert_eq!(resp.items.len(), 1);
+    assert_eq!(resp.items[0].pty_id, pty_id);
 }
 
 #[tokio::test]
 async fn test_destroy() {
-    let (_dir, mut client) = test_server().await;
+    let (_dir, _socket, mut client) = test_server().await;
 
-    let resp = send_recv(&mut client, terminal_command::Command::Create(CreateRequest {
-        cols: 80, rows: 24, command: None,
-    })).await;
-    let pty_id = match resp.response.unwrap() {
-        termd::proto::terminal_response::Response::Create(c) => c.item.unwrap().pty_id,
-        other => panic!("unexpected: {other:?}"),
-    };
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
 
-    let resp = send_recv(&mut client, terminal_command::Command::Destroy(
-        DestroyRequest { pty_id },
-    )).await;
-    match resp.response.unwrap() {
-        termd::proto::terminal_response::Response::Command(c) => {
-            assert!(c.success, "destroy failed: {:?}", c.error);
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
+    client.destroy(DestroyRequest { pty_id }).await.expect("destroy failed");
 
-    let resp = send_recv(&mut client, terminal_command::Command::List(ListRequest {})).await;
-    match resp.response.unwrap() {
-        termd::proto::terminal_response::Response::List(l) => {
-            assert!(l.items.is_empty(), "expected empty list after destroy");
-        }
-        other => panic!("unexpected after destroy list: {other:?}"),
-    }
+    let resp = client.list(ListRequest {}).await.unwrap().into_inner();
+    assert!(resp.items.is_empty(), "expected empty list after destroy");
 }
 
 #[tokio::test]
@@ -340,11 +400,8 @@ async fn test_tcp_transport_accepts_list() {
         Ok(req)
     });
 
-    let resp = send_recv(&mut client, terminal_command::Command::List(ListRequest {})).await;
-    match resp.response.unwrap() {
-        termd::proto::terminal_response::Response::List(l) => assert!(l.items.is_empty()),
-        other => panic!("unexpected: {other:?}"),
-    }
+    let resp = client.list(ListRequest {}).await.unwrap().into_inner();
+    assert!(resp.items.is_empty());
 }
 
 #[tokio::test]
@@ -355,7 +412,7 @@ async fn test_resize_broadcasts_metadata() {
     let handle = registry.create(80, 24, None).unwrap();
     let mut rx = handle.meta_subscribe();
 
-    handle.resize(120, 40).unwrap();
+    handle.resize(120, 40).await.unwrap();
 
     let found = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -384,7 +441,7 @@ async fn test_resize_broadcasts_refresh_event() {
     let handle = registry.create(80, 24, None).unwrap();
     let mut rx = handle.subscribe();
 
-    handle.resize(120, 40).unwrap();
+    handle.resize(120, 40).await.unwrap();
 
     let found = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -467,289 +524,137 @@ async fn test_closed_broadcasts_metadata() {
 
 #[tokio::test]
 async fn test_subscribe_receives_closed_metadata() {
-    use termd::proto::{
-        terminal_command::Command, terminal_response::Response,
-        TerminalCommand, SubscribeRequest, WriteRequest, StreamMetadataReason,
-    };
+    let (_dir, _socket, mut client) = test_server().await;
 
-    let (_dir, mut client) = test_server().await;
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
 
-    // Create a PTY
-    let resp = send_recv(&mut client, Command::Create(CreateRequest {
-        cols: 80, rows: 24, command: None,
-    })).await;
-    let pty_id = match resp.response.unwrap() {
-        Response::Create(c) => c.item.unwrap().pty_id,
-        other => panic!("expected Create, got {other:?}"),
-    };
+    // Open a Subscribe stream (the subscription's lifetime is the stream).
+    let mut sub = subscribe(&mut client, pty_id, 80, 24).await;
 
-    // Open a long-lived bidi stream and subscribe
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
-    let mut resp_stream = client
-        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx))
-        .await
-        .unwrap()
-        .into_inner();
-
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest { pty_id, ..Default::default() })),
+    // Trigger PTY exit via a Write frame on the stream.
+    sub.frame_tx.send(SubscribeFrame {
+        frame: Some(subscribe_frame::Frame::Write(WriteData { data: b"exit\n".to_vec() })),
     }).await.unwrap();
 
-    // Wait for subscribe ack
-    loop {
-        match resp_stream.message().await.unwrap().unwrap().response.unwrap() {
-            Response::Subscribe(s) if s.success => break,
-            _ => {}
-        }
-    }
-
-    // Trigger PTY exit
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Write(WriteRequest {
-            pty_id,
-            data: b"exit\n".to_vec(),
-        })),
-    }).await.unwrap();
-
-    // Wait for CLOSED metadata
-    let found = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match resp_stream.message().await {
-                Ok(Some(resp)) => match resp.response.unwrap() {
-                    Response::Metadata(m)
-                        if m.reason == StreamMetadataReason::Closed as i32 => return true,
-                    _ => continue,
-                },
-                _ => return false,
-            }
-        }
-    })
-    .await
-    .unwrap_or(false);
-
-    assert!(found, "subscribe stream should deliver Closed metadata after PTY exits");
+    // Exit now arrives as Metadata::Exited on the subscribe stream.
+    read_until(&mut sub, 5, |ev| match ev {
+        subscribe_event::Event::Metadata(m) => match m.event {
+            Some(stream_metadata::Event::Exited(_)) => Some(()),
+            _ => None,
+        },
+        _ => None,
+    }).await;
 }
 
 #[tokio::test]
 async fn test_resize_via_grpc_delivers_metadata() {
-    use termd::proto::{
-        terminal_command::Command, terminal_response::Response,
-        TerminalCommand, SubscribeRequest, ResizeRequest, StreamMetadataReason,
-    };
+    let (_dir, _socket, mut client) = test_server().await;
 
-    let (_dir, mut client) = test_server().await;
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
 
-    // Create a PTY
-    let resp = send_recv(&mut client, Command::Create(CreateRequest {
-        cols: 80, rows: 24, command: None,
-    })).await;
-    let pty_id = match resp.response.unwrap() {
-        Response::Create(c) => c.item.unwrap().pty_id,
-        other => panic!("expected Create, got {other:?}"),
-    };
+    // Subscribe at the PTY's own size so the unary resize below is the only
+    // size change (a differently-sized subscriber would itself refit the PTY).
+    let mut sub = subscribe(&mut client, pty_id, 80, 24).await;
 
-    // Open a bidi stream and subscribe
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
-    let mut resp_stream = client
-        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx))
-        .await
-        .unwrap()
-        .into_inner();
-
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest { pty_id, ..Default::default() })),
+    // Unary resize.
+    client.resize(ResizeRequest {
+        pty_id,
+        size: Some(Size { cols: 120, rows: 40 }),
     }).await.unwrap();
 
-    // Drain until subscribe ack
-    loop {
-        match resp_stream.message().await.unwrap().unwrap().response.unwrap() {
-            Response::Subscribe(s) if s.success => break,
-            _ => {}
-        }
-    }
-
-    // Send resize
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Resize(ResizeRequest {
-            pty_id,
-            cols: 120,
-            rows: 40,
-        })),
-    }).await.unwrap();
-
-    // Expect StreamMetadata::Resize with updated dimensions
-    let found = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match resp_stream.message().await {
-                Ok(Some(resp)) => match resp.response.unwrap() {
-                    Response::Metadata(m)
-                        if m.reason == StreamMetadataReason::Resize as i32 => {
-                            let item = m.item.unwrap();
-                            assert_eq!(item.cols, 120);
-                            assert_eq!(item.rows, 40);
-                            return true;
-                        }
-                    _ => continue,
-                },
-                _ => return false,
+    // Resize now arrives as Metadata::Resized on the subscribe stream.
+    read_until(&mut sub, 2, |ev| match ev {
+        subscribe_event::Event::Metadata(m) => match m.event {
+            Some(stream_metadata::Event::Resized(r)) => {
+                let s = r.size.unwrap_or_default();
+                assert_eq!((s.cols, s.rows), (120, 40));
+                Some(())
             }
-        }
-    })
-    .await
-    .unwrap_or(false);
-
-    assert!(found, "resize command should deliver StreamMetadata::Resize to subscriber");
+            _ => None,
+        },
+        _ => None,
+    }).await;
 }
 
 #[tokio::test]
 async fn test_subscribe_returns_subscriber_id() {
-    use termd::proto::{
-        terminal_command::Command, terminal_response::Response,
-        TerminalCommand, SubscribeRequest,
-    };
+    let (_dir, _socket, mut client) = test_server().await;
 
-    let (_dir, mut client) = test_server().await;
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
 
-    let resp = send_recv(&mut client, Command::Create(CreateRequest {
-        cols: 80, rows: 24, command: None,
-    })).await;
-    let pty_id = match resp.response.unwrap() {
-        Response::Create(c) => c.item.unwrap().pty_id,
-        other => panic!("unexpected: {other:?}"),
-    };
-
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
-    let mut resp_stream = client
-        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx))
-        .await.unwrap().into_inner();
-
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest {
-            pty_id,
-            hostname: "tester".into(),
-            cols:     80,
-            rows:     24,
-        })),
-    }).await.unwrap();
-
-    loop {
-        if let Response::Subscribe(s) = resp_stream.message().await.unwrap().unwrap().response.unwrap() {
-            assert!(s.success, "subscribe should succeed");
-            assert!(!s.subscriber_id.is_empty(), "subscriber_id must not be empty");
-            assert_eq!(s.pty_id, pty_id, "subscribe ack should reference the correct PTY");
-            break;
-        }
-    }
+    // The subscribe ack is now the first Event::Ready(SubscribeReady{subscriber_id}).
+    // `subscribe` reads it and asserts the id is non-empty; capture it here too.
+    let sub = subscribe(&mut client, pty_id, 80, 24).await;
+    assert!(!sub.subscriber_id.is_empty(), "subscriber_id must not be empty");
 }
 
 #[tokio::test]
 async fn test_list_shows_subscribers() {
-    use termd::proto::{
-        terminal_command::Command, terminal_response::Response,
-        TerminalCommand, SubscribeRequest,
-    };
+    let (_dir, _socket, mut client) = test_server().await;
 
-    let (_dir, mut client) = test_server().await;
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
 
-    let resp = send_recv(&mut client, Command::Create(CreateRequest {
-        cols: 80, rows: 24, command: None,
-    })).await;
-    let pty_id = match resp.response.unwrap() {
-        Response::Create(c) => c.item.unwrap().pty_id,
-        other => panic!("unexpected: {other:?}"),
-    };
+    // Subscribe at the PTY's size (so the subscriber size is reported as 80x24
+    // and no refit perturbs it). `sub` stays alive so the subscriber persists.
+    let sub = subscribe(&mut client, pty_id, 80, 24).await;
+    let subscriber_id = sub.subscriber_id.clone();
 
-    // Subscribe
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
-    let mut resp_stream = client
-        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx))
-        .await.unwrap().into_inner();
-
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest {
-            pty_id,
-            hostname: "tester".into(),
-            cols:     80,
-            rows:     24,
-        })),
-    }).await.unwrap();
-
-    // Wait for subscribe ack and capture subscriber_id
-    let subscriber_id = loop {
-        match resp_stream.message().await.unwrap().unwrap().response.unwrap() {
-            Response::Subscribe(s) if s.success => break s.subscriber_id,
-            _ => {}
-        }
-    };
-
-    // List via a new single-shot stream
-    let resp = send_recv(&mut client, Command::List(ListRequest {})).await;
-    match resp.response.unwrap() {
-        Response::List(l) => {
-            let item = l.items.iter().find(|i| i.pty_id == pty_id)
+    // Poll list until the subscriber appears (registration is async w.r.t. Ready).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let resp = client.list(ListRequest {}).await.unwrap().into_inner();
+            let item = resp.items.iter().find(|i| i.pty_id == pty_id)
                 .expect("PTY not found in list");
-            assert_eq!(item.subscribers.len(), 1, "expected 1 subscriber");
-            assert_eq!(item.subscribers[0].hostname, "tester");
-            assert_eq!(item.subscribers[0].cols, 80);
-            assert_eq!(item.subscribers[0].rows, 24);
-            assert_eq!(item.subscribers[0].subscriber_id, subscriber_id,
-                "subscriber_id in list should match the one returned by Subscribe");
+            if item.subscribers.len() == 1 {
+                let s = &item.subscribers[0];
+                assert_eq!(s.hostname, "tester");
+                let size = s.size.unwrap_or_default();
+                assert_eq!((size.cols, size.rows), (80, 24));
+                assert_eq!(s.subscriber_id, subscriber_id,
+                    "subscriber_id in list should match the one from Subscribe Ready");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        other => panic!("unexpected: {other:?}"),
-    }
+    }).await.expect("subscriber did not appear in list within 5s");
 }
 
 #[tokio::test]
 async fn test_disconnect_removes_subscriber() {
-    use termd::proto::{
-        terminal_command::Command, terminal_response::Response,
-        TerminalCommand, SubscribeRequest,
-    };
+    let (_dir, _socket, mut client) = test_server().await;
 
-    let (_dir, mut client) = test_server().await;
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
 
-    let resp = send_recv(&mut client, Command::Create(CreateRequest {
-        cols: 80, rows: 24, command: None,
-    })).await;
-    let pty_id = match resp.response.unwrap() {
-        Response::Create(c) => c.item.unwrap().pty_id,
-        other => panic!("unexpected: {other:?}"),
-    };
-
-    // Subscribe, wait for ack, then drop the stream (disconnect)
+    // Subscribe, wait for Ready, then drop the stream — which unsubscribes
+    // (there is no Unsubscribe RPC; the stream's lifetime IS the subscription).
     {
-        let (sub_tx, sub_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
-        let mut sub_stream = client
-            .stream(tokio_stream::wrappers::ReceiverStream::new(sub_rx))
-            .await.unwrap().into_inner();
-
-        sub_tx.send(TerminalCommand {
-            command: Some(Command::Subscribe(SubscribeRequest {
-                pty_id,
-                hostname: "subscriber".into(),
-                cols:     80,
-                rows:     24,
-            })),
-        }).await.unwrap();
-
-        loop {
-            match sub_stream.message().await.unwrap().unwrap().response.unwrap() {
-                Response::Subscribe(s) if s.success => break,
-                _ => {}
-            }
-        }
-        // sub_tx and sub_stream drop here — client disconnect
+        let sub = subscribe(&mut client, pty_id, 80, 24).await;
+        // sub (frame_tx + event stream) drops here — client disconnect.
+        drop(sub);
     }
 
-    // Poll until the subscriber list is empty or we time out
+    // Poll until the subscriber list is empty or we time out.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let resp = send_recv(&mut client, Command::List(ListRequest {})).await;
-            if let Response::List(l) = resp.response.unwrap() {
-                let item = l.items.iter().find(|i| i.pty_id == pty_id);
-                if item.map(|i| i.subscribers.is_empty()).unwrap_or(false) {
-                    return;
-                }
+            let resp = client.list(ListRequest {}).await.unwrap().into_inner();
+            let item = resp.items.iter().find(|i| i.pty_id == pty_id);
+            if item.map(|i| i.subscribers.is_empty()).unwrap_or(false) {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -768,214 +673,262 @@ fn test_destroy_all_empties_registry() {
 
 #[tokio::test]
 async fn test_scrollback_via_grpc() {
-    let (_dir, mut client) = test_server().await;
+    let (_dir, _socket, mut client) = test_server().await;
 
-    let resp = send_recv(
-        &mut client,
-        terminal_command::Command::Create(CreateRequest { cols: 80, rows: 24, command: None }),
-    ).await;
-    let pty_id = match resp.response.unwrap() {
-        termd::proto::terminal_response::Response::Create(c) => c.item.unwrap().pty_id,
-        other => panic!("unexpected: {other:?}"),
-    };
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
 
-    let resp = send_recv(
-        &mut client,
-        terminal_command::Command::Scrollback(termd::proto::ScrollbackRequest {
-            pty_id,
-            op: termd::proto::ScrollbackOp::Open as i32,
-            amount: 0,
-            row_count: 24,
-        }),
-    ).await;
+    // Scrollback targets a live subscription by its subscriber_id, so subscribe
+    // first and keep the stream alive for the duration of the call.
+    let sub = subscribe(&mut client, pty_id, 80, 24).await;
 
-    match resp.response.unwrap() {
-        termd::proto::terminal_response::Response::Scrollback(sr) => {
-            assert_eq!(sr.pty_id, pty_id);
-            // With Point::Screen semantics total includes the active screen rows even
-            // when there is no history yet.
-            assert_eq!(sr.total_scrollback_rows, 24, "fresh PTY total should equal screen rows");
-            assert_eq!(sr.row_offset, 0, "OPEN on a fresh PTY sits at the tail");
-            assert!(sr.data.is_empty(), "blank active screen produces no VT output");
-        }
-        other => panic!("unexpected: {other:?}"),
-    }
+    let sr = client.scrollback(ScrollbackRequest {
+        pty_id,
+        subscriber_id: sub.subscriber_id.clone(),
+        kind: ScrollbackOpKind::ScrollbackOpen as i32,
+        amount: 0,
+        row_count: 24,
+    }).await.unwrap().into_inner();
+
+    // With Point::Screen semantics total includes the active screen rows even
+    // when there is no history yet.
+    assert_eq!(sr.total_scrollback_rows, 24, "fresh PTY total should equal screen rows");
+    assert_eq!(sr.row_offset, 0, "OPEN on a fresh PTY sits at the tail");
+    assert!(sr.data.is_empty(), "blank active screen produces no VT output");
 }
 
 #[tokio::test]
 async fn test_subscribe_grows_pty_to_larger_client() {
-    use termd::proto::{
-        terminal_command::Command, terminal_response::Response,
-        TerminalCommand, SubscribeRequest, StreamMetadataReason,
-    };
-
-    let (_dir, mut client) = test_server().await;
+    let (_dir, _socket, mut client) = test_server().await;
 
     // Create a PTY at 80x24.
-    let resp = send_recv(&mut client, Command::Create(CreateRequest {
-        cols: 80, rows: 24, command: None,
-    })).await;
-    let pty_id = match resp.response.unwrap() {
-        Response::Create(c) => c.item.unwrap().pty_id,
-        other => panic!("expected Create, got {other:?}"),
-    };
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
 
-    // Subscribe with a larger terminal than the PTY. handle_subscribe should grow the
-    // PTY to the subscriber's size and broadcast a Resize to the (now-)subscriber.
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
-    let mut resp_stream = client
-        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx))
-        .await.unwrap().into_inner();
+    // Subscribe with a larger terminal than the PTY. The refit should grow the
+    // PTY to the subscriber's size; assert via list (the grown PTY size).
+    let _sub = subscribe(&mut client, pty_id, 100, 40).await;
 
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest {
-            pty_id,
-            hostname: "tester".into(),
-            cols:     100,
-            rows:     40,
-        })),
-    }).await.unwrap();
-
-    // Expect a StreamMetadata::Resize carrying the grown dimensions.
-    let found = tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            match resp_stream.message().await {
-                Ok(Some(resp)) => match resp.response.unwrap() {
-                    Response::Metadata(m)
-                        if m.reason == StreamMetadataReason::Resize as i32 => {
-                            let item = m.item.unwrap();
-                            assert_eq!(item.cols, 100);
-                            assert_eq!(item.rows, 40);
-                            return true;
-                        }
-                    _ => continue,
-                },
-                _ => return false,
+            let resp = client.list(ListRequest {}).await.unwrap().into_inner();
+            let item = resp.items.iter().find(|i| i.pty_id == pty_id).expect("PTY in list");
+            let size = item.size.unwrap_or_default();
+            if (size.cols, size.rows) == (100, 40) {
+                return;
             }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    })
-    .await
-    .unwrap_or(false);
-
-    assert!(found, "subscribing with a larger client should grow the PTY and broadcast Resize");
+    }).await.expect("subscribing with a larger client should grow the PTY to 100x40");
 }
 
 #[tokio::test]
 async fn test_subscribe_shrinks_pty_for_single_smaller_client() {
-    use termd::proto::{
-        terminal_command::Command, terminal_response::Response,
-        TerminalCommand, SubscribeRequest,
-    };
-
-    let (_dir, mut client) = test_server().await;
+    let (_dir, _socket, mut client) = test_server().await;
 
     // Create a PTY at 80x24.
-    let resp = send_recv(&mut client, Command::Create(CreateRequest {
-        cols: 80, rows: 24, command: None,
-    })).await;
-    let pty_id = match resp.response.unwrap() {
-        Response::Create(c) => c.item.unwrap().pty_id,
-        other => panic!("expected Create, got {other:?}"),
-    };
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
 
     // Subscribe with a smaller terminal. With a single subscriber there are no
     // other clients to clip, so the PTY tracks it exactly and shrinks to 70x20.
-    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
-    let mut resp_stream = client
-        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx))
-        .await.unwrap().into_inner();
+    // `sub` stays alive so the subscriber is still attached.
+    let sub = subscribe(&mut client, pty_id, 70, 20).await;
 
-    cmd_tx.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest {
-            pty_id,
-            hostname: "tester".into(),
-            cols:     70,
-            rows:     20,
-        })),
-    }).await.unwrap();
-
-    // Wait for the subscribe ack so the refit has been attempted.
-    loop {
-        match resp_stream.message().await.unwrap().unwrap().response.unwrap() {
-            Response::Subscribe(s) if s.success => break,
-            _ => {}
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let resp = client.list(ListRequest {}).await.unwrap().into_inner();
+            let item = resp.items.iter().find(|i| i.pty_id == pty_id).expect("PTY in list");
+            let size = item.size.unwrap_or_default();
+            if (size.cols, size.rows) == (70, 20) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
-
-    // The PTY must have shrunk to the single subscriber's size.
-    // (cmd_tx stays alive so the subscriber is still attached.)
-    let resp = send_recv(&mut client, Command::List(ListRequest {})).await;
-    let item = match resp.response.unwrap() {
-        Response::List(l) => l.items.into_iter().find(|i| i.pty_id == pty_id).expect("PTY in list"),
-        other => panic!("expected List, got {other:?}"),
-    };
-    assert_eq!((item.cols, item.rows), (70, 20), "a single smaller client should shrink the PTY");
-    drop(cmd_tx);
+    }).await.expect("a single smaller client should shrink the PTY to 70x20");
+    drop(sub);
 }
 
 #[tokio::test]
 async fn test_subscribe_does_not_shrink_for_multiple_subscribers() {
-    use termd::proto::{
-        terminal_command::Command, terminal_response::Response,
-        TerminalCommand, SubscribeRequest,
-    };
-
-    let (_dir, mut client) = test_server().await;
+    let (_dir, _socket, mut client) = test_server().await;
 
     // Create a PTY at 80x24.
-    let resp = send_recv(&mut client, Command::Create(CreateRequest {
-        cols: 80, rows: 24, command: None,
-    })).await;
-    let pty_id = match resp.response.unwrap() {
-        Response::Create(c) => c.item.unwrap().pty_id,
-        other => panic!("expected Create, got {other:?}"),
-    };
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
 
-    // Subscriber A (100x40) on its own connection. As the sole subscriber the PTY
-    // tracks it exactly and grows to 100x40.
-    let (cmd_tx_a, cmd_rx_a) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
-    let mut resp_a = client
-        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx_a))
-        .await.unwrap().into_inner();
-    cmd_tx_a.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest {
-            pty_id, hostname: "a".into(), cols: 100, rows: 40,
-        })),
-    }).await.unwrap();
-    loop {
-        match resp_a.message().await.unwrap().unwrap().response.unwrap() {
-            Response::Subscribe(s) if s.success => break,
-            _ => {}
+    // Subscriber A (100x40). As the sole subscriber the PTY grows to 100x40.
+    let sub_a = subscribe(&mut client, pty_id, 100, 40).await;
+
+    // Wait for the grow to land before B joins.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let resp = client.list(ListRequest {}).await.unwrap().into_inner();
+            let item = resp.items.iter().find(|i| i.pty_id == pty_id).expect("PTY in list");
+            let size = item.size.unwrap_or_default();
+            if (size.cols, size.rows) == (100, 40) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
+    }).await.expect("sole subscriber A should grow the PTY to 100x40");
 
-    // Subscriber B (70x20) joins on a separate connection. With two subscribers the
-    // grow-only policy applies: the PTY must NOT shrink to the smaller client.
-    let (cmd_tx_b, cmd_rx_b) = tokio::sync::mpsc::channel::<TerminalCommand>(16);
-    let mut resp_b = client
-        .stream(tokio_stream::wrappers::ReceiverStream::new(cmd_rx_b))
-        .await.unwrap().into_inner();
-    cmd_tx_b.send(TerminalCommand {
-        command: Some(Command::Subscribe(SubscribeRequest {
-            pty_id, hostname: "b".into(), cols: 70, rows: 20,
-        })),
-    }).await.unwrap();
-    loop {
-        match resp_b.message().await.unwrap().unwrap().response.unwrap() {
-            Response::Subscribe(s) if s.success => break,
-            _ => {}
+    // Subscriber B (70x20) joins. With two subscribers the grow-only policy
+    // applies: the PTY must NOT shrink to the smaller client.
+    let sub_b = subscribe(&mut client, pty_id, 70, 20).await;
+
+    // Poll list until B is registered (2 subscribers), then assert the PTY size.
+    let size = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let resp = client.list(ListRequest {}).await.unwrap().into_inner();
+            let item = resp.items.iter().find(|i| i.pty_id == pty_id).expect("PTY in list");
+            if item.subscribers.len() == 2 {
+                return item.size.unwrap_or_default();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }
+    }).await.expect("both subscribers should be registered");
 
-    // Both subscribers stay attached (cmd_tx_a/cmd_tx_b alive). The PTY must remain
-    // at the larger size rather than shrinking to B.
-    let resp = send_recv(&mut client, Command::List(ListRequest {})).await;
-    let item = match resp.response.unwrap() {
-        Response::List(l) => l.items.into_iter().find(|i| i.pty_id == pty_id).expect("PTY in list"),
-        other => panic!("expected List, got {other:?}"),
-    };
-    assert_eq!((item.cols, item.rows), (100, 40),
+    assert_eq!((size.cols, size.rows), (100, 40),
         "with multiple subscribers the PTY must not shrink to a smaller client");
-    drop(cmd_tx_a);
-    drop(cmd_tx_b);
+    drop(sub_a);
+    drop(sub_b);
+}
+
+// Refresh is now a unary ack returning (); the snapshot arrives on the matching
+// Subscribe stream as Event::Refresh, ordered against live output. Port of the
+// in-process refresh smoke test to the gRPC data plane.
+#[tokio::test]
+async fn test_refresh_delivers_snapshot_on_stream() {
+    let (_dir, _socket, mut client) = test_server().await;
+
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
+
+    let mut sub = subscribe(&mut client, pty_id, 80, 24).await;
+
+    // Unary refresh ack (returns ()).
+    client.refresh(RefreshRequest {
+        pty_id,
+        subscriber_id: sub.subscriber_id.clone(),
+    }).await.expect("refresh ack");
+
+    // The snapshot arrives as Event::Refresh on the subscribe stream.
+    let (size, data) = read_until(&mut sub, 5, |ev| match ev {
+        subscribe_event::Event::Refresh(rf) => Some((rf.size.unwrap_or_default(), rf.data)),
+        _ => None,
+    }).await;
+
+    assert_eq!((size.cols, size.rows), (80, 24), "refresh snapshot should carry the PTY size");
+    assert!(!data.is_empty(), "refresh data should not be empty");
+    assert!(
+        data.starts_with(b"\x1b["),
+        "refresh data should start with an ANSI escape sequence"
+    );
+}
+
+// Live concern #1: the `termd send` pattern. A client opens a Subscribe stream,
+// sends Start + Write, waits for Ready, then drops the stream. The written bytes
+// MUST still reach the PTY (the queued Write must not be lost to the stream-close
+// race). We observe delivery via a SECOND, long-lived subscriber's Event::Data.
+//
+// This is the WEAK form: the sender shares the long-lived `client` (and its H2
+// connection), so the server has unbounded time to drain the buffered Write even
+// after the stream is dropped. It proves the server reads a queued Write, but not
+// that it survives connection teardown. See the strong form below.
+#[tokio::test]
+async fn test_send_pattern_delivers_bytes_to_pty() {
+    let (_dir, _socket, mut client) = test_server().await;
+
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
+
+    // Observer subscriber stays attached for the whole test.
+    let mut observer = subscribe(&mut client, pty_id, 80, 24).await;
+
+    // The "send" client: subscribe, write, wait for Ready (already done by
+    // `subscribe`), then drop immediately — exactly the termd-send shape.
+    {
+        let sender = subscribe(&mut client, pty_id, 80, 24).await;
+        sender.frame_tx.send(SubscribeFrame {
+            frame: Some(subscribe_frame::Frame::Write(WriteData {
+                data: b"echo __termd_send__\n".to_vec(),
+            })),
+        }).await.unwrap();
+        // Drop the sender stream right after queueing the write.
+        drop(sender);
+    }
+
+    // The bytes must reach the PTY: the observer sees the echoed text in output.
+    read_until(&mut observer, 5, |ev| match ev {
+        subscribe_event::Event::Data(d) => {
+            if String::from_utf8_lossy(&d.data).contains("__termd_send__") {
+                Some(())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }).await;
+}
+
+// Live concern #1 — STRONG form. This reproduces the actual `termd send` teardown:
+// the sender runs on its OWN independent connection (its own `Channel`/H2
+// connection, like a separate process), queues a Write right after Ready, then
+// the entire sender client — channel and all — is dropped, tearing the connection
+// down. This is the race the reviewer flagged: the queued Write must reach the PTY
+// before the connection RST aborts the Subscribe stream server-side. Delivery is
+// observed on a SEPARATELY-connected, long-lived observer so the sender's
+// connection is the only thing keeping the Write alive — and it isn't.
+#[tokio::test]
+async fn test_send_pattern_survives_connection_teardown() {
+    let (_dir, socket, mut client) = test_server().await;
+
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
+
+    // Observer on the original (long-lived) connection.
+    let mut observer = subscribe(&mut client, pty_id, 80, 24).await;
+
+    // The sender gets a brand-new, independent connection. After queueing the
+    // Write we drop EVERYTHING the sender owns — the Sub (frame_tx + event
+    // stream) and its client/channel — replicating `termd send` exiting.
+    {
+        let mut sender_client = connect_client(socket.clone()).await;
+        let sender = subscribe(&mut sender_client, pty_id, 80, 24).await;
+        sender.frame_tx.send(SubscribeFrame {
+            frame: Some(subscribe_frame::Frame::Write(WriteData {
+                data: b"echo __termd_teardown__\n".to_vec(),
+            })),
+        }).await.unwrap();
+        drop(sender);
+        drop(sender_client);
+    }
+
+    // Despite the sender's connection being gone, the bytes must have reached the
+    // PTY: the independently-connected observer sees the echoed text.
+    read_until(&mut observer, 5, |ev| match ev {
+        subscribe_event::Event::Data(d) => {
+            if String::from_utf8_lossy(&d.data).contains("__termd_teardown__") {
+                Some(())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }).await;
 }

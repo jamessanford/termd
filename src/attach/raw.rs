@@ -9,11 +9,8 @@ impl RawHandler {
 }
 
 impl super::RenderModeHandler for RawHandler {
-    fn init(&mut self, refresh_data: &[u8], buffered: &[(u64, Vec<u8>)], out: &mut Vec<u8>) -> Result<super::EventResult> {
+    fn init(&mut self, refresh_data: &[u8], out: &mut Vec<u8>) -> Result<super::EventResult> {
         out.extend_from_slice(refresh_data);
-        for (_gen, data) in buffered {
-            out.extend_from_slice(data);
-        }
         Ok(super::EventResult::Continue)
     }
 
@@ -47,19 +44,9 @@ mod tests {
     fn init_writes_refresh_data() {
         let mut h = RawHandler::new();
         let mut out = Vec::new();
-        let result = h.init(b"hello", &[], &mut out).unwrap();
+        let result = h.init(b"hello", &mut out).unwrap();
         assert!(matches!(result, EventResult::Continue));
         assert_eq!(out, b"hello");
-    }
-
-    #[test]
-    fn init_replays_buffered_chunks() {
-        let mut h = RawHandler::new();
-        let mut out = Vec::new();
-        let buffered = vec![(2, b"world".to_vec())];
-        let result = h.init(b"hello", &buffered, &mut out).unwrap();
-        assert!(matches!(result, EventResult::Continue));
-        assert_eq!(out, b"helloworld");
     }
 
     #[test]

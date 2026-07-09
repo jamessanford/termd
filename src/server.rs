@@ -52,172 +52,287 @@ pub fn make_service(
     )
 }
 
-async fn dispatch_command(
-    cmd:            proto::TerminalCommand,
-    registry:       &Arc<PtyRegistry>,
-    subscriber_id:  &str,
-    subscribed_ids: &mut std::collections::HashSet<u64>,
-    sub_tasks:      &mut std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
-    sub_tx:         &tokio::sync::mpsc::Sender<(u64, PtyEvent)>,
-) -> proto::TerminalResponse {
-    use proto::terminal_command::Command;
-    match cmd.command {
-        None => proto::TerminalResponse {
-            response: Some(proto::terminal_response::Response::Command(
-                proto::CommandResponse { pty_id: 0, success: false, error: Some("unknown command".into()) }
-            )),
-        },
-        Some(Command::List(_r))        => commands::handle_list(registry),
-        Some(Command::Create(r))       => commands::handle_create(registry, r),
-        Some(Command::Destroy(r))      => commands::handle_destroy(registry, r, subscriber_id, subscribed_ids, sub_tasks),
-        Some(Command::Subscribe(r))    => commands::handle_subscribe(registry, r, subscriber_id, subscribed_ids, sub_tasks, sub_tx),
-        Some(Command::Unsubscribe(r))  => commands::handle_unsubscribe(registry, r, subscriber_id, subscribed_ids, sub_tasks),
-        Some(Command::Write(r))        => commands::handle_write(registry, r),
-        Some(Command::Resize(r))       => commands::handle_resize(registry, r),
-        Some(Command::SetTitle(r))     => commands::handle_set_title(registry, r),
-        Some(Command::Refresh(r))      => commands::handle_refresh(registry, r).await,
-        Some(Command::Scrollback(r))   => commands::handle_scrollback(registry, r, subscriber_id).await,
-    }
+/// Owns exactly one Subscribe stream's bookkeeping and reaps it on drop — whether
+/// the forwarding task ends cleanly or unwinds (panic). Doing the cleanup from
+/// `Drop` rather than as straight-line code after the loop means a panicking
+/// handler can't strand this subscriber's entry on its PTY. See docs/REAP.md for
+/// the bug this hardens against.
+struct StreamReaper {
+    registry:      Arc<PtyRegistry>,
+    pty_id:        u64,
+    subscriber_id: String,
 }
 
-/// Owns one connection's subscription bookkeeping and reaps it on drop — whether
-/// the stream task ends cleanly or unwinds (panic). Doing the cleanup from `Drop`
-/// rather than as straight-line code after the loop means a panicking handler
-/// can't strand this client's subscriber entries on their PTYs. See docs/REAP.md
-/// for the bug this hardens against.
-struct ConnReaper {
-    registry:       Arc<PtyRegistry>,
-    subscriber_id:  String,
-    subscribed_ids: std::collections::HashSet<u64>,
-    sub_tasks:      std::collections::HashMap<u64, tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for ConnReaper {
+impl Drop for StreamReaper {
     fn drop(&mut self) {
         tracing::debug!(
             subscriber_id = %self.subscriber_id,
-            ptys = ?self.subscribed_ids,
-            "stream ended, reaping subscriber"
+            pty_id = self.pty_id,
+            "subscribe stream ended, reaping subscriber"
         );
-        for &pty_id in &self.subscribed_ids {
-            if let Some(handle) = self.registry.get(pty_id) {
-                handle.close_scrollback(&self.subscriber_id);
-                handle.remove_subscriber(&self.subscriber_id);
-                handle.broadcast_metadata(Arc::new(PtyMetadata {
-                    reason:     MetadataReason::SubscribersChanged,
-                    exit_code:  None,
-                    generation: handle.current_generation(),
-                    info:       handle.info(),
-                }));
-            }
-        }
-        for (_, t) in self.sub_tasks.drain() {
-            t.abort();
+        if let Some(handle) = self.registry.get(self.pty_id) {
+            handle.close_scrollback(&self.subscriber_id);
+            handle.remove_subscriber(&self.subscriber_id);
+            handle.broadcast_metadata(Arc::new(PtyMetadata {
+                reason:     MetadataReason::SubscribersChanged,
+                exit_code:  None,
+                generation: handle.current_generation(),
+                info:       handle.info(),
+            }));
         }
     }
+}
+
+/// Map one internal `PtyEvent` to its wire `SubscribeEvent`. `generation` never
+/// appears on the wire (the per-PTY stream + ordered refresh make it unneeded).
+fn refresh_to_proto(rd: &crate::pty::RefreshData) -> proto::RefreshData {
+    proto::RefreshData {
+        data:     rd.data.to_vec(),
+        size:     Some(proto::Size { cols: rd.cols, rows: rd.rows }),
+        degraded: rd.degraded,
+    }
+}
+
+fn event_to_subscribe(event: PtyEvent) -> proto::SubscribeEvent {
+    use proto::subscribe_event::Event;
+    let inner = match event {
+        PtyEvent::Data(chunk) => Event::Data(proto::StreamData { data: chunk.data.to_vec() }),
+        PtyEvent::Refresh(rd) => Event::Refresh(refresh_to_proto(&rd)),
+        // Per-subscriber snapshot — the caller has already confirmed it's ours
+        // (the subscriber_id filter lives in the forwarding loop).
+        PtyEvent::RefreshFor { data, .. } => Event::Refresh(refresh_to_proto(&data)),
+        PtyEvent::Metadata(meta) => {
+            use proto::stream_metadata::Event as MetaEvent;
+            let inner = match meta.reason {
+                MetadataReason::Resize => MetaEvent::Resized(proto::Resized {
+                    size: Some(proto::Size { cols: meta.info.cols, rows: meta.info.rows }),
+                }),
+                MetadataReason::TitleChanged => MetaEvent::TitleChanged(proto::TitleChanged {
+                    title: meta.info.title.clone(),
+                }),
+                MetadataReason::Closed => MetaEvent::Exited(proto::Exited {
+                    exit_code: meta.exit_code.unwrap_or_default(),
+                }),
+                MetadataReason::SubscribersChanged => MetaEvent::SubscribersChanged(
+                    proto::SubscribersChanged {
+                        subscribers: commands::pty_info_to_item(meta.info.clone()).subscribers,
+                    },
+                ),
+            };
+            Event::Metadata(proto::StreamMetadata { event: Some(inner) })
+        }
+    };
+    proto::SubscribeEvent { event: Some(inner) }
 }
 
 #[tonic::async_trait]
 impl TerminalService for TerminalServiceImpl {
-    type StreamStream = tokio_stream::wrappers::ReceiverStream<Result<proto::TerminalResponse, Status>>;
-
-    async fn stream(
+    async fn list(
         &self,
-        request: Request<Streaming<proto::TerminalCommand>>,
-    ) -> Result<Response<Self::StreamStream>, Status> {
-        use std::collections::{HashMap, HashSet};
+        request: Request<proto::ListRequest>,
+    ) -> Result<Response<proto::ListResponse>, Status> {
+        if self.log_grpc { tracing::debug!(request = ?request.get_ref(), "gRPC list"); }
+        Ok(Response::new(commands::handle_list(&self.registry)))
+    }
+
+    async fn create(
+        &self,
+        request: Request<proto::CreateRequest>,
+    ) -> Result<Response<proto::PtyItem>, Status> {
+        if self.log_grpc { tracing::debug!(request = ?request.get_ref(), "gRPC create"); }
+        commands::handle_create(&self.registry, request.into_inner()).map(Response::new)
+    }
+
+    async fn destroy(
+        &self,
+        request: Request<proto::DestroyRequest>,
+    ) -> Result<Response<()>, Status> {
+        if self.log_grpc { tracing::debug!(request = ?request.get_ref(), "gRPC destroy"); }
+        commands::handle_destroy(&self.registry, request.into_inner()).map(Response::new)
+    }
+
+    async fn resize(
+        &self,
+        request: Request<proto::ResizeRequest>,
+    ) -> Result<Response<proto::PtyItem>, Status> {
+        if self.log_grpc { tracing::debug!(request = ?request.get_ref(), "gRPC resize"); }
+        commands::handle_resize(&self.registry, request.into_inner()).await.map(Response::new)
+    }
+
+    async fn set_title(
+        &self,
+        request: Request<proto::SetTitleRequest>,
+    ) -> Result<Response<proto::PtyItem>, Status> {
+        if self.log_grpc { tracing::debug!(request = ?request.get_ref(), "gRPC set_title"); }
+        commands::handle_set_title(&self.registry, request.into_inner()).map(Response::new)
+    }
+
+    async fn refresh(
+        &self,
+        request: Request<proto::RefreshRequest>,
+    ) -> Result<Response<()>, Status> {
+        if self.log_grpc { tracing::debug!(request = ?request.get_ref(), "gRPC refresh"); }
+        commands::handle_refresh(&self.registry, request.into_inner()).await.map(Response::new)
+    }
+
+    async fn scrollback(
+        &self,
+        request: Request<proto::ScrollbackRequest>,
+    ) -> Result<Response<proto::ScrollbackResponse>, Status> {
+        if self.log_grpc { tracing::debug!(request = ?request.get_ref(), "gRPC scrollback"); }
+        commands::handle_scrollback(&self.registry, request.into_inner()).await.map(Response::new)
+    }
+
+    type SubscribeStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::SubscribeEvent, Status>>;
+
+    async fn subscribe(
+        &self,
+        request: Request<Streaming<proto::SubscribeFrame>>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        use proto::subscribe_frame::Frame;
+        use proto::subscribe_event::Event;
         use tokio::sync::mpsc;
+        use tokio::sync::broadcast::error::RecvError;
         use tokio_stream::StreamExt;
+        use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 
         let registry = self.registry.clone();
         let log_grpc = self.log_grpc;
         let mut inbound = request.into_inner();
 
-        let (resp_tx, resp_rx) = mpsc::channel::<Result<proto::TerminalResponse, Status>>(256);
-        let (sub_tx, mut sub_rx) = mpsc::channel::<(u64, PtyEvent)>(1024);
+        // First frame must be SubscribeStart, naming the PTY to attach to.
+        let start = match inbound.message().await? {
+            Some(proto::SubscribeFrame { frame: Some(Frame::Start(start)) }) => start,
+            _ => return Err(Status::invalid_argument("expected SubscribeStart as first frame")),
+        };
+
+        let handle = registry
+            .get(start.pty_id)
+            .ok_or_else(|| Status::not_found("PTY not found"))?;
+        let pty_id = start.pty_id;
+
+        // Server-assigned id — the client learns it via SubscribeReady.
+        let subscriber_id = uuid::Uuid::new_v4().to_string();
+
+        let (resp_tx, resp_rx) =
+            mpsc::channel::<Result<proto::SubscribeEvent, Status>>(256);
+
+        // First event: hand the client its subscriber_id.
+        if resp_tx
+            .send(Ok(proto::SubscribeEvent {
+                event: Some(Event::Ready(proto::SubscribeReady {
+                    subscriber_id: subscriber_id.clone(),
+                })),
+            }))
+            .await
+            .is_err()
+        {
+            // Client already gone; nothing registered yet, so nothing to reap.
+            return Ok(Response::new(ReceiverStream::new(resp_rx)));
+        }
+
+        // Subscribe to the broadcast channels BEFORE apply_subscribe so we don't
+        // miss the Resize this subscriber's own refit (inside apply_subscribe)
+        // may broadcast — the client wants to see itself refit the PTY.
+        let mut data_rx = handle.subscribe();
+        let meta_rx = handle.meta_subscribe();
+
+        let size = start.size.unwrap_or_default();
+        let info = crate::pty::SubscriberInfo {
+            hostname:   start.hostname,
+            cols:       size.cols,
+            rows:       size.rows,
+            created_at: std::time::SystemTime::now(),
+        };
+        commands::apply_subscribe(&handle, &subscriber_id, info).await;
 
         tokio::spawn(async move {
-            // All subscription bookkeeping lives in the reaper so it's cleaned up on
-            // drop — covering both a clean loop exit and an unwind. Nothing below
-            // needs a manual cleanup block.
-            let mut reaper = ConnReaper {
-                registry:       registry.clone(),
-                subscriber_id:  uuid::Uuid::new_v4().to_string(),
-                subscribed_ids: HashSet::new(),
-                sub_tasks:      HashMap::new(),
+            // Reaper drops on clean exit OR unwind, reaping the subscriber.
+            // Owned by this task so the cleanup is panic-safe (see docs/REAP.md).
+            let _reaper = StreamReaper {
+                registry:      registry.clone(),
+                pty_id,
+                subscriber_id: subscriber_id.clone(),
+            };
+
+            let mut meta_stream = BroadcastStream::new(meta_rx);
+            // Once the meta stream is exhausted (sender dropped) it yields `None`
+            // immediately and forever; gate its select arm so we stop polling it
+            // and don't busy-spin while the data arm is still serving.
+            let mut meta_done = false;
+
+            // Build a DataLost event (broadcast lag → client should Refresh).
+            let data_lost = || proto::SubscribeEvent {
+                event: Some(Event::Metadata(proto::StreamMetadata {
+                    event: Some(proto::stream_metadata::Event::DataLost(proto::DataLost {})),
+                })),
             };
 
             loop {
                 tokio::select! {
-                    cmd = inbound.next() => {
-                        match cmd {
-                            None => break,
-                            Some(Err(e)) => {
-                                tracing::warn!("stream read error: {e}");
-                                break;
+                    item = data_rx.recv() => {
+                        match item {
+                            // A per-subscriber refresh snapshot rides the data
+                            // broadcast addressed to one subscriber. Skip it unless
+                            // it's ours — ordering relative to data is guaranteed
+                            // because the reader sequences it inline on this channel.
+                            Ok(PtyEvent::RefreshFor { subscriber_id: ref sid, .. })
+                                if *sid != subscriber_id => {}
+                            Ok(event) => {
+                                let ev = event_to_subscribe(event);
+                                if resp_tx.send(Ok(ev)).await.is_err() { break; }
                             }
-                            Some(Ok(cmd)) => {
-                                if log_grpc { tracing::debug!(command = ?cmd, "gRPC request"); }
-                                let resp = dispatch_command(
-                                    cmd, &registry, &reaper.subscriber_id,
-                                    &mut reaper.subscribed_ids, &mut reaper.sub_tasks, &sub_tx,
-                                ).await;
-                                if log_grpc { tracing::debug!(response = ?resp, "gRPC response"); }
-                                if resp_tx.send(Ok(resp)).await.is_err() { break; }
+                            Err(RecvError::Lagged(n)) => {
+                                tracing::debug!(subscriber_id = %subscriber_id, lagged = n, "data stream lagged");
+                                if resp_tx.send(Ok(data_lost())).await.is_err() { break; }
+                            }
+                            Err(RecvError::Closed) => break,
+                        }
+                    }
+                    item = meta_stream.next(), if !meta_done => {
+                        match item {
+                            Some(Ok(meta)) => {
+                                let ev = event_to_subscribe(PtyEvent::Metadata(meta));
+                                if resp_tx.send(Ok(ev)).await.is_err() { break; }
+                            }
+                            Some(Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n))) => {
+                                tracing::debug!(subscriber_id = %subscriber_id, lagged = n, "meta stream lagged");
+                                // A lagged-away Resize/TitleChanged is also repaired
+                                // by a refresh (RefreshData carries the size).
+                                if resp_tx.send(Ok(data_lost())).await.is_err() { break; }
+                            }
+                            // Meta channel closed: park this arm, keep serving data.
+                            None => meta_done = true,
+                        }
+                    }
+                    msg = inbound.message() => {
+                        match msg {
+                            Ok(Some(proto::SubscribeFrame { frame: Some(Frame::Write(w)) })) => {
+                                if let Err(e) = handle.write(&w.data) {
+                                    tracing::debug!(subscriber_id = %subscriber_id, "pty write error: {e}");
+                                }
+                            }
+                            Ok(Some(proto::SubscribeFrame { frame: Some(Frame::Start(_)) })) => {
+                                tracing::warn!(subscriber_id = %subscriber_id, "unexpected SubscribeStart after first frame; ignoring");
+                            }
+                            Ok(Some(proto::SubscribeFrame { frame: None })) => {
+                                tracing::debug!(subscriber_id = %subscriber_id, "empty SubscribeFrame; ignoring");
+                            }
+                            Ok(None) => break,        // client closed the up-stream
+                            Err(e) => {
+                                if log_grpc { tracing::debug!(subscriber_id = %subscriber_id, "subscribe read error: {e}"); }
+                                break;
                             }
                         }
                     }
-                    Some((pty_id, event)) = sub_rx.recv() => {
-                        let resp = match event {
-                            PtyEvent::Data(chunk) => proto::TerminalResponse {
-                                response: Some(proto::terminal_response::Response::Stream(
-                                    proto::StreamData { pty_id, generation: chunk.generation, data: chunk.data.to_vec() }
-                                )),
-                            },
-                            PtyEvent::Refresh(rd) => proto::TerminalResponse {
-                                response: Some(proto::terminal_response::Response::Refresh(
-                                    proto::RefreshResponse {
-                                        pty_id,
-                                        generation: rd.generation,
-                                        data: rd.data.to_vec(),
-                                        cols: rd.cols,
-                                        rows: rd.rows,
-                                        degraded: rd.degraded,
-                                    }
-                                )),
-                            },
-                            PtyEvent::Metadata(meta) => {
-                                use proto::StreamMetadataReason;
-                                let reason = match meta.reason {
-                                    MetadataReason::Resize             => StreamMetadataReason::Resize,
-                                    MetadataReason::Closed             => StreamMetadataReason::Closed,
-                                    MetadataReason::TitleChanged       => StreamMetadataReason::TitleChanged,
-                                    MetadataReason::SubscribersChanged => StreamMetadataReason::SubscribersChanged,
-                                };
-                                proto::TerminalResponse {
-                                    response: Some(proto::terminal_response::Response::Metadata(
-                                        proto::StreamMetadata {
-                                            pty_id,
-                                            item:       Some(commands::pty_info_to_item(meta.info.clone())),
-                                            reason:     reason as i32,
-                                            exit_code:  meta.exit_code,
-                                            generation: meta.generation,
-                                        }
-                                    )),
-                                }
-                            }
-                        };
-                        if resp_tx.send(Ok(resp)).await.is_err() { break; }
-                    }
                 }
             }
-
-            // `reaper` drops here — on a clean exit or an unwind — reaping this
-            // client's subscriptions and aborting its forwarding tasks.
-            drop(reaper);
+            // `_reaper` drops here — clean exit or unwind — reaping this subscriber
+            // from its PTY.
         });
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(resp_rx)))
+        Ok(Response::new(ReceiverStream::new(resp_rx)))
     }
 }
 
