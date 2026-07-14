@@ -201,6 +201,13 @@ const RESET_TERMINAL_MODES: &str = concat!(
     "\x1b[?25h",    // show cursor
     "\x1b[?1l",     // DECCKM - normal cursor keys
     "\x1b>",        // DECNKM - normal keypad mode
+    "\x1b[?2026l",    // end synchronized output (a cut stream mid-sync freezes rendering)
+    "\x1b]8;;\x1b\\", // close any unterminated OSC 8 hyperlink
+    "\x1b]104\x1b\\", // reset OSC 4 palette redefinitions to the terminal's configured defaults
+    "\x1b]110\x1b\\", // reset dynamic default foreground (undo OSC 10)
+    "\x1b]111\x1b\\", // reset dynamic default background (undo OSC 11)
+    "\x1b]112\x1b\\", // reset dynamic cursor color (undo OSC 12)
+    "\x1b]0;\x1b\\",  // clear window title (undo OSC 0/2; session pop in run() restores the original)
     "\x1b(B",       // reset G0 character set to ASCII
     "\x1b)B",       // reset G1 character set to ASCII
     "\x1b*B",       // reset G2 character set to ASCII
@@ -606,6 +613,15 @@ pub async fn run(
     }
 
     let _guard = setup_raw_mode()?;
+
+    // Save the client terminal's title on the xterm title stack; PTY output and the
+    // reset-path title clears overwrite it freely during the session, and the matching
+    // pop at the bottom restores it. Terminals without a title stack ignore both.
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(b"\x1b[22;0t");
+        let _ = std::io::stdout().flush();
+    }
 
     let mut current_pty_id = item.pty_id;
     let mut current_item = item;
@@ -1084,6 +1100,12 @@ pub async fn run(
         }
     }
 
+    // Restore the client terminal's original title (matches the push at session start).
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(b"\x1b[23;0t");
+        let _ = std::io::stdout().flush();
+    }
     move_terminal_end();
     drop(_guard);
     Ok(())

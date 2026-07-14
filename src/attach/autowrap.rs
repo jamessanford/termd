@@ -23,6 +23,11 @@ pub(super) struct WrapInjector {
     prev_x: u16,
     prev_y: u16,
     server_rows: u32,
+    /// The DECSTBM region currently established on the client (1-based),
+    /// tracked so it can be re-established after a client resize (terminals
+    /// reset scroll margins to full screen when the window is resized).
+    region_top: u32,
+    region_bottom: u32,
 }
 
 impl WrapInjector {
@@ -38,6 +43,8 @@ impl WrapInjector {
             prev_x: 0,
             prev_y: 0,
             server_rows,
+            region_top: 1,
+            region_bottom: server_rows,
         })
     }
 
@@ -49,6 +56,10 @@ impl WrapInjector {
     pub(super) fn resize(&mut self, server_cols: u32, server_rows: u32) -> Result<()> {
         self.term.resize(server_cols as u16, server_rows as u16, 0, 0)?;
         self.server_rows = server_rows;
+        // The resize resets the tracked terminal's scroll margins (as any
+        // terminal's does); mirror that in the region we consider established.
+        self.region_top = 1;
+        self.region_bottom = server_rows;
         // The resize may clamp the cursor; rebaseline so the next printable
         // isn't misread as a wrap.
         self.prev_x = self.term.cursor_x()?;
@@ -67,12 +78,16 @@ impl WrapInjector {
         self.prev_x = 0;
         self.prev_y = 0;
         self.server_rows = server_rows;
+        self.region_top = 1;
+        self.region_bottom = server_rows;
         Ok(())
     }
 
     /// Emit the DECSTBM that establishes the vertical scroll region the
     /// client must use: top margin always 1, bottom margin the server rows.
-    pub(super) fn emit_region_setup(&self, out: &mut Vec<u8>) {
+    pub(super) fn emit_region_setup(&mut self, out: &mut Vec<u8>) {
+        self.region_top = 1;
+        self.region_bottom = self.server_rows;
         write!(out, "\x1b[1;{}r", self.server_rows).ok();
     }
 
@@ -80,9 +95,30 @@ impl WrapInjector {
     /// cursor, then ED2 clears any stale client content (from a previous
     /// render mode, or client columns/rows beyond the server's) before the
     /// repaint is replayed.
-    pub(super) fn emit_screen_setup(&self, out: &mut Vec<u8>) {
+    pub(super) fn emit_screen_setup(&mut self, out: &mut Vec<u8>) {
         self.emit_region_setup(out);
         out.extend_from_slice(b"\x1b[2J");
+    }
+
+    /// Re-establish the scroll region after the *client* terminal was resized:
+    /// terminals reset DECSTBM to the full screen on resize, which would let
+    /// output run past the server's last row instead of scrolling there.
+    /// Re-emit the tracked region (which homes the cursor) and put the cursor
+    /// back where the tracked terminal says it is. (A DECSLRM left margin was
+    /// also reset by the resize and is not restored; the follow-up repaint is
+    /// what cleans up such deeper state.)
+    pub(super) fn restore_client_region(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        write!(out, "\x1b[{};{}r", self.region_top, self.region_bottom).ok();
+        let cx = self.term.cursor_x()? as u32;
+        let cy = self.term.cursor_y()? as u32;
+        // Under DECOM, CUP rows are relative to the region top.
+        let row = if self.term.mode(libghostty_vt::terminal::Mode::ORIGIN)? {
+            cy + 2 - self.region_top
+        } else {
+            cy + 1
+        };
+        write!(out, "\x1b[{};{}H", row, cx + 1).ok();
+        Ok(())
     }
 
     /// Emit any held unit bytes verbatim. Only valid at end-of-life (Closed or
@@ -154,7 +190,7 @@ impl WrapInjector {
     /// Pass a completed, held control unit to the client, rewriting the few
     /// sequences that contend with our region setup. Mirrors region.rs's
     /// dispatch_csi, minus the DECSLRM/DECLRMM handling autowrap doesn't need.
-    fn rewrite_control(&self, cx: u16, cy: u16, out: &mut Vec<u8>) {
+    fn rewrite_control(&mut self, cx: u16, cy: u16, out: &mut Vec<u8>) {
         let u = &self.unit;
         if u.as_slice() == b"\x1bc" {
             // RIS: pass through (clears + homes the client), then re-establish
@@ -190,6 +226,8 @@ impl WrapInjector {
                     bottom
                 };
                 let top = if top >= bottom { 1 } else { top };
+                self.region_top = top;
+                self.region_bottom = bottom;
                 write!(out, "\x1b[{};{}r", top, bottom).ok();
                 return;
             }
@@ -278,14 +316,18 @@ impl super::RenderModeHandler for AutowrapHandler {
         Ok(super::EventResult::Continue)
     }
 
-    fn on_sigwinch(&mut self, cols: u32, rows: u32, _out: &mut Vec<u8>) -> Result<super::EventResult> {
+    fn on_sigwinch(&mut self, cols: u32, rows: u32, out: &mut Vec<u8>) -> Result<super::EventResult> {
         if !super::server_fits_client(self.server_cols, self.server_rows, cols, rows) {
             return Ok(super::EventResult::ChangeRenderMode(super::RenderMode::Cell));
         }
-        // The client width/height changed but the transformed stream is
-        // width-agnostic for any client >= server, so there is nothing to
-        // re-emit; the existing region setup and injected breaks remain valid.
-        Ok(super::EventResult::Continue)
+        // The transformed stream is width-agnostic for any client >= server,
+        // but the resize reset the client's scroll margins (terminals reset
+        // DECSTBM to the full screen on resize), so output would stop
+        // scrolling at the server's last row. Restore the region and cursor
+        // inline so the live stream stays correct, then request a repaint to
+        // clean up whatever the resize reflow did to the screen.
+        self.inj.restore_client_region(out)?;
+        Ok(super::EventResult::RequestRefresh)
     }
 
     fn cleanup(&mut self, out: &mut Vec<u8>) {
@@ -490,7 +532,7 @@ mod tests {
 
     #[test]
     fn region_setup_emits_decstbm() {
-        let wi = WrapInjector::new(4, 3).unwrap();
+        let mut wi = WrapInjector::new(4, 3).unwrap();
         let mut out = Vec::new();
         wi.emit_region_setup(&mut out);
         assert_eq!(out, b"\x1b[1;3r");
@@ -575,7 +617,7 @@ mod tests {
         // stale client content never survives a (re)attach. We test the
         // injector method directly because handler.init consults the real
         // terminal size, which is (0,0) in the test environment.
-        let wi = WrapInjector::new(80, 24).unwrap();
+        let mut wi = WrapInjector::new(80, 24).unwrap();
         let mut out = Vec::new();
         wi.emit_screen_setup(&mut out);
         assert_eq!(out, b"\x1b[1;24r\x1b[2J");
@@ -594,5 +636,102 @@ mod tests {
             EventResult::ChangeRenderMode(RenderMode::Cell) => {}
             _ => panic!("expected fallback to Cell"),
         }
+    }
+}
+
+#[cfg(test)]
+mod client_view {
+    //! Tests that replay the injector's output into a second (larger)
+    //! libghostty terminal standing in for the client, verifying the
+    //! vertical behavior the raw byte assertions above can't see.
+    use super::*;
+
+    fn screen_rows(client: &Terminal<'_, '_>, cols: u16, rows: u16) -> Vec<String> {
+        let mut out = Vec::new();
+        for y in 0..rows {
+            let mut line = String::new();
+            for x in 0..cols {
+                let gr = client
+                    .grid_ref(libghostty_vt::terminal::Point::Active(
+                        libghostty_vt::terminal::PointCoordinate { x, y: y as u32 },
+                    ))
+                    .unwrap();
+                let cp = gr.cell().unwrap().codepoint().unwrap();
+                line.push(char::from_u32(cp).filter(|c| *c != '\0').unwrap_or(' '));
+            }
+            out.push(line.trim_end().to_string());
+        }
+        out
+    }
+
+    #[test]
+    fn taller_client_scrolls_at_server_bottom() {
+        // Server 4x3, client 10x6: the region setup must make the client
+        // scroll at row 3, keeping the last three lines in rows 0..2.
+        let mut wi = WrapInjector::new(4, 3).unwrap();
+        let mut out = Vec::new();
+        wi.emit_screen_setup(&mut out);
+        wi.process(b"a\r\nb\r\nc\r\nd\r\ne", &mut out).unwrap();
+        let mut client = Terminal::new(TerminalOptions { cols: 10, rows: 6, max_scrollback: 0 }).unwrap();
+        client.vt_write(&out);
+        assert_eq!(screen_rows(&client, 10, 6), vec!["c", "d", "e", "", "", ""]);
+        assert!(client.cursor_y().unwrap() <= 2);
+    }
+
+    #[test]
+    fn client_resize_restores_region_and_scrolling() {
+        // A client window resize resets the client's scroll margins; the
+        // restore emitted for SIGWINCH must re-establish the region (and the
+        // cursor position) so subsequent output keeps scrolling at the
+        // server's last row instead of walking into the extra client rows.
+        let mut wi = WrapInjector::new(4, 3).unwrap();
+        let mut out = Vec::new();
+        wi.emit_screen_setup(&mut out);
+        wi.process(b"a\r\nb\r\nc", &mut out).unwrap();
+        let mut client = Terminal::new(TerminalOptions { cols: 10, rows: 6, max_scrollback: 0 }).unwrap();
+        client.vt_write(&out);
+
+        // The user makes the client window even taller: margins reset.
+        client.resize(10, 8, 0, 0).unwrap();
+        out.clear();
+        wi.restore_client_region(&mut out).unwrap();
+        client.vt_write(&out);
+
+        out.clear();
+        wi.process(b"\r\nd\r\ne", &mut out).unwrap();
+        client.vt_write(&out);
+        assert_eq!(
+            screen_rows(&client, 10, 8),
+            vec!["c", "d", "e", "", "", "", "", ""],
+            "output must keep scrolling inside the server's 3 rows"
+        );
+        assert!(client.cursor_y().unwrap() <= 2);
+    }
+
+    #[test]
+    fn restore_preserves_app_scroll_region() {
+        // The app set its own DECSTBM; the restore must re-emit that region,
+        // not the full-server one.
+        let mut wi = WrapInjector::new(80, 24).unwrap();
+        let mut out = Vec::new();
+        wi.emit_screen_setup(&mut out);
+        wi.process(b"\x1b[5;20r\x1b[10;3H", &mut out).unwrap();
+        out.clear();
+        wi.restore_client_region(&mut out).unwrap();
+        assert_eq!(out, b"\x1b[5;20r\x1b[10;3H");
+    }
+
+    #[test]
+    fn restore_cursor_is_region_relative_under_decom() {
+        // With origin mode on, the restoring CUP must be relative to the
+        // region top (absolute row 10 inside a region starting at row 5 is
+        // region-relative row 6).
+        let mut wi = WrapInjector::new(80, 24).unwrap();
+        let mut out = Vec::new();
+        wi.emit_screen_setup(&mut out);
+        wi.process(b"\x1b[5;20r\x1b[?6h\x1b[6;3H", &mut out).unwrap();
+        out.clear();
+        wi.restore_client_region(&mut out).unwrap();
+        assert_eq!(out, b"\x1b[5;20r\x1b[6;3H");
     }
 }

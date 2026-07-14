@@ -108,6 +108,17 @@ pub(crate) fn do_refresh(
     // mirroring how the formatter restores via CSI = flags ; 1 u); CSI > 4 ; 0 m turns off
     // xterm modifyOtherKeys.
     out.extend_from_slice(b"\x1b[=0;1u\x1b[>4;0m");
+    // Dynamic colors and title are the same shape as the keyboard modes: the formatter
+    // emits OSC 10/11/12 / OSC 0 only when the PTY has a non-default value, so residual
+    // state from the previous PTY must be cleared explicitly.  The bg reset (OSC 111)
+    // must precede the 2J below so the screen clears to the true default background.
+    out.extend_from_slice(b"\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\");
+    out.extend_from_slice(b"\x1b]0;\x1b\\");
+    // Residual state with no formatter-side restore at all: a stuck ?2026 begin-sync
+    // (a cut stream would leave rendering frozen), an unterminated OSC 8 hyperlink,
+    // and OSC 4 palette redefinitions (OSC 104 resets entries to the terminal's
+    // configured defaults; palette:false above stays restore-side only).
+    out.extend_from_slice(b"\x1b[?2026l\x1b]8;;\x1b\\\x1b]104\x1b\\");
     out.extend_from_slice(b"\x1b[2J\x1b[H");
     let vt = fmt.format_alloc(None)?;
     out.extend_from_slice(&vt);
@@ -451,6 +462,72 @@ mod scrollback_tests {
         let r = do_refresh(&terminal, 1).unwrap();
         assert!(find(&r.data, b"\x1b[=0;1u").is_some(), "missing kitty clear for plain PTY");
         assert!(find(&r.data, b"\x1b[>4;0m").is_some(), "missing modifyOtherKeys clear for plain PTY");
+    }
+
+    #[test]
+    fn do_refresh_clears_dynamic_colors_when_pty_has_none() {
+        // A PTY with no OSC 10/11/12 overrides: the formatter emits nothing, so the
+        // preamble resets must clear any residual colors on the client (same pattern
+        // as the keyboard-mode clears).
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"plain shell");
+        let r = do_refresh(&terminal, 1).unwrap();
+        assert!(find(&r.data, b"\x1b]110\x1b\\").is_some(), "missing default-fg reset (OSC 110)");
+        assert!(find(&r.data, b"\x1b]111\x1b\\").is_some(), "missing default-bg reset (OSC 111)");
+        assert!(find(&r.data, b"\x1b]112\x1b\\").is_some(), "missing cursor-color reset (OSC 112)");
+    }
+
+    #[test]
+    fn do_refresh_restores_cursor_color_after_clear() {
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"\x1b]12;#ff8800\x1b\\");
+        let r = do_refresh(&terminal, 1).unwrap();
+        let clear = find(&r.data, b"\x1b]112\x1b\\").expect("preamble missing cursor-color reset");
+        let restore = find(&r.data, b"\x1b]12;rgb:ff/88/00").expect("missing cursor-color restore");
+        assert!(clear < restore, "cursor-color reset must precede restore");
+    }
+
+    #[test]
+    fn do_refresh_clears_bg_before_erasing_screen() {
+        // The 2J in the preamble must run against the terminal's true default
+        // background, not a stale OSC 11 override from the previous PTY.
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"plain shell");
+        let r = do_refresh(&terminal, 1).unwrap();
+        let reset = find(&r.data, b"\x1b]111\x1b\\").expect("missing default-bg reset");
+        let erase = find(&r.data, b"\x1b[2J").expect("missing clear-screen");
+        assert!(reset < erase, "default-bg reset must precede clear-screen");
+    }
+
+    #[test]
+    fn do_refresh_clears_hyperlink_palette_and_sync() {
+        // Residual client state with no formatter-side restore at all: an
+        // unterminated OSC 8 hyperlink, OSC 4 palette redefinitions
+        // (palette:false is restore-side only), and a stuck ?2026 begin-sync.
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"plain shell");
+        let r = do_refresh(&terminal, 1).unwrap();
+        assert!(find(&r.data, b"\x1b]8;;\x1b\\").is_some(), "missing hyperlink close (OSC 8)");
+        assert!(find(&r.data, b"\x1b]104\x1b\\").is_some(), "missing palette reset (OSC 104)");
+        assert!(find(&r.data, b"\x1b[?2026l").is_some(), "missing synchronized-output disable");
+    }
+
+    #[test]
+    fn do_refresh_clears_title_when_pty_has_none() {
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"plain shell");
+        let r = do_refresh(&terminal, 1).unwrap();
+        assert!(find(&r.data, b"\x1b]0;\x1b\\").is_some(), "missing empty-title clear");
+    }
+
+    #[test]
+    fn do_refresh_restores_title_after_clear() {
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"\x1b]0;my window\x1b\\");
+        let r = do_refresh(&terminal, 1).unwrap();
+        let clear = find(&r.data, b"\x1b]0;\x1b\\").expect("preamble missing empty-title clear");
+        let restore = find(&r.data, b"\x1b]0;my window").expect("missing title restore");
+        assert!(clear < restore, "title clear must precede restore");
     }
 
     #[test]
