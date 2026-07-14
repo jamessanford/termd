@@ -103,16 +103,30 @@ impl AttachClient {
         AttachClient { child, master: master.into() }
     }
 
-    /// Collect everything the client writes to its terminal for `dur`.
-    fn drain(&mut self, dur: Duration) -> Vec<u8> {
+    /// Collect the client's terminal output until `marker` has been seen, then
+    /// keep reading for a short settle window so trailing bytes of the same
+    /// burst (which negative assertions depend on) are captured too. Panics if
+    /// the marker never shows up within the timeout.
+    fn drain_until(&mut self, marker: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
-        let deadline = Instant::now() + dur;
+        let timeout = Instant::now() + Duration::from_secs(5);
+        let mut deadline: Option<Instant> = None;
         let mut chunk = [0u8; 65536];
-        while Instant::now() < deadline {
+        loop {
             match self.master.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                Err(_) => std::thread::sleep(Duration::from_millis(25)),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+            if deadline.is_none() && find(&buf, marker).is_some() {
+                deadline = Some(Instant::now() + Duration::from_millis(250));
+            }
+            match deadline {
+                Some(d) if Instant::now() >= d => break,
+                None if Instant::now() >= timeout => {
+                    panic!("marker {marker:?} never arrived; got {} bytes: {buf:?}", buf.len())
+                }
+                _ => {}
             }
         }
         buf
@@ -165,11 +179,14 @@ fn attach_clears_colors_and_title_on_switch_and_exit() {
     std::thread::sleep(Duration::from_millis(500));
 
     let mut client = AttachClient::spawn(&daemon, &pty_a, 80, 24);
-    let attach = client.drain(Duration::from_millis(1500));
+    // The OSC 12 restore is the last of the color restores in the refresh blob.
+    let attach = client.drain_until(b"\x1b]12;rgb:ff/88/00");
     client.write(b"\x011"); // C-a 1: switch to PTY B (0-indexed list)
-    let switch = client.drain(Duration::from_millis(1500));
+    // DECSTR appears only in the refresh preamble, so seeing it means B's
+    // refresh (one write) has started arriving; the settle catches the rest.
+    let switch = client.drain_until(b"\x1b[!p");
     client.write(b"\x01d"); // C-a d: detach
-    let detach = client.drain(Duration::from_millis(1500));
+    let detach = client.drain_until(b"\x1b[23;0t");
 
     // Attach: the client saves the host title, and the refresh restores A's
     // colors and title.
@@ -183,6 +200,9 @@ fn attach_clears_colors_and_title_on_switch_and_exit() {
     assert!(contains(&switch, b"\x1b]111\x1b\\"), "missing default-bg reset on switch");
     assert!(contains(&switch, b"\x1b]112\x1b\\"), "missing cursor-color reset on switch");
     assert!(contains(&switch, b"\x1b]0;\x1b\\"), "missing empty-title clear on switch");
+    assert!(contains(&switch, b"\x1b[?2026l"), "missing synchronized-output disable on switch");
+    assert!(contains(&switch, b"\x1b]8;;\x1b\\"), "missing hyperlink close on switch");
+    assert!(contains(&switch, b"\x1b]104\x1b\\"), "missing palette reset on switch");
     let bg_reset = find(&switch, b"\x1b]111\x1b\\").unwrap();
     let erase = rfind(&switch, b"\x1b[2J").expect("missing clear-screen on switch");
     assert!(bg_reset < erase, "default-bg reset must precede the refresh 2J");

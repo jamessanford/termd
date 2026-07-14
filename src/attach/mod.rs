@@ -201,6 +201,9 @@ const RESET_TERMINAL_MODES: &str = concat!(
     "\x1b[?25h",    // show cursor
     "\x1b[?1l",     // DECCKM - normal cursor keys
     "\x1b>",        // DECNKM - normal keypad mode
+    "\x1b[?2026l",    // end synchronized output (a cut stream mid-sync freezes rendering)
+    "\x1b]8;;\x1b\\", // close any unterminated OSC 8 hyperlink
+    "\x1b]104\x1b\\", // reset OSC 4 palette redefinitions to the terminal's configured defaults
     "\x1b]110\x1b\\", // reset dynamic default foreground (undo OSC 10)
     "\x1b]111\x1b\\", // reset dynamic default background (undo OSC 11)
     "\x1b]112\x1b\\", // reset dynamic cursor color (undo OSC 12)

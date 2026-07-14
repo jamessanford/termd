@@ -69,19 +69,27 @@ def find_binary() -> str:
 BIN = find_binary()
 
 
-def drain(fd: int, duration: float) -> bytes:
-    """Read everything the client writes to its terminal for `duration` seconds."""
+def drain_until(fd: int, marker: bytes, timeout: float = 5.0, settle: float = 0.25) -> bytes:
+    """Read the client's terminal output until `marker` is seen, then keep
+    reading for a short settle window so trailing bytes of the same burst
+    (which the negative assertions depend on) are captured too."""
     os.set_blocking(fd, False)
     buf = b""
-    deadline = time.time() + duration
-    while time.time() < deadline:
+    hard_deadline = time.time() + timeout
+    deadline = None
+    while True:
         try:
             chunk = os.read(fd, 65536)
             if chunk:
                 buf += chunk
         except (BlockingIOError, OSError):
-            time.sleep(0.05)
-    return buf
+            time.sleep(0.01)
+        if deadline is None and marker in buf:
+            deadline = time.time() + settle
+        if deadline is not None and time.time() >= deadline:
+            return buf
+        if deadline is None and time.time() >= hard_deadline:
+            sys.exit(f"marker {marker!r} never arrived; got {len(buf)} bytes: {buf!r}")
 
 
 def main() -> int:
@@ -118,11 +126,14 @@ def main() -> int:
             stdin=slave, stdout=slave, stderr=subprocess.DEVNULL, close_fds=True)
         os.close(slave)
 
-        attach = drain(master, 1.5)
+        # The OSC 12 restore is the last of the color restores in the refresh blob.
+        attach = drain_until(master, b"\x1b]12;rgb:ff/88/00")
         os.write(master, b"\x011")  # C-a 1: switch to PTY B (0-indexed list)
-        switch = drain(master, 1.5)
+        # DECSTR appears only in the refresh preamble, so seeing it means B's
+        # refresh (one write) has started arriving; the settle catches the rest.
+        switch = drain_until(master, b"\x1b[!p")
         os.write(master, b"\x01d")  # C-a d: detach
-        detach = drain(master, 1.5)
+        detach = drain_until(master, b"\x1b[23;0t")
 
         client.terminate()
         try:
@@ -143,6 +154,9 @@ def main() -> int:
             ("switch: default-fg reset (OSC 110)", b"\x1b]110\x1b\\" in switch),
             ("switch: default-bg reset (OSC 111)", b"\x1b]111\x1b\\" in switch),
             ("switch: empty-title clear", b"\x1b]0;\x1b\\" in switch),
+            ("switch: synchronized-output disable", b"\x1b[?2026l" in switch),
+            ("switch: hyperlink close", b"\x1b]8;;\x1b\\" in switch),
+            ("switch: palette reset (OSC 104)", b"\x1b]104\x1b\\" in switch),
             ("switch: bg reset precedes 2J",
              b"\x1b]111\x1b\\" in switch
              and switch.find(b"\x1b]111\x1b\\") < switch.rfind(b"\x1b[2J")),

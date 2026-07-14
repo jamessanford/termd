@@ -114,6 +114,11 @@ pub(crate) fn do_refresh(
     // must precede the 2J below so the screen clears to the true default background.
     out.extend_from_slice(b"\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\");
     out.extend_from_slice(b"\x1b]0;\x1b\\");
+    // Residual state with no formatter-side restore at all: a stuck ?2026 begin-sync
+    // (a cut stream would leave rendering frozen), an unterminated OSC 8 hyperlink,
+    // and OSC 4 palette redefinitions (OSC 104 resets entries to the terminal's
+    // configured defaults; palette:false above stays restore-side only).
+    out.extend_from_slice(b"\x1b[?2026l\x1b]8;;\x1b\\\x1b]104\x1b\\");
     out.extend_from_slice(b"\x1b[2J\x1b[H");
     let vt = fmt.format_alloc(None)?;
     out.extend_from_slice(&vt);
@@ -492,6 +497,19 @@ mod scrollback_tests {
         let reset = find(&r.data, b"\x1b]111\x1b\\").expect("missing default-bg reset");
         let erase = find(&r.data, b"\x1b[2J").expect("missing clear-screen");
         assert!(reset < erase, "default-bg reset must precede clear-screen");
+    }
+
+    #[test]
+    fn do_refresh_clears_hyperlink_palette_and_sync() {
+        // Residual client state with no formatter-side restore at all: an
+        // unterminated OSC 8 hyperlink, OSC 4 palette redefinitions
+        // (palette:false is restore-side only), and a stuck ?2026 begin-sync.
+        let mut terminal = make_terminal(80, 24, 1000);
+        terminal.vt_write(b"plain shell");
+        let r = do_refresh(&terminal, 1).unwrap();
+        assert!(find(&r.data, b"\x1b]8;;\x1b\\").is_some(), "missing hyperlink close (OSC 8)");
+        assert!(find(&r.data, b"\x1b]104\x1b\\").is_some(), "missing palette reset (OSC 104)");
+        assert!(find(&r.data, b"\x1b[?2026l").is_some(), "missing synchronized-output disable");
     }
 
     #[test]
