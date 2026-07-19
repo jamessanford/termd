@@ -24,7 +24,7 @@ fn best_fit_size(subscribers: &[(String, crate::pty::SubscriberInfo)]) -> Option
 /// With multiple subscribers (`allow_shrink == false`) we only ever grow: the PTY
 /// expands only when every subscriber can accommodate a larger box (neither
 /// dimension would shrink). A smaller client never shrinks the PTY out from under
-/// the others — it letterboxes via region/cell mode instead. Auto-shrinking under
+/// the others — it letterboxes via cell mode instead. Auto-shrinking under
 /// multiple clients is disorienting (the shell reflows and content jumps).
 ///
 /// With a single subscriber (`allow_shrink == true`) there are no other clients to

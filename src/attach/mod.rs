@@ -30,8 +30,6 @@ pub enum RenderMode {
     Cell,
     /// Raw PTY byte passthrough
     Raw,
-    /// Raw passthrough within a DECSTBM scroll region
-    Region,
     /// Raw passthrough with libghostty-driven explicit wrap injection
     Autowrap,
 }
@@ -65,10 +63,6 @@ fn create_handler(
     Ok(match mode {
         RenderMode::Cell => Box::new(cell::CellHandler::new(server_cols, server_rows, upgrade_to)?),
         RenderMode::Raw => Box::new(raw::RawHandler::new()),
-        RenderMode::Region => {
-            let (client_cols, client_rows) = get_terminal_size();
-            Box::new(region::RegionHandler::new(server_rows, server_cols, client_rows, client_cols))
-        }
         RenderMode::Autowrap => Box::new(autowrap::AutowrapHandler::new(server_cols, server_rows)?),
     })
 }
@@ -107,11 +101,36 @@ pub(super) struct Subscription {
     pub subscriber_id: String,
 }
 
+/// Half-close-and-drain teardown for a Subscribe stream. Bare-dropping the
+/// stream RSTs it, and h2 >= 0.4.15 discards buffered DATA once a reset is
+/// scheduled — losing any still-queued Write (e.g. keystrokes read in the same
+/// stdin chunk as a chord). Dropping only `frame_tx` half-closes gracefully;
+/// the server processes inbound frames in order and ends the response stream
+/// on half-close, so draining to stream end confirms every Write reached the
+/// PTY. Timeout-capped so a wedged server can't hang teardown; on a broken
+/// transport the drain errors out immediately.
+async fn close_subscription(sub: Subscription) {
+    let Subscription { frame_tx, mut event_rx, .. } = sub;
+    drop(frame_tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Ok(Some(_)) = event_rx.message().await {}
+    })
+    .await;
+}
+
+/// Fire-and-forget `close_subscription` for mid-session teardowns (PTY switch,
+/// create, resubscribe): the drain runs in the background so the switch never
+/// waits on a server round-trip.
+fn close_subscription_bg(sub: &mut Option<Subscription>) {
+    if let Some(s) = sub.take() {
+        tokio::spawn(close_subscription(s));
+    }
+}
+
 mod autowrap;
 mod cell;
 mod help;
 mod raw;
-mod region;
 mod scrollback;
 
 use crate::AuthedClient;
@@ -376,11 +395,15 @@ fn prev_pty(list: &[PtyItem], current_id: u64) -> Option<&PtyItem> {
 // dropping the current Subscribe stream (which unsubscribes server-side) and
 // opening a new one for the target PTY.
 fn switch_pty(
+    sub:             &mut Option<Subscription>,
     current_pty_id:  &mut u64,
     current_item:    &mut PtyItem,
     previous_pty_id: &mut Option<u64>,
     new_item:        PtyItem,
 ) {
+    // Tear down the old PTY's stream gracefully (in the background, so the
+    // switch never waits on the server) rather than letting callers bare-drop it.
+    close_subscription_bg(sub);
     *previous_pty_id = Some(std::mem::replace(current_pty_id, new_item.pty_id));
     *current_item = new_item;
 }
@@ -631,7 +654,6 @@ pub async fn run(
     let mut sub: Option<Subscription> = None;
 
     let upgrade_to = match mode {
-        RenderMode::Region => Some(RenderMode::Region),
         RenderMode::Autowrap => Some(RenderMode::Autowrap),
         _ => None,
     };
@@ -709,7 +731,7 @@ pub async fn run(
                 match show_list(client, &mut pty_list, current_pty_id, &mut stdin).await? {
                     Some(new_id) => {
                         if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-                            switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
+                            switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                             pty_list.clear();
                         }
                         continue 'session;
@@ -929,14 +951,14 @@ pub async fn run(
                 break 'session;
             }
             RunOutcome::Resubscribe => {
-                // Drop the current Subscribe stream (server reaps it) and reopen it
-                // for the same PTY with the current size on the next 'session pass.
-                // Reached by SIGWINCH refit, DataLost resync, or a graceful stream
-                // close while the transport is healthy — none of which warrant the
-                // reconnect banner. If the PTY is actually gone, the reopen's
-                // refresh returns None and routes to the list.
+                // Close the current Subscribe stream (drained in the background)
+                // and reopen it for the same PTY with the current size on the next
+                // 'session pass. Reached by SIGWINCH refit, DataLost resync, or a
+                // graceful stream close while the transport is healthy — none of
+                // which warrant the reconnect banner. If the PTY is actually gone,
+                // the reopen's refresh returns None and routes to the list.
                 reset_terminal_modes();
-                sub = None;
+                close_subscription_bg(&mut sub);
                 continue 'session;
             }
             RunOutcome::PtyClosed => {
@@ -947,7 +969,7 @@ pub async fn run(
                 match show_list(client, &mut pty_list, current_pty_id, &mut stdin).await? {
                     Some(new_id) => {
                         if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-                            switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
+                            switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                             pty_list.clear();
                         }
                     }
@@ -974,7 +996,7 @@ pub async fn run(
                         };
                         match auto_target {
                             Some(target) if target.pty_id != current_pty_id => {
-                                switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
+                                switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                                 pty_list.clear();
                             }
                             _ => { skip_subscribe = true; }
@@ -1005,8 +1027,7 @@ pub async fn run(
                             command: None,
                         }).await);
                         let new_item = created.into_inner();
-                        sub = None;
-                        switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, new_item);
+                        switch_pty(&mut sub,&mut current_pty_id, &mut current_item, &mut previous_pty_id, new_item);
                         pty_list.clear();
                     }
 
@@ -1016,8 +1037,7 @@ pub async fn run(
                         }
                         if let Some(target) = next_pty(&pty_list, current_pty_id).cloned() {
                             if target.pty_id != current_pty_id {
-                                sub = None;
-                                switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
+                                switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                             }
                         }
                     }
@@ -1028,8 +1048,7 @@ pub async fn run(
                         }
                         if let Some(target) = prev_pty(&pty_list, current_pty_id).cloned() {
                             if target.pty_id != current_pty_id {
-                                sub = None;
-                                switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
+                                switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                             }
                         }
                     }
@@ -1038,8 +1057,7 @@ pub async fn run(
                         if ensure_list(client, &mut pty_list).await {
                             if let Some(target) = recent_pty(&pty_list, &previous_pty_id, current_pty_id).await.cloned() {
                                 if target.pty_id != current_pty_id {
-                                    sub = None;
-                                    switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
+                                    switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                                 }
                             }
                         }
@@ -1051,8 +1069,7 @@ pub async fn run(
                         }
                         if let Some(target) = pty_list.get(n as usize).cloned() {
                             if target.pty_id != current_pty_id {
-                                sub = None;
-                                switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
+                                switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                             }
                         }
                     }
@@ -1061,8 +1078,7 @@ pub async fn run(
                         match show_list(client, &mut pty_list, current_pty_id, &mut stdin).await? {
                             Some(new_id) if new_id != current_pty_id => {
                                 if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-                                    sub = None;
-                                    switch_pty(&mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
+                                    switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
                                     pty_list.clear();
                                 }
                             }
@@ -1098,6 +1114,13 @@ pub async fn run(
                 }
             }
         }
+    }
+
+    // Flush any Write still queued on the stream (e.g. keystrokes read in the
+    // same stdin chunk as the detach chord) before tearing it down. On a broken
+    // transport this fails fast rather than waiting out the timeout.
+    if let Some(s) = sub.take() {
+        close_subscription(s).await;
     }
 
     // Restore the client terminal's original title (matches the push at session start).

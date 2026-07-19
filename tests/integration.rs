@@ -699,6 +699,58 @@ async fn test_scrollback_via_grpc() {
     assert!(sr.data.is_empty(), "blank active screen produces no VT output");
 }
 
+// The `termd dump` pattern: a one-shot screen snapshot via the unary Scrollback
+// RPC with a synthetic subscriber_id — no Subscribe stream at all. The
+// subscriber_id is only a pin key server-side, so OPEN at the tail returns the
+// visible screen, and CLOSE removes the pin so nothing leaks.
+#[tokio::test]
+async fn test_scrollback_dump_pattern_needs_no_subscription() {
+    let (_dir, _socket, mut client) = test_server().await;
+
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
+
+    // Get some text onto the screen (via a real subscriber, like a shell user),
+    // and wait until it has actually rendered.
+    let mut writer = subscribe(&mut client, pty_id, 80, 24).await;
+    writer.frame_tx.send(SubscribeFrame {
+        frame: Some(subscribe_frame::Frame::Write(WriteData {
+            data: b"echo __dump_marker__\n".to_vec(),
+        })),
+    }).await.unwrap();
+    read_until(&mut writer, 5, |ev| match ev {
+        subscribe_event::Event::Data(d)
+            if String::from_utf8_lossy(&d.data).contains("__dump_marker__") => Some(()),
+        _ => None,
+    }).await;
+
+    // The dump: OPEN at the tail with a subscriber_id no subscription owns.
+    let sr = client.scrollback(ScrollbackRequest {
+        pty_id,
+        subscriber_id: "dump-test".into(),
+        kind: ScrollbackOpKind::ScrollbackOpen as i32,
+        amount: 0,
+        row_count: 24,
+    }).await.unwrap().into_inner();
+    assert!(
+        String::from_utf8_lossy(&sr.data).contains("__dump_marker__"),
+        "dump must contain the visible screen text, got: {:?}",
+        String::from_utf8_lossy(&sr.data)
+    );
+
+    // CLOSE removes the pin; returns no rows.
+    let sr = client.scrollback(ScrollbackRequest {
+        pty_id,
+        subscriber_id: "dump-test".into(),
+        kind: ScrollbackOpKind::ScrollbackClose as i32,
+        amount: 0,
+        row_count: 0,
+    }).await.unwrap().into_inner();
+    assert!(sr.data.is_empty(), "CLOSE returns no rows");
+}
+
 #[tokio::test]
 async fn test_subscribe_grows_pty_to_larger_client() {
     let (_dir, _socket, mut client) = test_server().await;
@@ -837,10 +889,27 @@ async fn test_refresh_delivers_snapshot_on_stream() {
     );
 }
 
+// Half-close-and-drain teardown for a send-style subscriber: drop the
+// up-channel (graceful END_STREAM, not the RST_STREAM a full drop causes),
+// then read events until the server ends the response stream. The server
+// processes inbound frames in order and closes the stream on half-close, so
+// stream end is positive confirmation every queued Write reached the PTY.
+async fn close_and_drain(sub: Sub) {
+    let Sub { frame_tx, mut events, .. } = sub;
+    drop(frame_tx);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(_) = events.message().await.expect("drain error") {}
+    })
+    .await
+    .expect("timed out draining subscribe stream after half-close");
+}
+
 // Live concern #1: the `termd send` pattern. A client opens a Subscribe stream,
-// sends Start + Write, waits for Ready, then drops the stream. The written bytes
-// MUST still reach the PTY (the queued Write must not be lost to the stream-close
-// race). We observe delivery via a SECOND, long-lived subscriber's Event::Data.
+// sends Start + Write, waits for Ready, half-closes the up-stream, and drains
+// events to end-of-stream before exiting. The written bytes MUST reach the PTY
+// (a bare drop would RST the stream and can discard the buffered Write — h2
+// >= 0.4.15 enforces this). We observe delivery via a SECOND, long-lived
+// subscriber's Event::Data.
 //
 // This is the WEAK form: the sender shares the long-lived `client` (and its H2
 // connection), so the server has unbounded time to drain the buffered Write even
@@ -859,7 +928,7 @@ async fn test_send_pattern_delivers_bytes_to_pty() {
     let mut observer = subscribe(&mut client, pty_id, 80, 24).await;
 
     // The "send" client: subscribe, write, wait for Ready (already done by
-    // `subscribe`), then drop immediately — exactly the termd-send shape.
+    // `subscribe`), then half-close and drain — exactly the termd-send shape.
     {
         let sender = subscribe(&mut client, pty_id, 80, 24).await;
         sender.frame_tx.send(SubscribeFrame {
@@ -867,8 +936,7 @@ async fn test_send_pattern_delivers_bytes_to_pty() {
                 data: b"echo __termd_send__\n".to_vec(),
             })),
         }).await.unwrap();
-        // Drop the sender stream right after queueing the write.
-        drop(sender);
+        close_and_drain(sender).await;
     }
 
     // The bytes must reach the PTY: the observer sees the echoed text in output.
@@ -886,12 +954,12 @@ async fn test_send_pattern_delivers_bytes_to_pty() {
 
 // Live concern #1 — STRONG form. This reproduces the actual `termd send` teardown:
 // the sender runs on its OWN independent connection (its own `Channel`/H2
-// connection, like a separate process), queues a Write right after Ready, then
-// the entire sender client — channel and all — is dropped, tearing the connection
-// down. This is the race the reviewer flagged: the queued Write must reach the PTY
-// before the connection RST aborts the Subscribe stream server-side. Delivery is
-// observed on a SEPARATELY-connected, long-lived observer so the sender's
-// connection is the only thing keeping the Write alive — and it isn't.
+// connection, like a separate process), queues a Write right after Ready,
+// half-closes and drains to end-of-stream, and only THEN is the entire sender
+// client — channel and all — dropped, tearing the connection down (the process
+// exiting). Draining to stream end before teardown is what guarantees the Write
+// reached the PTY; delivery is observed on a SEPARATELY-connected, long-lived
+// observer so nothing of the sender's survives to help it along.
 #[tokio::test]
 async fn test_send_pattern_survives_connection_teardown() {
     let (_dir, socket, mut client) = test_server().await;
@@ -905,8 +973,9 @@ async fn test_send_pattern_survives_connection_teardown() {
     let mut observer = subscribe(&mut client, pty_id, 80, 24).await;
 
     // The sender gets a brand-new, independent connection. After queueing the
-    // Write we drop EVERYTHING the sender owns — the Sub (frame_tx + event
-    // stream) and its client/channel — replicating `termd send` exiting.
+    // Write it half-closes and drains to stream end, then EVERYTHING the sender
+    // owns — event stream, client, channel — is dropped, replicating `termd
+    // send` exiting.
     {
         let mut sender_client = connect_client(socket.clone()).await;
         let sender = subscribe(&mut sender_client, pty_id, 80, 24).await;
@@ -915,7 +984,7 @@ async fn test_send_pattern_survives_connection_teardown() {
                 data: b"echo __termd_teardown__\n".to_vec(),
             })),
         }).await.unwrap();
-        drop(sender);
+        close_and_drain(sender).await;
         drop(sender_client);
     }
 

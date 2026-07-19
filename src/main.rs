@@ -153,6 +153,19 @@ enum Cmd {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Print a PTY's screen contents
+    Dump {
+        pty_id: String,
+        /// Rows to print, counting back from the bottom of the screen
+        /// (default: the PTY's height; more reaches into scrollback)
+        #[arg(long)]
+        rows: Option<u32>,
+        #[command(flatten)]
+        conn: ConnectionArgs,
+        /// Auth token (required when connecting over TCP)
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 pub(crate) type ClientInterceptor =
@@ -267,9 +280,57 @@ async fn main() -> Result<()> {
                 frame: Some(Frame::Write(WriteData { data: text.into_bytes() })),
             }).await?;
             let mut events = client.subscribe(ReceiverStream::new(rx)).await?.into_inner();
-            // Wait for Ready so the server has accepted the stream (and our Write).
+            // Wait for Ready so the server has accepted the stream.
             let _ = events.message().await?;
+            // Half-close the up-stream and drain events until the server ends
+            // the response stream. The server reads inbound frames in order and
+            // closes on half-close, so stream end confirms the Write reached
+            // the PTY. A bare drop would RST the stream, and h2 >= 0.4.15
+            // discards buffered DATA when a reset is scheduled — losing the
+            // Write. Timeout-capped so a wedged server can't hang us; that's
+            // an error, since delivery is then unconfirmed.
             drop(tx);
+            let drain = async {
+                while events.message().await?.is_some() {}
+                Ok::<(), tonic::Status>(())
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(2), drain).await {
+                Ok(r) => r?,
+                Err(_) => anyhow::bail!("timed out waiting for the server to confirm delivery"),
+            }
+        }
+
+        Cmd::Dump { pty_id, rows, conn, token } => {
+            use termd::proto::{ScrollbackOpKind, ScrollbackRequest};
+            let mut client = connect_client(conn.destination(), token).await?;
+            let item = resolve_pty_item(&mut client, &pty_id).await?;
+            let (_, pty_rows) = attach::item_size(&item);
+            let row_count = rows.unwrap_or(pty_rows).max(1);
+            // One-shot snapshot via the scrollback viewport: OPEN pins at the
+            // live tail and returns the bottom `row_count` rows; CLOSE removes
+            // the pin. The subscriber_id is only a pin key server-side, so no
+            // Subscribe stream is needed.
+            let pin = format!("dump-{}", std::process::id());
+            let sr = client.scrollback(ScrollbackRequest {
+                pty_id: item.pty_id,
+                subscriber_id: pin.clone(),
+                kind: ScrollbackOpKind::ScrollbackOpen as i32,
+                amount: 0,
+                row_count,
+            }).await?.into_inner();
+            let _ = client.scrollback(ScrollbackRequest {
+                pty_id: item.pty_id,
+                subscriber_id: pin,
+                kind: ScrollbackOpKind::ScrollbackClose as i32,
+                amount: 0,
+                row_count: 0,
+            }).await;
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            out.write_all(&sr.data)?;
+            if !sr.data.ends_with(b"\n") {
+                out.write_all(b"\n")?;
+            }
         }
 
         Cmd::Resize { pty_id, cols, rows, conn, token } => {
