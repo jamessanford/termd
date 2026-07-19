@@ -13,17 +13,16 @@ We've settled on two primary render modes to help this:
 `--render-mode <mode>` flag (or `--renderer`) to the `Attach` subcommand
 in `src/main.rs`. Possible values:
 
-- **`cell`** (current default on `main`) — cell-by-cell render state iteration.
+- **`cell`** — cell-by-cell render state iteration.
   Dirty tracking at row level; `Dirty::Partial` repaints only changed rows,
   `Dirty::Full` repaints everything row-by-row with cursor-goto per row.
   Has reduced performance, but allows a "viewport" into the server window.
   Clients typically do not want to stay in this mode for long, because they
   cannot see the entire screen.
 
-- **`region`** (see below) — raw passthrough within a DECSTBM scroll
-  region sized to the server PTY, with in-stream rewriting of conflicting
-  escape sequences. Requires a VT stream filter (see upstream item below).
-  Works for both "same-size" and "client is larger than server"
+- **`autowrap`** (current default) — raw passthrough with libghostty-driven
+  explicit wrap injection; the output is valid for any client at least as wide
+  as the server PTY. See [AUTOWRAP.md](AUTOWRAP.md).
 
 - **`raw`** — original approach, code path now exists only for debugging/testing.
   forward the raw PTY byte stream from the server
@@ -35,36 +34,15 @@ The `attach::run` function in `src/attach.rs` would take a `RenderMode` enum
 argument. Each mode is a different code path; the shared infrastructure
 (gRPC streaming, stdin forwarding, SIGWINCH handling) stays the same.
 
+There was also a `region` mode (raw passthrough confined to a DECSTBM scroll
+region plus DECSLRM horizontal margins, with in-stream rewriting of conflicting
+escape sequences). The horizontal-margin state proved too contended to share
+with server apps and it was removed in favor of `autowrap` — see
+[AUTOWRAP.md](AUTOWRAP.md) for the full rationale.
+
 ---
 
-## Region passthrough mode (future)
-
-The `region` render mode would work as follows when the client terminal is
-larger than the server PTY:
-
-1. Emit `\E[1;{server_rows}r` (DECSTBM) on the client to confine scrolling to
-   the top N rows, matching the server PTY height.
-2. Optionally emit `\E[?69h` + `\E[1;{server_cols}s` (DECLRMM + DECSLRM) for
-   width confinement if the client is wider.
-3. Forward raw PTY bytes from the server. Scrolling, cursor movement, and line
-   wrapping happen naturally within the region.
-
-### The byte-stream rewriting problem
-
-Programs running on the server (vim, less, htop, tmux) emit their own DECSTBM
-sequences (and sometimes DECLRMM/DECSLRM) that would clobber the client-side
-region. These must be intercepted and rewritten (offset/clamped to the outer
-region bounds). Edge cases:
-
-- `\E[r` (bare DECSTBM reset) → rewrite to the outer region
-- `\Ec` (RIS full reset) → re-emit the region setup after
-- `\E[?1049h/l` (alt screen) → region setup must survive or be reapplied
-- `\E[?69h/l` (DECLRMM toggle) → manage carefully with our own DECLRMM
-
-Escape sequences can be split across read buffers, so naïve string matching
-does not work. A proper VT state machine is required.
-
-### libghostty upstream gap
+## libghostty upstream gap
 
 libghostty-vt already has a complete, battle-tested VT parser (`Parser`,
 `Stream`, `TerminalStream`, `StreamAction`) exposed in the Zig public API

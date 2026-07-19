@@ -10,7 +10,7 @@ use crate::AuthedClient;
 
 // This is a fairly naive version of scrollback, more a proof of concept.
 // Right now the scrollback pages get "dumped" out to the screen, instead
-// of rendered (they probably need to go through cell/region formatters)
+// of rendered (they probably need to go through the cell formatter)
 pub(super) async fn show_scrollback(
     client:        &mut AuthedClient,
     pty_id:        u64,

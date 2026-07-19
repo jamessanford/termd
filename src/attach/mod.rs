@@ -30,8 +30,6 @@ pub enum RenderMode {
     Cell,
     /// Raw PTY byte passthrough
     Raw,
-    /// Raw passthrough within a DECSTBM scroll region
-    Region,
     /// Raw passthrough with libghostty-driven explicit wrap injection
     Autowrap,
 }
@@ -65,10 +63,6 @@ fn create_handler(
     Ok(match mode {
         RenderMode::Cell => Box::new(cell::CellHandler::new(server_cols, server_rows, upgrade_to)?),
         RenderMode::Raw => Box::new(raw::RawHandler::new()),
-        RenderMode::Region => {
-            let (client_cols, client_rows) = get_terminal_size();
-            Box::new(region::RegionHandler::new(server_rows, server_cols, client_rows, client_cols))
-        }
         RenderMode::Autowrap => Box::new(autowrap::AutowrapHandler::new(server_cols, server_rows)?),
     })
 }
@@ -137,7 +131,6 @@ mod autowrap;
 mod cell;
 mod help;
 mod raw;
-mod region;
 mod scrollback;
 
 use crate::AuthedClient;
@@ -661,7 +654,6 @@ pub async fn run(
     let mut sub: Option<Subscription> = None;
 
     let upgrade_to = match mode {
-        RenderMode::Region => Some(RenderMode::Region),
         RenderMode::Autowrap => Some(RenderMode::Autowrap),
         _ => None,
     };

@@ -188,8 +188,7 @@ impl WrapInjector {
     }
 
     /// Pass a completed, held control unit to the client, rewriting the few
-    /// sequences that contend with our region setup. Mirrors region.rs's
-    /// dispatch_csi, minus the DECSLRM/DECLRMM handling autowrap doesn't need.
+    /// sequences that contend with our region setup.
     fn rewrite_control(&mut self, cx: u16, cy: u16, out: &mut Vec<u8>) {
         let u = &self.unit;
         if u.as_slice() == b"\x1bc" {
