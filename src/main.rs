@@ -274,9 +274,17 @@ async fn main() -> Result<()> {
             // closes on half-close, so stream end confirms the Write reached
             // the PTY. A bare drop would RST the stream, and h2 >= 0.4.15
             // discards buffered DATA when a reset is scheduled — losing the
-            // Write.
+            // Write. Timeout-capped so a wedged server can't hang us; that's
+            // an error, since delivery is then unconfirmed.
             drop(tx);
-            while events.message().await?.is_some() {}
+            let drain = async {
+                while events.message().await?.is_some() {}
+                Ok::<(), tonic::Status>(())
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(2), drain).await {
+                Ok(r) => r?,
+                Err(_) => anyhow::bail!("timed out waiting for the server to confirm delivery"),
+            }
         }
 
         Cmd::Resize { pty_id, cols, rows, conn, token } => {
