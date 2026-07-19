@@ -267,9 +267,16 @@ async fn main() -> Result<()> {
                 frame: Some(Frame::Write(WriteData { data: text.into_bytes() })),
             }).await?;
             let mut events = client.subscribe(ReceiverStream::new(rx)).await?.into_inner();
-            // Wait for Ready so the server has accepted the stream (and our Write).
+            // Wait for Ready so the server has accepted the stream.
             let _ = events.message().await?;
+            // Half-close the up-stream and drain events until the server ends
+            // the response stream. The server reads inbound frames in order and
+            // closes on half-close, so stream end confirms the Write reached
+            // the PTY. A bare drop would RST the stream, and h2 >= 0.4.15
+            // discards buffered DATA when a reset is scheduled — losing the
+            // Write.
             drop(tx);
+            while events.message().await?.is_some() {}
         }
 
         Cmd::Resize { pty_id, cols, rows, conn, token } => {
