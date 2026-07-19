@@ -699,6 +699,58 @@ async fn test_scrollback_via_grpc() {
     assert!(sr.data.is_empty(), "blank active screen produces no VT output");
 }
 
+// The `termd dump` pattern: a one-shot screen snapshot via the unary Scrollback
+// RPC with a synthetic subscriber_id — no Subscribe stream at all. The
+// subscriber_id is only a pin key server-side, so OPEN at the tail returns the
+// visible screen, and CLOSE removes the pin so nothing leaks.
+#[tokio::test]
+async fn test_scrollback_dump_pattern_needs_no_subscription() {
+    let (_dir, _socket, mut client) = test_server().await;
+
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
+
+    // Get some text onto the screen (via a real subscriber, like a shell user),
+    // and wait until it has actually rendered.
+    let mut writer = subscribe(&mut client, pty_id, 80, 24).await;
+    writer.frame_tx.send(SubscribeFrame {
+        frame: Some(subscribe_frame::Frame::Write(WriteData {
+            data: b"echo __dump_marker__\n".to_vec(),
+        })),
+    }).await.unwrap();
+    read_until(&mut writer, 5, |ev| match ev {
+        subscribe_event::Event::Data(d)
+            if String::from_utf8_lossy(&d.data).contains("__dump_marker__") => Some(()),
+        _ => None,
+    }).await;
+
+    // The dump: OPEN at the tail with a subscriber_id no subscription owns.
+    let sr = client.scrollback(ScrollbackRequest {
+        pty_id,
+        subscriber_id: "dump-test".into(),
+        kind: ScrollbackOpKind::ScrollbackOpen as i32,
+        amount: 0,
+        row_count: 24,
+    }).await.unwrap().into_inner();
+    assert!(
+        String::from_utf8_lossy(&sr.data).contains("__dump_marker__"),
+        "dump must contain the visible screen text, got: {:?}",
+        String::from_utf8_lossy(&sr.data)
+    );
+
+    // CLOSE removes the pin; returns no rows.
+    let sr = client.scrollback(ScrollbackRequest {
+        pty_id,
+        subscriber_id: "dump-test".into(),
+        kind: ScrollbackOpKind::ScrollbackClose as i32,
+        amount: 0,
+        row_count: 0,
+    }).await.unwrap().into_inner();
+    assert!(sr.data.is_empty(), "CLOSE returns no rows");
+}
+
 #[tokio::test]
 async fn test_subscribe_grows_pty_to_larger_client() {
     let (_dir, _socket, mut client) = test_server().await;
