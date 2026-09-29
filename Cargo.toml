@@ -12,13 +12,13 @@ name = "termd"
 path = "src/lib.rs"
 
 [dependencies]
-tonic = { version = "0.14", features = ["transport"] }
+tonic = { version = "0.14", features = ["transport", "tls-ring"] }
 prost = "0.14"
 prost-types = "0.14"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync", "net"] }
 tower = "0.5"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 nix = { version = "0.31", features = ["process", "signal", "term"] }
 libc = "0.2"
 tracing = "0.1"
@@ -32,6 +32,12 @@ libghostty-vt = { git = "https://github.com/jamessanford/libghostty-rs", rev = "
 libghostty-vt-sys = { git = "https://github.com/jamessanford/libghostty-rs", rev = "0bc60291aeaaca618fbd86edd17510c3d42dcab0", default-features = false, features = ["pkg-config", "kitty-graphics"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tonic-prost = "0.14.6"
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+sha2 = "0.10"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
+rustls-native-certs = { version = "0.8.4", default-features = false }
+hex = { version = "0.4.3", default-features = false, features = ["std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use tonic::Request;
 
@@ -10,6 +10,7 @@ use termd::{
         Size,
         terminal_service_client::TerminalServiceClient,
     },
+    auth,
     pty::PtyRegistry,
     server,
 };
@@ -42,27 +43,30 @@ fn default_socket() -> PathBuf {
     base.join("termd.sock")
 }
 
-enum Destination {
-    Socket(PathBuf),
-    Tcp(String),
-}
-
 #[derive(Args)]
 struct ConnectionArgs {
     #[arg(long, default_value_os_t = default_socket(), conflicts_with = "endpoint")]
     socket: PathBuf,
-    #[arg(long, help = "Endpoint URI to connect to (e.g. http://127.0.0.1:7777 or https://host:7777)", conflicts_with = "socket")]
+    /// Endpoint URI to connect to (e.g. https://192.0.2.7:7777, or
+    /// http://127.0.0.1:7777 for a --tls=off daemon)
+    #[arg(long, env = "TERMD_ENDPOINT", conflicts_with = "socket")]
     endpoint: Option<String>,
+    /// Auth token for TCP connections (see `termd token`)
+    #[arg(long, env = "TERMD_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+    /// Pin the server's self-signed certificate by fingerprint (sha256:<hex>,
+    /// see `termd token`). Without it, https endpoints are verified against
+    /// the system roots.
+    #[arg(long, env = "TERMD_FINGERPRINT")]
+    fingerprint: Option<String>,
 }
 
-impl ConnectionArgs {
-    fn destination(self) -> Destination {
-        if let Some(ep) = self.endpoint {
-            Destination::Tcp(ep)
-        } else {
-            Destination::Socket(self.socket)
-        }
-    }
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum TlsMode {
+    /// Serve TLS with a persistent self-signed certificate
+    On,
+    /// Plaintext h2c, for running behind a TLS-terminating proxy like caddy
+    Off,
 }
 
 #[derive(Parser)]
@@ -78,10 +82,21 @@ enum Cmd {
     Start {
         #[arg(long)]
         log_grpc: bool,
-        #[arg(long, default_value = "127.0.0.1:7777")]
+        #[arg(long, default_value = "0.0.0.0:7777")]
         listen: SocketAddr,
         #[arg(long, default_value_os_t = default_socket())]
         socket: PathBuf,
+        /// TLS on the TCP listener
+        #[arg(long, value_enum, default_value_t = TlsMode::On)]
+        tls: TlsMode,
+    },
+    /// Print the TCP auth token and certificate fingerprint (via the socket only)
+    Token {
+        #[arg(long, default_value_os_t = default_socket())]
+        socket: PathBuf,
+        /// Replace the token with a new one; the old one stops working
+        #[arg(long)]
+        refresh: bool,
     },
     /// Attach to a PTY and act as multiplexer
     Attach {
@@ -89,9 +104,6 @@ enum Cmd {
         pty_id: Option<String>,
         #[command(flatten)]
         conn: ConnectionArgs,
-        /// Auth token (required when connecting over TCP)
-        #[arg(long)]
-        token: Option<String>,
         /// Print message metadata to stderr instead of writing data to stdout
         #[arg(long)]
         debug: bool,
@@ -103,9 +115,6 @@ enum Cmd {
     List {
         #[command(flatten)]
         conn: ConnectionArgs,
-        /// Auth token (required when connecting over TCP)
-        #[arg(long)]
-        token: Option<String>,
         #[arg(long, help = "Show subscribers for each PTY")]
         verbose: bool,
     },
@@ -119,18 +128,12 @@ enum Cmd {
         cmd: Option<String>,
         #[command(flatten)]
         conn: ConnectionArgs,
-        /// Auth token (required when connecting over TCP)
-        #[arg(long)]
-        token: Option<String>,
     },
     /// Destroy a PTY
     Destroy {
         pty_id: String,
         #[command(flatten)]
         conn: ConnectionArgs,
-        /// Auth token (required when connecting over TCP)
-        #[arg(long)]
-        token: Option<String>,
     },
     /// Resize a PTY's columns and rows on the server
     Resize {
@@ -139,9 +142,6 @@ enum Cmd {
         rows: u32,
         #[command(flatten)]
         conn: ConnectionArgs,
-        /// Auth token (required when connecting over TCP)
-        #[arg(long)]
-        token: Option<String>,
     },
     /// Inject text to a PTY
     Send {
@@ -149,9 +149,6 @@ enum Cmd {
         text: String,
         #[command(flatten)]
         conn: ConnectionArgs,
-        /// Auth token (required when connecting over TCP)
-        #[arg(long)]
-        token: Option<String>,
     },
     /// Print a PTY's screen contents
     Dump {
@@ -162,9 +159,6 @@ enum Cmd {
         rows: Option<u32>,
         #[command(flatten)]
         conn: ConnectionArgs,
-        /// Auth token (required when connecting over TCP)
-        #[arg(long)]
-        token: Option<String>,
     },
 }
 
@@ -180,7 +174,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Cmd::Start { log_grpc, listen, socket } => {
+        Cmd::Start { log_grpc, listen, socket, tls } => {
             let level = if log_grpc { "debug" } else { "info" };
             tracing_subscriber::fmt()
                 .with_env_filter(
@@ -204,15 +198,37 @@ async fn main() -> Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
 
-            let token = server::generate_token();
-            println!("TCP connection token {token}");
+            let state = auth::state_dir();
+            let tokens = auth::TokenStore::load_or_create(&state)?;
+            let cert = match tls {
+                TlsMode::On => Some(auth::load_or_create_cert(&state)?),
+                TlsMode::Off => {
+                    if !listen.ip().is_loopback() {
+                        tracing::warn!(%listen, "--tls=off on a non-loopback address: token and traffic are sent in the clear");
+                    }
+                    None
+                }
+            };
 
             let registry = Arc::new(PtyRegistry::new());
-            server::serve(registry, &socket, listen, token, log_grpc).await?;
+            server::serve(registry, &socket, listen, tokens, cert, log_grpc).await?;
         }
 
-        Cmd::List { conn, token, verbose } => {
-            let mut client = connect_client(conn.destination(), token).await?;
+        Cmd::Token { socket, refresh } => {
+            use termd::proto::{admin_service_client::AdminServiceClient, TokenRequest};
+            let channel = socket_channel(socket).await?;
+            let resp = AdminServiceClient::new(channel)
+                .token(TokenRequest { refresh })
+                .await?
+                .into_inner();
+            println!("TERMD_TOKEN={}", resp.token);
+            if !resp.fingerprint.is_empty() {
+                println!("TERMD_FINGERPRINT={}", resp.fingerprint);
+            }
+        }
+
+        Cmd::List { conn, verbose } => {
+            let mut client = connect_client(conn).await?;
             let mut items = client.list(ListRequest {}).await?.into_inner().items;
             if items.is_empty() {
                 println!("No active PTYs.");
@@ -238,8 +254,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Create { cols, rows, cmd, conn, token } => {
-            let mut client = connect_client(conn.destination(), token).await?;
+        Cmd::Create { cols, rows, cmd, conn } => {
+            let mut client = connect_client(conn).await?;
             let item = client.create(CreateRequest {
                 size: Some(Size { cols, rows }),
                 command: cmd,
@@ -247,8 +263,8 @@ async fn main() -> Result<()> {
             println!("{:016x}", item.pty_id);
         }
 
-        Cmd::Destroy { pty_id, conn, token } => {
-            let mut client = connect_client(conn.destination(), token).await?;
+        Cmd::Destroy { pty_id, conn } => {
+            let mut client = connect_client(conn).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             match client.destroy(DestroyRequest { pty_id }).await {
                 Ok(_) => println!("destroyed {:016x}", pty_id),
@@ -259,8 +275,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Send { pty_id, text, conn, token } => {
-            let mut client = connect_client(conn.destination(), token).await?;
+        Cmd::Send { pty_id, text, conn } => {
+            let mut client = connect_client(conn).await?;
             let item = resolve_pty_item(&mut client, &pty_id).await?;
             let (cols, rows) = attach::item_size(&item);
             // No standalone write RPC remains: open a Subscribe stream, send the
@@ -300,9 +316,9 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Dump { pty_id, rows, conn, token } => {
+        Cmd::Dump { pty_id, rows, conn } => {
             use termd::proto::{ScrollbackOpKind, ScrollbackRequest};
-            let mut client = connect_client(conn.destination(), token).await?;
+            let mut client = connect_client(conn).await?;
             let item = resolve_pty_item(&mut client, &pty_id).await?;
             let (_, pty_rows) = attach::item_size(&item);
             let row_count = rows.unwrap_or(pty_rows).max(1);
@@ -333,8 +349,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Resize { pty_id, cols, rows, conn, token } => {
-            let mut client = connect_client(conn.destination(), token).await?;
+        Cmd::Resize { pty_id, cols, rows, conn } => {
+            let mut client = connect_client(conn).await?;
             let pty_id = resolve_pty_id(&mut client, &pty_id).await?;
             match client.resize(ResizeRequest {
                 pty_id,
@@ -348,8 +364,8 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Attach { pty_id, conn, token, debug, render_mode } => {
-            let mut client = connect_client(conn.destination(), token).await?;
+        Cmd::Attach { pty_id, conn, debug, render_mode } => {
+            let mut client = connect_client(conn).await?;
             let item = match pty_id {
                 Some(prefix) => resolve_pty_item(&mut client, &prefix).await?,
                 None => auto_select_or_create(&mut client).await?,
@@ -400,32 +416,69 @@ async fn auto_select_or_create(client: &mut AuthedClient) -> Result<PtyItem> {
     Ok(item)
 }
 
-async fn connect_client(dest: Destination, token: Option<String>) -> Result<AuthedClient> {
-    let channel = match dest {
-        Destination::Socket(path) => {
-            use hyper_util::rt::TokioIo;
-            use tonic::transport::Endpoint;
-            use tower::service_fn;
-            Endpoint::try_from("http://[::]:1")?
-                .connect_with_connector(service_fn(move |_| {
-                    let path = path.clone();
-                    async move { tokio::net::UnixStream::connect(path).await.map(TokioIo::new) }
-                }))
-                .await?
+async fn socket_channel(path: PathBuf) -> Result<tonic::transport::Channel> {
+    use hyper_util::rt::TokioIo;
+    use tonic::transport::Endpoint;
+    use tower::service_fn;
+    Ok(Endpoint::try_from("http://[::]:1")?
+        .connect_with_connector(service_fn(move |_| {
+            let path = path.clone();
+            async move { tokio::net::UnixStream::connect(path).await.map(TokioIo::new) }
+        }))
+        .await?)
+}
+
+/// Connect over TCP, doing TLS ourselves for https so we can pin a
+/// self-signed cert by fingerprint (tonic's TLS config can't).
+async fn tcp_channel(uri: &str, fingerprint: Option<&str>) -> Result<tonic::transport::Channel> {
+    use hyper_util::rt::TokioIo;
+    use tonic::transport::{Endpoint, Uri};
+    use tower::service_fn;
+
+    let parsed: Uri = uri.parse()?;
+    match parsed.scheme_str() {
+        Some("https") => {}
+        Some("http") => {
+            anyhow::ensure!(fingerprint.is_none(), "--fingerprint needs an https:// endpoint");
+            return Ok(Endpoint::from_shared(uri.to_string())?.connect().await?);
         }
-        Destination::Tcp(uri) => {
-            tonic::transport::Channel::from_shared(uri)?
-                .connect()
-                .await?
-        }
+        _ => anyhow::bail!("endpoint must be http:// or https://"),
+    }
+    let host = parsed.host().context("endpoint has no host")?.to_string();
+    let port = parsed.port_u16().unwrap_or(443);
+    let bare_host = host.trim_start_matches('[').trim_end_matches(']').to_string();
+    let server_name = rustls::pki_types::ServerName::try_from(bare_host.clone())?;
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(auth::client_tls_config(fingerprint)?));
+
+    // tonic only sees plaintext h2 from the connector, so hand it an http URI.
+    let authority = parsed.authority().context("endpoint has no authority")?.as_str();
+    Ok(Endpoint::from_shared(format!("http://{authority}"))?
+        .connect_with_connector(service_fn(move |_| {
+            let (tls, server_name, bare_host) = (tls.clone(), server_name.clone(), bare_host.clone());
+            async move {
+                let tcp = tokio::net::TcpStream::connect((bare_host.as_str(), port)).await?;
+                let stream = tls.connect(server_name, tcp).await?;
+                Ok::<_, std::io::Error>(TokioIo::new(stream))
+            }
+        }))
+        .await?)
+}
+
+async fn connect_client(conn: ConnectionArgs) -> Result<AuthedClient> {
+    let channel = match &conn.endpoint {
+        None => socket_channel(conn.socket).await?,
+        Some(uri) => tcp_channel(uri, conn.fingerprint.as_deref()).await?,
     };
-    let interceptor: ClientInterceptor = match token {
-        Some(token) => Box::new(move |mut req: Request<()>| {
-            req.metadata_mut().insert("x-auth-token", token.parse().unwrap());
-            Ok(req)
-        }),
+    let interceptor: ClientInterceptor = match conn.token {
+        Some(token) => {
+            let value: tonic::metadata::MetadataValue<_> =
+                token.trim().parse().context("token is not a valid header value")?;
+            Box::new(move |mut req: Request<()>| {
+                req.metadata_mut().insert("x-auth-token", value.clone());
+                Ok(req)
+            })
+        }
         None => Box::new(|req: Request<()>| Ok(req)),
     };
     Ok(TerminalServiceClient::with_interceptor(channel, interceptor))
 }
-

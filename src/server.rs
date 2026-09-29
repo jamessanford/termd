@@ -3,25 +3,46 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
 use tonic::service::interceptor::InterceptedService;
 
+use crate::auth::{ServerCert, TokenStore};
 use crate::proto;
 use crate::pty::{MetadataReason, PtyEvent, PtyMetadata, PtyRegistry};
 use crate::commands;
 
 pub use crate::proto::terminal_service_server::{TerminalService, TerminalServiceServer};
 
-/// Generate a fresh random auth token for a daemon instance, formatted as
-/// 16 hex digits like a PTY id.
-pub fn generate_token() -> String {
-    format!("{:016x}", uuid::Uuid::new_v4().as_u64_pair().0)
-}
+pub use crate::proto::admin_service_server::{AdminService, AdminServiceServer};
 
-/// Build an auth interceptor that accepts requests carrying the given token.
+/// Build an auth interceptor that accepts requests carrying the current token.
 pub fn auth_interceptor(
-    token: String,
+    tokens: TokenStore,
 ) -> impl Fn(Request<()>) -> Result<Request<()>, Status> + Clone {
     move |req: Request<()>| match req.metadata().get("x-auth-token") {
-        Some(v) if v.as_bytes() == token.as_bytes() => Ok(req),
+        Some(v) if tokens.check(v.as_bytes()) => Ok(req),
         _ => Err(Status::unauthenticated("invalid or missing x-auth-token")),
+    }
+}
+
+/// Hands out (and rotates) the TCP token. Mounted only on the unix listener.
+pub struct AdminServiceImpl {
+    pub tokens: TokenStore,
+    /// Empty when the TCP listener runs with --tls=off.
+    pub fingerprint: String,
+}
+
+#[tonic::async_trait]
+impl AdminService for AdminServiceImpl {
+    async fn token(
+        &self,
+        req: Request<proto::TokenRequest>,
+    ) -> Result<Response<proto::TokenResponse>, Status> {
+        let token = if req.into_inner().refresh {
+            let t = self.tokens.refresh().map_err(|e| Status::internal(format!("{e:#}")))?;
+            tracing::info!("TCP auth token refreshed");
+            t
+        } else {
+            self.tokens.get()
+        };
+        Ok(Response::new(proto::TokenResponse { token, fingerprint: self.fingerprint.clone() }))
     }
 }
 
@@ -41,14 +62,14 @@ impl TerminalServiceImpl {
 pub fn make_service(
     registry: Arc<PtyRegistry>,
     log_grpc: bool,
-    token: String,
+    tokens: TokenStore,
 ) -> InterceptedService<
     TerminalServiceServer<TerminalServiceImpl>,
     impl tonic::service::Interceptor + Clone,
 > {
     TerminalServiceServer::with_interceptor(
         TerminalServiceImpl::new(registry, log_grpc),
-        auth_interceptor(token),
+        auth_interceptor(tokens),
     )
 }
 
@@ -340,7 +361,8 @@ pub async fn serve(
     registry: Arc<PtyRegistry>,
     unix_path: &std::path::Path,
     tcp_addr: std::net::SocketAddr,
-    token: String,
+    tokens: TokenStore,
+    tls: Option<ServerCert>,
     log_grpc: bool,
 ) -> anyhow::Result<()> {
     use tokio::net::UnixListener;
@@ -361,7 +383,12 @@ pub async fn serve(
         }
     };
 
-    tracing::info!(unix = ?unix_path, tcp = %tcp_addr, "termd listening");
+    tracing::info!(
+        unix = ?unix_path,
+        tcp = %tcp_addr,
+        tls = tls.is_some(),
+        "termd listening; run `termd token` for TCP credentials",
+    );
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let mut shutdown_rx1 = shutdown_tx.subscribe();
@@ -386,19 +413,33 @@ pub async fn serve(
 
     // Domain-socket clients are trusted by virtue of filesystem access, so the
     // unix listener runs without auth. The TCP listener requires the token.
+    // AdminService goes on the unix listener only, so the token can't be
+    // fetched or rotated over TCP.
     let svc_unix = TerminalServiceServer::new(TerminalServiceImpl::new(registry.clone(), log_grpc));
-    let svc_tcp  = make_service(registry, log_grpc, token);
+    let svc_admin = AdminServiceServer::new(AdminServiceImpl {
+        tokens: tokens.clone(),
+        fingerprint: tls.as_ref().map(|c| c.fingerprint.clone()).unwrap_or_default(),
+    });
+    let svc_tcp  = make_service(registry, log_grpc, tokens);
+
+    let mut tcp_builder = Server::builder();
+    if let Some(cert) = &tls {
+        let identity = tonic::transport::Identity::from_pem(&cert.cert_pem, &cert.key_pem);
+        tcp_builder = tcp_builder
+            .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?;
+    }
 
     let servers = async move {
         let _ = tokio::try_join!(
             Server::builder()
                 .add_service(svc_unix)
+                .add_service(svc_admin)
                 .serve_with_incoming_shutdown(
                     UnixListenerStream::new(unix_listener),
                     async move { let _ = shutdown_rx1.recv().await; },
                 ),
             // Make sure we eventually timeout and remove TCP clients that have vanished.
-            Server::builder()
+            tcp_builder
                 .http2_keepalive_interval(Some(std::time::Duration::from_secs(60)))
                 .http2_keepalive_timeout(Some(std::time::Duration::from_secs(20)))
                 .tcp_keepalive(Some(std::time::Duration::from_secs(60)))

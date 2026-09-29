@@ -126,7 +126,7 @@ async fn test_server() -> (tempfile::TempDir, std::path::PathBuf, TerminalServic
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("termd.sock");
     let registry = Arc::new(PtyRegistry::new());
-    let svc = make_service(registry, false, TEST_TOKEN.to_string());
+    let svc = make_service(registry, false, termd::auth::TokenStore::fixed(TEST_TOKEN));
     let socket_path = socket.clone();
     tokio::spawn(async move {
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -147,7 +147,7 @@ async fn test_auth_rejects_missing_token() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("termd.sock");
     let registry = Arc::new(PtyRegistry::new());
-    let svc = make_service(registry, false, TEST_TOKEN.to_string());
+    let svc = make_service(registry, false, termd::auth::TokenStore::fixed(TEST_TOKEN));
     let socket_path = socket.clone();
     tokio::spawn(async move {
         let listener = UnixListener::bind(&socket_path).unwrap();
@@ -365,7 +365,7 @@ async fn test_destroy() {
 #[tokio::test]
 async fn test_tcp_transport_accepts_list() {
     let registry = Arc::new(PtyRegistry::new());
-    let svc = termd::server::make_service(registry, false, TEST_TOKEN.to_string());
+    let svc = termd::server::make_service(registry, false, termd::auth::TokenStore::fixed(TEST_TOKEN));
 
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();

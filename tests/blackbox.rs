@@ -90,7 +90,7 @@ impl TestServer {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("termd.sock");
         let registry = Arc::new(PtyRegistry::new());
-        let svc = make_service(registry, false, TEST_TOKEN.to_string());
+        let svc = make_service(registry, false, termd::auth::TokenStore::fixed(TEST_TOKEN));
         let socket_path = socket.clone();
         tokio::spawn(async move {
             let listener = UnixListener::bind(&socket_path).unwrap();

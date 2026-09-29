@@ -148,3 +148,20 @@ message SubscribersChanged { repeated SubscriberInfo subscribers = 1; }
 // DataLost means the subscriber lagged and stream data was potentially lost.
 // The client should call Refresh to resynchronize.
 message DataLost           {}
+
+// AdminService is served only on the unix socket, never on TCP: holding a
+// socket connection is what proves a caller is local and may see the token.
+service AdminService {
+  rpc Token (TokenRequest) returns (TokenResponse);
+}
+
+message TokenRequest {
+  // Replace the TCP auth token with a fresh one before returning it.
+  bool refresh = 1;
+}
+
+message TokenResponse {
+  string token = 1;
+  // "sha256:<hex>" of the TCP listener's certificate; empty with --tls=off.
+  string fingerprint = 2;
+}
