@@ -158,6 +158,7 @@ impl Client {
                 pty_id,
                 hostname: self.name.clone(),
                 size: Some(Size { cols: 80, rows: 24 }),
+                keep_on_exit: None,
             })),
         }).await.unwrap();
 

@@ -241,12 +241,13 @@ fn attach_exit_switches_to_most_recent_pty() {
     assert!(!contains(&after, b"\x1b]0;MRU-A"), "exit went to A, not the most recent PTY");
 }
 
-// Keep mode (C-a o): an exited PTY stays on screen, showing how it ended,
-// instead of switching away. C-a k then destroys it and moves to the most
-// recent survivor. Flipping back to Switch (C-a o) while parked on a dead PTY
-// moves on immediately.
+// C-a o marks the current PTY keep_on_exit: when its command exits, it stays
+// on screen showing how it ended, instead of switching away. C-a k then destroys
+// it and moves to the most recent survivor. A kept PTY also survives exiting
+// while unwatched, and clearing the flag (C-a o again) on a dead one reaps it
+// and moves on.
 #[test]
-fn attach_keep_mode_holds_dead_pty_until_destroyed() {
+fn attach_keep_flag_holds_dead_pty_until_destroyed() {
     let daemon = Daemon::start();
     let ptys: Vec<String> = (0..3).map(|_| daemon.create_pty()).collect();
     for (pty, title) in ptys.iter().zip(["KEEP-A", "KEEP-B", "KEEP-C"]) {
@@ -256,31 +257,38 @@ fn attach_keep_mode_holds_dead_pty_until_destroyed() {
 
     let mut client = AttachClient::spawn(&daemon, &ptys[0], 80, 24);
     client.drain_until(b"\x1b]0;KEEP-A");
-    client.write(b"\x011"); // C-a 1: B
+    // Mark C kept (the banner goes to stderr, uncaptured; C repaints after it).
+    client.write(b"\x012");
+    client.drain_until(b"\x1b]0;KEEP-C");
+    client.write(b"\x01o");
+    client.drain_until(b"\x1b]0;KEEP-C");
+    // Mark B kept.
+    client.write(b"\x011");
     client.drain_until(b"\x1b]0;KEEP-B");
-    client.write(b"\x01o"); // C-a o: Keep
-    // The banner goes to stderr (not captured); show_info holds 1s, then B repaints.
+    client.write(b"\x01o");
     client.drain_until(b"\x1b]0;KEEP-B");
 
     daemon.send(&ptys[1], "exit 7\r");
     let after = client.drain_until(b"exited with code 7");
-    assert!(!contains(&after, b"\x1b]0;KEEP-A"), "Keep mode switched away on exit");
+    assert!(!contains(&after, b"\x1b]0;KEEP-"), "kept PTY switched away on exit");
 
-    // Scrollback-capable dead screen survives a repaint (C-a R).
+    // The dead screen survives a repaint (C-a R), exit banner included.
     client.write(b"\x01R");
-    let repaint = client.drain_until(b"exited with code 7");
-    assert!(!contains(&repaint, b"\x1b]0;KEEP-A"));
+    client.drain_until(b"exited with code 7");
 
-    client.write(b"\x01k"); // C-a k: destroy → most recent survivor (A)
+    client.write(b"\x01k"); // C-a k: destroy B -> most recent survivor (C)
+    client.drain_until(b"\x1b]0;KEEP-C");
+    client.write(b"\x010"); // back to A
     client.drain_until(b"\x1b]0;KEEP-A");
 
-    // Now C dies while unviewed-but-kept, we visit it, then flip to Switch.
+    // C exits while unwatched; kept, so it's still listed and viewable.
     daemon.send(&ptys[2], "exit\r");
     std::thread::sleep(Duration::from_millis(300));
-    client.write(b"\x011"); // list is now [A, C]: C-a 1 = C (dead)
+    assert!(daemon.run(&["list"]).contains(&ptys[2]), "kept PTY reaped on unwatched exit");
+    client.write(b"\x011"); // list is now [A, C]
     client.drain_until(b"exited with code 0");
-    client.write(b"\x01o"); // C-a o: Switch → leaves dead C for A
+    client.write(b"\x01o"); // clear keep on dead C -> reaped, back to A
     client.drain_until(b"\x1b]0;KEEP-A");
     let listed = daemon.run(&["list"]);
-    assert!(!listed.contains(&ptys[2]), "dead PTY not destroyed on switching away: {listed}");
+    assert!(!listed.contains(&ptys[2]), "dead PTY not reaped after clearing keep: {listed}");
 }

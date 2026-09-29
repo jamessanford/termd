@@ -45,12 +45,30 @@ where
     T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
 {
+    subscribe_keep(client, pty_id, cols, rows, None).await
+}
+
+// As `subscribe`, also setting the PTY's keep_on_exit flag when `keep` is Some.
+async fn subscribe_keep<T>(
+    client: &mut TerminalServiceClient<T>,
+    pty_id: u64,
+    cols: u32,
+    rows: u32,
+    keep: Option<bool>,
+) -> Sub
+where
+    T: tonic::client::GrpcService<tonic::body::Body>,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+{
     let (frame_tx, frame_rx) = mpsc::channel::<SubscribeFrame>(16);
     frame_tx.send(SubscribeFrame {
         frame: Some(subscribe_frame::Frame::Start(SubscribeStart {
             pty_id,
             hostname: "tester".into(),
             size: Some(Size { cols, rows }),
+            keep_on_exit: keep,
         })),
     }).await.unwrap();
 
@@ -1002,9 +1020,10 @@ async fn test_send_pattern_survives_connection_teardown() {
     }).await;
 }
 
-// An exited PTY lingers until destroyed: the subscribe stream stays open after
-// Exited, List marks it exited, a (late) subscriber can still Refresh its final
-// screen (flagged exited) and open scrollback, and Destroy then ends the stream.
+// A keep_on_exit PTY lingers after exit until destroyed: the subscribe stream
+// stays open after Exited, List marks it exited, a (late) subscriber can still
+// Refresh its final screen (flagged exited) and open scrollback, and Destroy
+// then ends the stream.
 #[tokio::test]
 async fn test_exited_pty_lingers_until_destroyed() {
     let (_dir, _socket, mut client) = test_server().await;
@@ -1014,7 +1033,7 @@ async fn test_exited_pty_lingers_until_destroyed() {
     }).await.unwrap().into_inner();
     let pty_id = item.pty_id;
 
-    let mut sub = subscribe(&mut client, pty_id, 80, 24).await;
+    let mut sub = subscribe_keep(&mut client, pty_id, 80, 24, Some(true)).await;
     sub.frame_tx.send(SubscribeFrame {
         frame: Some(subscribe_frame::Frame::Write(WriteData {
             data: b"echo LINGER-MARK; exit 3\n".to_vec(),
@@ -1032,6 +1051,7 @@ async fn test_exited_pty_lingers_until_destroyed() {
     let listed = client.list(ListRequest {}).await.unwrap().into_inner().items;
     let listed = listed.iter().find(|p| p.pty_id == pty_id).expect("exited PTY vanished from List");
     assert_eq!(listed.exited.as_ref().map(|e| e.exit_code), Some(3));
+    assert!(listed.keep_on_exit);
 
     // A fresh subscriber on the dead PTY gets its final screen.
     let mut late = subscribe(&mut client, pty_id, 80, 24).await;
@@ -1058,4 +1078,68 @@ async fn test_exited_pty_lingers_until_destroyed() {
     tokio::time::timeout(Duration::from_secs(5), async {
         while let Ok(Some(_)) = sub.events.message().await {}
     }).await.expect("subscribe stream didn't end after Destroy");
+}
+
+async fn wait_unlisted<T>(client: &mut TerminalServiceClient<T>, pty_id: u64, what: &str)
+where
+    T: tonic::client::GrpcService<tonic::body::Body>,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let items = client.list(ListRequest {}).await.unwrap().into_inner().items;
+            if !items.iter().any(|p| p.pty_id == pty_id) { return; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap_or_else(|_| panic!("{what}: PTY still listed"));
+}
+
+// Without keep_on_exit (the default) an exited PTY is removed at once, watched
+// or not, and its subscribe stream ends. Clearing keep_on_exit on a lingering
+// PTY reaps it too.
+#[tokio::test]
+async fn test_exited_pty_without_keep_is_removed() {
+    let (_dir, _socket, mut client) = test_server().await;
+    let create = || CreateRequest { size: Some(Size { cols: 80, rows: 24 }), command: None };
+
+    // Unwatched: a command that exits on its own with nobody subscribed.
+    let a = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: Some("true".into()),
+    }).await.unwrap().into_inner().pty_id;
+    wait_unlisted(&mut client, a, "unwatched exit").await;
+
+    // Watched: the stream ends too.
+    let b = client.create(create()).await.unwrap().into_inner().pty_id;
+    let mut sub = subscribe(&mut client, b, 80, 24).await;
+    sub.frame_tx.send(SubscribeFrame {
+        frame: Some(subscribe_frame::Frame::Write(WriteData { data: b"exit\n".to_vec() })),
+    }).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Ok(Some(_)) = sub.events.message().await {}
+    }).await.expect("subscribe stream didn't end");
+    wait_unlisted(&mut client, b, "watched exit").await;
+
+    // Kept, then flag cleared while dead.
+    let c = client.create(create()).await.unwrap().into_inner().pty_id;
+    let mut sub = subscribe_keep(&mut client, c, 80, 24, Some(true)).await;
+    sub.frame_tx.send(SubscribeFrame {
+        frame: Some(subscribe_frame::Frame::Write(WriteData { data: b"exit\n".to_vec() })),
+    }).await.unwrap();
+    // Wait for the exit before leaving: a bare drop could discard the queued write.
+    read_until(&mut sub, 5, |ev| match ev {
+        subscribe_event::Event::Metadata(m) => match m.event {
+            Some(stream_metadata::Event::Exited(_)) => Some(()),
+            _ => None,
+        },
+        _ => None,
+    }).await;
+    drop(sub);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let items = client.list(ListRequest {}).await.unwrap().into_inner().items;
+    let kept = items.iter().find(|p| p.pty_id == c).expect("kept PTY reaped after its viewer left");
+    assert!(kept.exited.is_some(), "kept PTY not marked exited");
+    let _unkeep = subscribe_keep(&mut client, c, 80, 24, Some(false)).await;
+    wait_unlisted(&mut client, c, "cleared keep").await;
 }

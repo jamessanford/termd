@@ -272,6 +272,9 @@ impl TerminalService for TerminalServiceImpl {
             rows:       size.rows,
             created_at: std::time::SystemTime::now(),
         };
+        if let Some(keep) = start.keep_on_exit {
+            handle.set_keep_on_exit(keep);
+        }
         commands::apply_subscribe(&handle, &subscriber_id, info).await;
 
         tokio::spawn(async move {

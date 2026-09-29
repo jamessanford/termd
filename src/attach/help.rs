@@ -17,7 +17,7 @@ const HELP: &str = concat!(
     "  C-a C-a    switch to recent PTY\r\n",
     "  C-a 0-9    switch to PTY by index\r\n",
     "  C-a k      destroy current PTY\r\n",
-    "  C-a o      toggle on-exit: switch to recent / keep dead PTY\r\n",
+    "  C-a o      toggle keeping this PTY after it exits\r\n",
     "\r\n",
     "  C-a s      show scrollback\r\n",
     "  C-a i      show info\r\n",

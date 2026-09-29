@@ -47,6 +47,7 @@ pub fn pty_info_to_item(info: PtyInfo) -> PtyItem {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     PtyItem {
+        keep_on_exit: info.keep_on_exit,
         exited:      info.exited.map(|c| proto::Exited { exit_code: c.unwrap_or_default() }),
         pty_id:      info.id,
         hostname:    info.hostname,

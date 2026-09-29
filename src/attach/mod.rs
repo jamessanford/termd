@@ -23,29 +23,9 @@ pub(super) enum InputAction {
     ShowInfo,
     ShowScrollback,
     ShowHelp,
-    ToggleOnExit,
+    ToggleKeep,
 }
 
-/// What to do when the viewed PTY's command exits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OnExit {
-    /// Destroy it and switch to the most recently viewed PTY.
-    Switch,
-    /// Leave the dead PTY on screen (scrollback works) until C-a k destroys it.
-    Keep,
-}
-
-/// Client options. For now only settable by keybinding and not persisted; the
-/// intended home for options once there's a config file / settings UI (TODO.md).
-struct Settings {
-    on_exit: OnExit,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Settings { on_exit: OnExit::Switch }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum RenderMode {
@@ -279,9 +259,11 @@ fn move_terminal_end() {
 /// client's current viewport size, and read the first event — which must be the
 /// server's `Ready` carrying the `subscriber_id`. Returns the live `Subscription`.
 /// Transport/protocol failures surface as `Err`.
+/// `keep_on_exit`: Some sets the PTY's flag as part of subscribing; None leaves it.
 async fn subscribe(
     client: &mut AuthedClient,
     pty_id: u64,
+    keep_on_exit: Option<bool>,
 ) -> anyhow::Result<Subscription> {
     let (cols, rows) = get_terminal_size();
     let (frame_tx, frame_rx) = mpsc::channel::<SubscribeFrame>(64);
@@ -290,6 +272,7 @@ async fn subscribe(
             pty_id,
             hostname: hostname::get().unwrap_or_default().to_string_lossy().into_owned(),
             size: Some(Size { cols, rows }),
+            keep_on_exit,
         })),
     }).await?;
     let mut event_rx = client
@@ -429,9 +412,10 @@ fn draw_list(items: &[PtyItem], selected: usize) {
         let pty_id_hex = format!("{:016x}", item.pty_id);
         let title_trunc: String = title.chars().take(32).collect();
         let (cols, rows) = item_size(item);
-        let state = match &item.exited {
-            Some(e) => format!("  [exited {}]", e.exit_code),
-            None => String::new(),
+        let state = match (&item.exited, item.keep_on_exit) {
+            (Some(e), _) => format!("  [exited {}]", e.exit_code),
+            (None, true) => "  [keep]".to_string(),
+            (None, false) => String::new(),
         };
         let line = format!(
             " {:>3}  {:<16}  {:<32}  {}x{}{}\r\n",
@@ -682,7 +666,8 @@ pub async fn run(
     let mut current_item = item;
     let mut pty_list: Vec<PtyItem> = Vec::new();
     let mut mru = mru::Mru::default();
-    let mut settings = Settings::default();
+    // C-a o's new keep_on_exit for the current PTY, sent on the next subscribe.
+    let mut pending_keep: Option<bool> = None;
     mru.touch(current_pty_id);
     // The single active Subscribe stream for the current PTY (None = idle/unsubscribed).
     let mut sub: Option<Subscription> = None;
@@ -737,7 +722,7 @@ pub async fn run(
         // PTYs and resubscribes set `sub = None` so we always open a fresh stream
         // for the current PTY here.
         if sub.is_none() {
-            match subscribe(client, current_pty_id).await {
+            match subscribe(client, current_pty_id, pending_keep.take()).await {
                 Ok(s) => sub = Some(s),
                 // PTY is gone: leave `sub = None` so the gone-PTY branch below
                 // routes to the list (no reconnect banner — the transport is up).
@@ -755,15 +740,14 @@ pub async fn run(
         };
 
         match refresh_result {
-            // An exited PTY is only worth showing in Keep mode; in Switch mode
-            // it's as good as gone (e.g. it died while we were elsewhere, or
-            // C-a o just flipped us back to Switch).
-            Some((cols, rows, bytes, exited)) if !exited || settings.on_exit == OnExit::Keep => {
+            // An exited PTY without keep_on_exit is being reaped (C-a o just
+            // cleared the flag); treat it as gone rather than show it.
+            Some((cols, rows, bytes, exited)) if !exited || current_item.keep_on_exit => {
                 (cols, rows, bytes)
             }
             _ => {
                 // The PTY is gone (stream ended, or subscribe found it already
-                // gone) or exited in Switch mode. Tear it down and move on.
+                // gone) or is being reaped. Tear it down and move on.
                 close_subscription_bg(&mut sub);
                 pty_list.clear();
                 let _ = destroy_and_drain(client, current_pty_id).await;
@@ -868,10 +852,11 @@ pub async fn run(
                                     }
                                     stream_metadata::Event::Exited(_) => {
                                         handler.on_pty_event(PtyEvent::Closed, &mut out)?;
-                                        // Keep: stay on the final screen. The stream
-                                        // stays open until someone destroys the PTY,
-                                        // then ends and routes through the gone path.
-                                        if settings.on_exit == OnExit::Switch {
+                                        // keep_on_exit: stay on the final screen. The
+                                        // stream stays open until the PTY is destroyed
+                                        // (or its flag cleared), then ends and routes
+                                        // through the gone path.
+                                        if !current_item.keep_on_exit {
                                             input.reset();
                                             break RunOutcome::PtyClosed;
                                         }
@@ -1126,8 +1111,8 @@ pub async fn run(
                         show_info(&format!(
                             "requested={mode:?} actual={dispatch_mode:?} pty={current_pty_id:016x} \
                              server={server_cols}x{server_rows} client={client_cols}x{client_rows} \
-                             on_exit={on_exit:?}",
-                            on_exit = settings.on_exit,
+                             keep_on_exit={keep}",
+                            keep = current_item.keep_on_exit,
                         )).await;
                     }
 
@@ -1148,17 +1133,19 @@ pub async fn run(
                         help::show_help(&mut stdin).await;
                     }
 
-                    InputAction::ToggleOnExit => {
-                        settings.on_exit = match settings.on_exit {
-                            OnExit::Switch => OnExit::Keep,
-                            OnExit::Keep => OnExit::Switch,
-                        };
-                        show_info(match settings.on_exit {
-                            OnExit::Switch => "On exit: switch to the most recent PTY",
-                            OnExit::Keep => "On exit: keep the dead PTY until C-a k",
+                    InputAction::ToggleKeep => {
+                        // The flag rides the next SubscribeStart: resubscribe. If the
+                        // PTY is already dead and we just cleared it, the server
+                        // reaps it and the next pass moves on to the recent PTY.
+                        let keep = !current_item.keep_on_exit;
+                        current_item.keep_on_exit = keep;
+                        pending_keep = Some(keep);
+                        close_subscription_bg(&mut sub);
+                        show_info(if keep {
+                            "This PTY will be kept after it exits (C-a k to destroy)"
+                        } else {
+                            "This PTY will be removed when it exits"
                         }).await;
-                        // The next pass's refresh re-checks the current PTY: if it's
-                        // already dead and we're now in Switch mode, it moves on.
                     }
                 }
             }
@@ -1185,7 +1172,7 @@ pub async fn run(
 
 async fn run_debug(client: &mut AuthedClient, pty_id: u64) -> Result<()> {
     // Open the Subscribe stream and read the Ready event for the subscriber_id.
-    let mut sub = subscribe(client, pty_id).await?;
+    let mut sub = subscribe(client, pty_id, None).await?;
     eprintln!("[Subscribe pty_id={:016x} subscriber_id={}]", pty_id, sub.subscriber_id);
 
     // Request refresh (the snapshot arrives in-order on the Subscribe stream).

@@ -316,6 +316,7 @@ async fn main() -> Result<()> {
                     pty_id: item.pty_id,
                     hostname: hostname::get().unwrap_or_default().to_string_lossy().into_owned(),
                     size: Some(Size { cols, rows }),
+                    keep_on_exit: None,
                 })),
             }).await?;
             tx.send(SubscribeFrame {

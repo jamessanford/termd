@@ -282,6 +282,7 @@ impl PtyInfo {
             subscribers: None,
             sort_order: 0,
             exited: None,
+            keep_on_exit: false,
         }
     }
 }
@@ -315,9 +316,12 @@ pub(super) struct Reader {
     exit_code: Option<i32>,
     // A Shutdown request arrived: leave the run / linger loop.
     shutdown: bool,
+    // For self-unregistering an exited PTY that isn't keep_on_exit.
+    registry: std::sync::Weak<super::PtyMap>,
 }
 
 impl Reader {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         master: File,
         wakeup_read: OwnedFd,
@@ -326,6 +330,7 @@ impl Reader {
         meta_tx: broadcast::Sender<Arc<PtyMetadata>>,
         shared: Arc<PtyShared>,
         child: std::process::Child,
+        registry: std::sync::Weak<super::PtyMap>,
     ) -> Result<Self> {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: shared.cols.load(Ordering::Relaxed) as u16,
@@ -363,6 +368,7 @@ impl Reader {
             prev_screen: Screen::Primary,
             exit_code: None,
             shutdown: false,
+            registry,
         })
     }
 
@@ -507,9 +513,9 @@ impl Reader {
         self.cleanup();
         if !destroyed {
             // The child exited but nobody destroyed the PTY: announce the exit,
-            // then keep the final terminal around (refresh / scrollback) until
-            // Destroy drops the handle. Subscribe streams stay open meanwhile —
-            // they end when `tx` drops with us.
+            // then (keep_on_exit) keep the final terminal around for refresh /
+            // scrollback until destroyed, or (not) unregister right away.
+            // Subscribe streams end on the Closed our Drop sends.
             let _ = self.meta_tx.send(Arc::new(PtyMetadata {
                 reason:     MetadataReason::Exited,
                 exit_code:  self.exit_code,
@@ -522,7 +528,8 @@ impl Reader {
     }
 
     /// Post-exit service loop: answer requests against the final terminal state
-    /// until the wakeup pipe HUPs (the PtyHandle dropped — destroy()).
+    /// until destroyed, or until keep_on_exit is (or becomes) false — then
+    /// unregister the PTY ourselves.
     fn linger(&mut self) {
         let wakeup_fd = self.wakeup_read.as_raw_fd();
         loop {
@@ -533,6 +540,13 @@ impl Reader {
             }
             if self.shutdown {
                 tracing::debug!("PTY reader: destroyed after exit");
+                break;
+            }
+            if !self.shared.keep_on_exit.load(Ordering::Relaxed) {
+                tracing::debug!("PTY reader: exited without keep_on_exit, reaping");
+                if let Some(map) = self.registry.upgrade() {
+                    map.write().unwrap().remove(&self.shared.id);
+                }
                 break;
             }
             let mut pfd = libc::pollfd { fd: wakeup_fd, events: libc::POLLIN, revents: 0 };

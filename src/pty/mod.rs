@@ -3,7 +3,7 @@ use std::{
     fs::File,
     os::unix::io::{AsRawFd, FromRawFd},
     os::fd::OwnedFd,
-    sync::{Arc, Mutex, RwLock, atomic::{AtomicU32, AtomicU64, Ordering}},
+    sync::{Arc, Mutex, RwLock, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}},
     time::SystemTime,
 };
 
@@ -46,6 +46,7 @@ pub struct PtyInfo {
     pub sort_order:        u32,
     /// Some once the child has exited (inner None: killed / no status).
     pub exited:            Option<Option<i32>>,
+    pub keep_on_exit:      bool,
 }
 
 #[derive(Debug, Clone)]
@@ -135,9 +136,11 @@ pub(crate) struct PtyShared {
     // Assigned once at registration (next available slot, 0-based) for stable
     // list ordering; never changes for the life of the handle.
     pub(crate) sort_order:         AtomicU32,
-    // Set by the reader when the child exits; the PTY then lingers, serving its
-    // final screen, until destroyed. Some(None) = killed / no exit status.
+    // Set by the reader when the child exits. Some(None) = killed / no status.
     pub(crate) exited:             Mutex<Option<Option<i32>>>,
+    // On child exit: linger (final screen served) until destroyed, vs. unregister
+    // immediately. Clearing it on an exited PTY reaps it.
+    pub(crate) keep_on_exit:       AtomicBool,
 }
 
 impl PtyShared {
@@ -161,6 +164,7 @@ impl PtyShared {
             subscribers:        Some(subscribers),
             sort_order:         self.sort_order.load(Ordering::Relaxed),
             exited:             *self.exited.lock().unwrap(),
+            keep_on_exit:       self.keep_on_exit.load(Ordering::Relaxed),
         }
     }
 }
@@ -310,15 +314,26 @@ impl PtyHandle {
     pub fn remove_subscriber(&self, subscriber_id: &str) {
         self.shared.subscribers.write().unwrap().remove(subscriber_id);
     }
+
+    /// Set keep_on_exit, waking the reader so an already-exited PTY whose flag
+    /// was just cleared gets reaped.
+    pub fn set_keep_on_exit(&self, keep: bool) {
+        self.shared.keep_on_exit.store(keep, Ordering::Relaxed);
+        self.wake();
+    }
 }
 
+pub(crate) type PtyMap = RwLock<HashMap<u64, Arc<PtyHandle>>>;
+
 pub struct PtyRegistry {
-    ptys: RwLock<HashMap<u64, Arc<PtyHandle>>>,
+    // Arc'd so each reader can hold a Weak and unregister its own PTY when it
+    // exits without keep_on_exit.
+    ptys: Arc<PtyMap>,
 }
 
 impl PtyRegistry {
     pub fn new() -> Self {
-        Self { ptys: RwLock::new(HashMap::new()) }
+        Self { ptys: Arc::new(RwLock::new(HashMap::new())) }
     }
 
     pub fn create(&self, cols: u32, rows: u32, command: Option<&str>) -> Result<Arc<PtyHandle>> {
@@ -432,6 +447,7 @@ impl PtyRegistry {
             last_subscribed_at: Mutex::new(None),
             sort_order: AtomicU32::new(0), // real value assigned under the registry lock below
             exited: Mutex::new(None),
+            keep_on_exit: AtomicBool::new(false),
         });
 
         let handle = Arc::new(PtyHandle {
@@ -443,15 +459,29 @@ impl PtyRegistry {
             wakeup_write,
         });
 
+        // Assign sort_order and insert atomically so concurrent creates can't
+        // pick the same slot. Smallest unused 0-based value, reusing gaps left
+        // by destroyed PTYs. Registered before the reader starts so a child that
+        // exits immediately is listed before its reader can reap it.
+        {
+            let mut map = self.ptys.write().unwrap();
+            let used: HashSet<u32> =
+                map.values().map(|h| h.shared.sort_order.load(Ordering::Relaxed)).collect();
+            let order = (0u32..).find(|n| !used.contains(n)).unwrap();
+            handle.shared.sort_order.store(order, Ordering::Relaxed);
+            map.insert(id, handle.clone());
+        }
+
         // Spawn dedicated reader thread — owns libghostty state, the master fd,
         // and the child process
         let master = File::from(master);
+        let registry = Arc::downgrade(&self.ptys);
         let meta_tx_spawn = meta_tx.clone();
         let shared_spawn = shared.clone();
         std::thread::Builder::new()
             .name(format!("pty-reader-{id:016x}"))
             .spawn(move || {
-                match Reader::new(master, wakeup_read, req_rx, tx, meta_tx, shared, child) {
+                match Reader::new(master, wakeup_read, req_rx, tx, meta_tx, shared, child, registry) {
                     Ok(r) => r.run(),
                     Err(e) => {
                         // Startup failure: there is no Reader (and so no Drop) yet.
@@ -467,19 +497,8 @@ impl PtyRegistry {
                     }
                 }
             })
+            .inspect_err(|_| { self.ptys.write().unwrap().remove(&id); })
             .context("spawn reader thread")?;
-
-        // Assign sort_order and insert atomically so concurrent creates can't
-        // pick the same slot. Smallest unused 0-based value, reusing gaps left
-        // by destroyed PTYs.
-        {
-            let mut map = self.ptys.write().unwrap();
-            let used: HashSet<u32> =
-                map.values().map(|h| h.shared.sort_order.load(Ordering::Relaxed)).collect();
-            let order = (0u32..).find(|n| !used.contains(n)).unwrap();
-            handle.shared.sort_order.store(order, Ordering::Relaxed);
-            map.insert(id, handle.clone());
-        }
         Ok(handle)
     }
 

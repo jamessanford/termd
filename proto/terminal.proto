@@ -44,9 +44,11 @@ message PtyItem {
   repeated SubscriberInfo   subscribers        = 7;
   optional google.protobuf.Timestamp last_subscribed_at = 8;
   uint32                    sort_order         = 9;
-  // Present once the PTY's command has exited. The PTY lingers (its final
-  // screen and scrollback stay viewable) until someone Destroys it.
+  // Present once the PTY's command has exited (only seen with keep_on_exit).
   optional Exited           exited             = 10;
+  // When the command exits: true keeps the PTY (final screen + scrollback)
+  // until it is Destroyed; false removes it immediately. Set via SubscribeStart.
+  bool                      keep_on_exit       = 11;
 }
 
 message SubscriberInfo {
@@ -101,6 +103,8 @@ message SubscribeStart {
   uint64 pty_id   = 1;
   string hostname = 2;
   Size   size     = 3;
+  // Set the PTY's keep_on_exit flag (see PtyItem); absent leaves it unchanged.
+  optional bool keep_on_exit = 4;
 }
 
 message WriteData { bytes data = 1; }
