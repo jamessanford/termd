@@ -70,6 +70,11 @@ fn create_handler(
     })
 }
 
+/// How long a possible escape-sequence start (e.g. a bare ESC) is held waiting
+/// for the rest before being treated as the bare key. A sequence from the
+/// terminal arrives in one burst, so this only needs to cover a split read.
+const ESC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+
 enum RunOutcome {
     /// Transport error on the Subscribe stream: the connection is suspect, so
     /// retry it with the reconnect banner/backoff.
@@ -842,6 +847,10 @@ pub async fn run(
             // True while a lag-recovery Refresh request is in flight, so a
             // persistently slow link can't amplify lag into a refresh storm.
             let mut refresh_pending = false;
+            // Armed while the InputProcessor holds a possible escape-sequence
+            // start (e.g. a bare ESC); on expiry the held bytes go to the PTY.
+            let mut esc_flush = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(86400)));
+            let mut esc_armed = false;
 
             loop {
                 out.clear();
@@ -940,6 +949,21 @@ pub async fn run(
                         }
                         if let Some(a) = r.action {
                             break RunOutcome::Action(a);
+                        }
+                        esc_armed = input.has_pending_escape();
+                        if esc_armed {
+                            esc_flush.as_mut().reset(tokio::time::Instant::now() + ESC_TIMEOUT);
+                        }
+                    }
+                    _ = &mut esc_flush, if esc_armed => {
+                        // Nothing followed: it was a bare ESC (or a truncated
+                        // sequence), not the start of one. Pass it through.
+                        esc_armed = false;
+                        let data = input.flush_pending_escape();
+                        if !data.is_empty() {
+                            let _ = sub.frame_tx.send(SubscribeFrame {
+                                frame: Some(Frame::Write(WriteData { data })),
+                            }).await;
                         }
                     }
                     _ = sigwinch.recv() => {

@@ -50,6 +50,39 @@ impl InputProcessor {
         InputResult { write, action: None }
     }
 
+    /// True while the processor is holding the start of what may be an escape
+    /// sequence (a bare ESC, a partial CSI, or either after a Ctrl-A prefix).
+    /// The caller should give the rest a moment to arrive, then call
+    /// `flush_pending_escape`: a lone ESC is otherwise held until the next key.
+    /// A bare Ctrl-A prefix is deliberately not "pending" — it waits for the
+    /// user's next key however long that takes.
+    pub fn has_pending_escape(&self) -> bool {
+        matches!(
+            self.state,
+            EscapeState::Escape | EscapeState::InCsi
+                | EscapeState::AfterCtrlAEscape | EscapeState::AfterCtrlAInCsi
+        )
+    }
+
+    /// Give up waiting on a held escape sequence: return its bytes verbatim
+    /// (preceded by the pending Ctrl-A if there was one, as for any Ctrl-A +
+    /// unbound key) and return to the normal state. Empty if nothing is held.
+    pub fn flush_pending_escape(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self.state {
+            EscapeState::Escape => out.push(0x1B),
+            EscapeState::InCsi => self.flush_csi(&mut out),
+            EscapeState::AfterCtrlAEscape => out.extend_from_slice(&[0x01, 0x1B]),
+            EscapeState::AfterCtrlAInCsi => {
+                out.push(0x01);
+                self.flush_csi(&mut out);
+            }
+            _ => return out,
+        }
+        self.state = EscapeState::Normal;
+        out
+    }
+
     fn flush_csi(&mut self, to_send: &mut Vec<u8>) {
         to_send.push(0x1B);
         to_send.push(b'[');
@@ -293,6 +326,51 @@ mod tests {
         let r = process(&[0x01, b'c']);
         assert!(matches!(r.action, Some(InputAction::Create)));
         assert!(r.write.is_empty());
+    }
+
+    #[test]
+    fn bare_esc_is_held_then_flushed() {
+        let mut p = InputProcessor::new();
+        assert!(p.process(&[0x1b]).write.is_empty());
+        assert!(p.has_pending_escape());
+        assert_eq!(p.flush_pending_escape(), vec![0x1b]);
+        assert!(!p.has_pending_escape());
+        // Back to normal: the next key passes straight through.
+        assert_eq!(p.process(b"x").write, b"x");
+    }
+
+    #[test]
+    fn partial_csi_flushes_verbatim() {
+        let mut p = InputProcessor::new();
+        assert!(p.process(b"\x1b[1;5").write.is_empty());
+        assert!(p.has_pending_escape());
+        assert_eq!(p.flush_pending_escape(), b"\x1b[1;5");
+    }
+
+    #[test]
+    fn ctrl_a_then_bare_esc_flushes_both() {
+        let mut p = InputProcessor::new();
+        assert!(p.process(&[0x01, 0x1b]).write.is_empty());
+        assert!(p.has_pending_escape());
+        assert_eq!(p.flush_pending_escape(), vec![0x01, 0x1b]);
+    }
+
+    #[test]
+    fn bare_ctrl_a_prefix_never_pending() {
+        let mut p = InputProcessor::new();
+        assert!(p.process(&[0x01]).write.is_empty());
+        assert!(!p.has_pending_escape());
+        assert!(p.flush_pending_escape().is_empty());
+        assert!(matches!(p.process(b"c").action, Some(InputAction::Create)));
+    }
+
+    #[test]
+    fn complete_sequences_leave_nothing_pending() {
+        let mut p = InputProcessor::new();
+        assert_eq!(p.process(b"\x1b[A").write, b"\x1b[A");
+        assert!(!p.has_pending_escape());
+        assert_eq!(p.process(b"\x1bx").write, b"\x1bx");
+        assert!(!p.has_pending_escape());
     }
 
     #[test]

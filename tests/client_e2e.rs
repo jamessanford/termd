@@ -292,3 +292,20 @@ fn attach_keep_flag_holds_dead_pty_until_destroyed() {
     let listed = daemon.run(&["list"]);
     assert!(!listed.contains(&ptys[2]), "dead PTY not reaped after clearing keep: {listed}");
 }
+
+// A bare ESC typed on the client (not a CSI-u encoded one) reaches the PTY on
+// its own, without waiting for another key: the client holds it only briefly
+// in case it starts an escape sequence. `cat -v` in non-canonical mode shows
+// it as ^[ the moment it arrives.
+#[test]
+fn attach_bare_esc_passes_through_without_next_key() {
+    let daemon = Daemon::start();
+    let pty = daemon.create_pty();
+    daemon.send(&pty, "stty -icanon -echo; printf 'CAT-READY\\n'; cat -v\r");
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut client = AttachClient::spawn(&daemon, &pty, 80, 24);
+    client.drain_until(b"CAT-READY");
+    client.write(&[0x1b]);
+    client.drain_until(b"^[");
+}
