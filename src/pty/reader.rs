@@ -667,6 +667,9 @@ impl Reader {
                 None => format!("\r\n[Command {} terminated]\r\n", title),
             }
         };
+        // Into the terminal too, so the exited PTY's lingering final screen
+        // (refresh / scrollback) shows how it ended.
+        self.terminal.vt_write(exit_msg.as_bytes());
         let gen = self.shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = self.tx.send(PtyEvent::Data(PtyChunk {
             generation: gen,

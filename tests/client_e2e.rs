@@ -240,3 +240,47 @@ fn attach_exit_switches_to_most_recent_pty() {
     let after = client.drain_until(b"\x1b]0;MRU-C");
     assert!(!contains(&after, b"\x1b]0;MRU-A"), "exit went to A, not the most recent PTY");
 }
+
+// Keep mode (C-a o): an exited PTY stays on screen, showing how it ended,
+// instead of switching away. C-a k then destroys it and moves to the most
+// recent survivor. Flipping back to Switch (C-a o) while parked on a dead PTY
+// moves on immediately.
+#[test]
+fn attach_keep_mode_holds_dead_pty_until_destroyed() {
+    let daemon = Daemon::start();
+    let ptys: Vec<String> = (0..3).map(|_| daemon.create_pty()).collect();
+    for (pty, title) in ptys.iter().zip(["KEEP-A", "KEEP-B", "KEEP-C"]) {
+        daemon.send(pty, &format!("printf '\\033]0;{title}\\007'\r"));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut client = AttachClient::spawn(&daemon, &ptys[0], 80, 24);
+    client.drain_until(b"\x1b]0;KEEP-A");
+    client.write(b"\x011"); // C-a 1: B
+    client.drain_until(b"\x1b]0;KEEP-B");
+    client.write(b"\x01o"); // C-a o: Keep
+    // The banner goes to stderr (not captured); show_info holds 1s, then B repaints.
+    client.drain_until(b"\x1b]0;KEEP-B");
+
+    daemon.send(&ptys[1], "exit 7\r");
+    let after = client.drain_until(b"exited with code 7");
+    assert!(!contains(&after, b"\x1b]0;KEEP-A"), "Keep mode switched away on exit");
+
+    // Scrollback-capable dead screen survives a repaint (C-a R).
+    client.write(b"\x01R");
+    let repaint = client.drain_until(b"exited with code 7");
+    assert!(!contains(&repaint, b"\x1b]0;KEEP-A"));
+
+    client.write(b"\x01k"); // C-a k: destroy → most recent survivor (A)
+    client.drain_until(b"\x1b]0;KEEP-A");
+
+    // Now C dies while unviewed-but-kept, we visit it, then flip to Switch.
+    daemon.send(&ptys[2], "exit\r");
+    std::thread::sleep(Duration::from_millis(300));
+    client.write(b"\x011"); // list is now [A, C]: C-a 1 = C (dead)
+    client.drain_until(b"exited with code 0");
+    client.write(b"\x01o"); // C-a o: Switch → leaves dead C for A
+    client.drain_until(b"\x1b]0;KEEP-A");
+    let listed = daemon.run(&["list"]);
+    assert!(!listed.contains(&ptys[2]), "dead PTY not destroyed on switching away: {listed}");
+}

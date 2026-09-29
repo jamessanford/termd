@@ -23,6 +23,28 @@ pub(super) enum InputAction {
     ShowInfo,
     ShowScrollback,
     ShowHelp,
+    ToggleOnExit,
+}
+
+/// What to do when the viewed PTY's command exits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnExit {
+    /// Destroy it and switch to the most recently viewed PTY.
+    Switch,
+    /// Leave the dead PTY on screen (scrollback works) until C-a k destroys it.
+    Keep,
+}
+
+/// Client options. For now only settable by keybinding and not persisted; the
+/// intended home for options once there's a config file / settings UI (TODO.md).
+struct Settings {
+    on_exit: OnExit,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { on_exit: OnExit::Switch }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -286,7 +308,7 @@ async fn subscribe(
 /// snapshot is the authoritative base; the server sequences it after the data it
 /// subsumes, so the client renders only the snapshot and resumes on the data that
 /// follows it.
-type RefreshSnapshot = (u32, u32, Vec<u8>);
+type RefreshSnapshot = (u32, u32, Vec<u8>, bool);
 
 // Returns Ok(None) if the server reported this subscription is gone (the Subscribe
 // stream ended before a Refresh arrived). Returns Ok(Some(...)) on success.
@@ -305,7 +327,7 @@ async fn request_refresh(
             None => return Ok(None),
             Some(SubscribeEvent { event: Some(Event::Refresh(rf)) }) => {
                 let s = rf.size.unwrap_or_default();
-                return Ok(Some((s.cols, s.rows, rf.data)));
+                return Ok(Some((s.cols, s.rows, rf.data, rf.exited)));
             }
             // Discard everything that precedes the snapshot. The server emits the
             // snapshot inline, ordered after the data it subsumes, so any Data here
@@ -407,12 +429,16 @@ fn draw_list(items: &[PtyItem], selected: usize) {
         let pty_id_hex = format!("{:016x}", item.pty_id);
         let title_trunc: String = title.chars().take(32).collect();
         let (cols, rows) = item_size(item);
+        let state = match &item.exited {
+            Some(e) => format!("  [exited {}]", e.exit_code),
+            None => String::new(),
+        };
         let line = format!(
-            " {:>3}  {:<16}  {:<32}  {}x{}\r\n",
+            " {:>3}  {:<16}  {:<32}  {}x{}{}\r\n",
             item.sort_order,
             pty_id_hex,
             title_trunc,
-            cols, rows,
+            cols, rows, state,
         );
         out.extend_from_slice(line.as_bytes());
         if i == selected { out.extend_from_slice(b"\x1b[0m"); }
@@ -656,6 +682,7 @@ pub async fn run(
     let mut current_item = item;
     let mut pty_list: Vec<PtyItem> = Vec::new();
     let mut mru = mru::Mru::default();
+    let mut settings = Settings::default();
     mru.touch(current_pty_id);
     // The single active Subscribe stream for the current PTY (None = idle/unsubscribed).
     let mut sub: Option<Subscription> = None;
@@ -728,11 +755,16 @@ pub async fn run(
         };
 
         match refresh_result {
-            Some((cols, rows, bytes)) => (cols, rows, bytes),
-            None => {
-                // Subscription is gone (the PTY closed, or subscribe found it
-                // already gone). Tear it down and let the user pick a new one.
-                sub = None;
+            // An exited PTY is only worth showing in Keep mode; in Switch mode
+            // it's as good as gone (e.g. it died while we were elsewhere, or
+            // C-a o just flipped us back to Switch).
+            Some((cols, rows, bytes, exited)) if !exited || settings.on_exit == OnExit::Keep => {
+                (cols, rows, bytes)
+            }
+            _ => {
+                // The PTY is gone (stream ended, or subscribe found it already
+                // gone) or exited in Switch mode. Tear it down and move on.
+                close_subscription_bg(&mut sub);
                 pty_list.clear();
                 let _ = destroy_and_drain(client, current_pty_id).await;
                 match next_after_gone(client, &mut pty_list, &mut mru, current_pty_id, &mut stdin).await? {
@@ -836,8 +868,13 @@ pub async fn run(
                                     }
                                     stream_metadata::Event::Exited(_) => {
                                         handler.on_pty_event(PtyEvent::Closed, &mut out)?;
-                                        input.reset();
-                                        break RunOutcome::PtyClosed;
+                                        // Keep: stay on the final screen. The stream
+                                        // stays open until someone destroys the PTY,
+                                        // then ends and routes through the gone path.
+                                        if settings.on_exit == OnExit::Switch {
+                                            input.reset();
+                                            break RunOutcome::PtyClosed;
+                                        }
                                     }
                                     stream_metadata::Event::SubscribersChanged(_) => {}
                                     // We lagged the server's broadcast and lost stream
@@ -1088,7 +1125,9 @@ pub async fn run(
                         let (server_cols, server_rows) = item_size(&current_item);
                         show_info(&format!(
                             "requested={mode:?} actual={dispatch_mode:?} pty={current_pty_id:016x} \
-                             server={server_cols}x{server_rows} client={client_cols}x{client_rows}",
+                             server={server_cols}x{server_rows} client={client_cols}x{client_rows} \
+                             on_exit={on_exit:?}",
+                            on_exit = settings.on_exit,
                         )).await;
                     }
 
@@ -1107,6 +1146,19 @@ pub async fn run(
 
                     InputAction::ShowHelp => {
                         help::show_help(&mut stdin).await;
+                    }
+
+                    InputAction::ToggleOnExit => {
+                        settings.on_exit = match settings.on_exit {
+                            OnExit::Switch => OnExit::Keep,
+                            OnExit::Keep => OnExit::Switch,
+                        };
+                        show_info(match settings.on_exit {
+                            OnExit::Switch => "On exit: switch to the most recent PTY",
+                            OnExit::Keep => "On exit: keep the dead PTY until C-a k",
+                        }).await;
+                        // The next pass's refresh re-checks the current PTY: if it's
+                        // already dead and we're now in Switch mode, it moves on.
                     }
                 }
             }

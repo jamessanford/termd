@@ -91,6 +91,7 @@ impl InputProcessor {
                 b'"' | b'w' => Some(InputAction::ShowList),
                 b'i'     => Some(InputAction::ShowInfo),
                 b'k'     => Some(InputAction::Destroy),
+                b'o'     => Some(InputAction::ToggleOnExit),
                 b's'     => Some(InputAction::ShowScrollback),
                 b'?'     => Some(InputAction::ShowHelp),
                 b' '     => Some(InputAction::SwitchNext),
@@ -291,6 +292,13 @@ mod tests {
     fn ctrl_a_c_creates() {
         let r = process(&[0x01, b'c']);
         assert!(matches!(r.action, Some(InputAction::Create)));
+        assert!(r.write.is_empty());
+    }
+
+    #[test]
+    fn ctrl_a_o_toggles_on_exit() {
+        let r = process(&[0x01, b'o']);
+        assert!(matches!(r.action, Some(InputAction::ToggleOnExit)));
         assert!(r.write.is_empty());
     }
 
