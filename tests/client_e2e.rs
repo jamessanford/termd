@@ -215,3 +215,28 @@ fn attach_clears_colors_and_title_on_switch_and_exit() {
     assert!(contains(&detach, b"\x1b]112\x1b\\"), "missing cursor-color reset at detach");
     assert!(contains(&detach, b"\x1b[23;0t"), "missing title pop at session exit");
 }
+
+// When the viewed PTY exits, the client goes to the most recently viewed
+// survivor instead of the picker. Visit A -> C -> B and exit B: the MRU says C
+// (list order would say A or C; the old code showed the picker). Each PTY sets a
+// distinct title, which its refresh restores, so the title identifies the PTY.
+#[test]
+fn attach_exit_switches_to_most_recent_pty() {
+    let daemon = Daemon::start();
+    let ptys: Vec<String> = (0..3).map(|_| daemon.create_pty()).collect();
+    for (pty, title) in ptys.iter().zip(["MRU-A", "MRU-B", "MRU-C"]) {
+        daemon.send(pty, &format!("printf '\\033]0;{title}\\007'\r"));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut client = AttachClient::spawn(&daemon, &ptys[0], 80, 24);
+    client.drain_until(b"\x1b]0;MRU-A");
+    client.write(b"\x012"); // C-a 2: C
+    client.drain_until(b"\x1b]0;MRU-C");
+    client.write(b"\x011"); // C-a 1: B
+    client.drain_until(b"\x1b]0;MRU-B");
+
+    daemon.send(&ptys[1], "exit\r");
+    let after = client.drain_until(b"\x1b]0;MRU-C");
+    assert!(!contains(&after, b"\x1b]0;MRU-A"), "exit went to A, not the most recent PTY");
+}

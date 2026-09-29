@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 mod input;
+mod mru;
 
 pub(super) enum InputAction {
     Detach,
@@ -360,25 +361,6 @@ async fn destroy_and_drain(
     }
 }
 
-async fn recent_pty<'a>(list: &'a [PtyItem], previous_pty_id: &Option<u64>, current_pty_id: u64) -> Option<&'a PtyItem> {
-    let prev_id = (*previous_pty_id)?;
-    if let Some(item) = list.iter().find(|p| p.pty_id == prev_id) {
-        Some(item)
-    } else {
-        let best = list.iter()
-            .filter(|p| p.pty_id != current_pty_id)
-            .max_by_key(|p| {
-                let ts = p.last_subscribed_at.as_ref().or(p.created_at.as_ref());
-                ts.map(|t| (t.seconds, t.nanos)).unwrap_or((0, 0))
-            });
-        if best.is_none() {
-            show_info("No other PTYs").await;
-        }
-        best.or_else(|| list.first())
-    }
-}
-
-
 fn next_pty(list: &[PtyItem], current_id: u64) -> Option<&PtyItem> {
     if list.is_empty() { return None; }
     let pos = list.iter().position(|p| p.pty_id == current_id).unwrap_or(0);
@@ -398,13 +380,14 @@ fn switch_pty(
     sub:             &mut Option<Subscription>,
     current_pty_id:  &mut u64,
     current_item:    &mut PtyItem,
-    previous_pty_id: &mut Option<u64>,
+    mru:             &mut mru::Mru,
     new_item:        PtyItem,
 ) {
     // Tear down the old PTY's stream gracefully (in the background, so the
     // switch never waits on the server) rather than letting callers bare-drop it.
     close_subscription_bg(sub);
-    *previous_pty_id = Some(std::mem::replace(current_pty_id, new_item.pty_id));
+    *current_pty_id = new_item.pty_id;
+    mru.touch(new_item.pty_id);
     *current_item = new_item;
 }
 
@@ -436,6 +419,29 @@ fn draw_list(items: &[PtyItem], selected: usize) {
     }
     let _ = std::io::stdout().write_all(&out);
     let _ = std::io::stdout().flush();
+}
+
+/// The current PTY `gone_id` is dead (exited or destroyed): pick where to go.
+/// The most recently viewed surviving PTY wins; the picker is the last resort
+/// (nothing else in the MRU or on the server). None = nowhere to go (empty
+/// session or picker cancelled); the caller idles.
+async fn next_after_gone(
+    client:   &mut AuthedClient,
+    pty_list: &mut Vec<PtyItem>,
+    mru:      &mut mru::Mru,
+    gone_id:  u64,
+    stdin:    &mut tokio::io::Stdin,
+) -> anyhow::Result<Option<PtyItem>> {
+    mru.remove(gone_id);
+    if ensure_list(client, pty_list).await {
+        if let Some(target) = mru.pick(pty_list, gone_id) {
+            return Ok(Some(target.clone()));
+        }
+    }
+    Ok(match show_list(client, pty_list, gone_id, stdin).await? {
+        Some(id) => pty_list.iter().find(|p| p.pty_id == id).cloned(),
+        None => None,
+    })
 }
 
 async fn show_list(
@@ -649,7 +655,8 @@ pub async fn run(
     let mut current_pty_id = item.pty_id;
     let mut current_item = item;
     let mut pty_list: Vec<PtyItem> = Vec::new();
-    let mut previous_pty_id: Option<u64> = None;
+    let mut mru = mru::Mru::default();
+    mru.touch(current_pty_id);
     // The single active Subscribe stream for the current PTY (None = idle/unsubscribed).
     let mut sub: Option<Subscription> = None;
 
@@ -728,12 +735,10 @@ pub async fn run(
                 sub = None;
                 pty_list.clear();
                 let _ = destroy_and_drain(client, current_pty_id).await;
-                match show_list(client, &mut pty_list, current_pty_id, &mut stdin).await? {
-                    Some(new_id) => {
-                        if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-                            switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
-                            pty_list.clear();
-                        }
+                match next_after_gone(client, &mut pty_list, &mut mru, current_pty_id, &mut stdin).await? {
+                    Some(target) => {
+                        switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
+                        pty_list.clear();
                         continue 'session;
                     }
                     None => { skip_subscribe = true; (0, 0, vec![]) }
@@ -966,12 +971,10 @@ pub async fn run(
                 sub = None;
                 pty_list.clear();
                 let _ = destroy_and_drain(client, current_pty_id).await;
-                match show_list(client, &mut pty_list, current_pty_id, &mut stdin).await? {
-                    Some(new_id) => {
-                        if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-                            switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
-                            pty_list.clear();
-                        }
+                match next_after_gone(client, &mut pty_list, &mut mru, current_pty_id, &mut stdin).await? {
+                    Some(target) => {
+                        switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
+                        pty_list.clear();
                     }
                     None => { skip_subscribe = true; }
                 }
@@ -989,17 +992,12 @@ pub async fn run(
                         }
                         sub = None;
                         pty_list.clear();
-                        let auto_target = if ensure_list(client, &mut pty_list).await {
-                            recent_pty(&pty_list, &previous_pty_id, current_pty_id).await.cloned()
-                        } else {
-                            None
-                        };
-                        match auto_target {
-                            Some(target) if target.pty_id != current_pty_id => {
-                                switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
+                        match next_after_gone(client, &mut pty_list, &mut mru, current_pty_id, &mut stdin).await? {
+                            Some(target) => {
+                                switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
                                 pty_list.clear();
                             }
-                            _ => { skip_subscribe = true; }
+                            None => { skip_subscribe = true; }
                         }
                     }
 
@@ -1027,7 +1025,7 @@ pub async fn run(
                             command: None,
                         }).await);
                         let new_item = created.into_inner();
-                        switch_pty(&mut sub,&mut current_pty_id, &mut current_item, &mut previous_pty_id, new_item);
+                        switch_pty(&mut sub,&mut current_pty_id, &mut current_item, &mut mru, new_item);
                         pty_list.clear();
                     }
 
@@ -1037,7 +1035,7 @@ pub async fn run(
                         }
                         if let Some(target) = next_pty(&pty_list, current_pty_id).cloned() {
                             if target.pty_id != current_pty_id {
-                                switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
+                                switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
                             }
                         }
                     }
@@ -1048,17 +1046,16 @@ pub async fn run(
                         }
                         if let Some(target) = prev_pty(&pty_list, current_pty_id).cloned() {
                             if target.pty_id != current_pty_id {
-                                switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
+                                switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
                             }
                         }
                     }
 
                     InputAction::SwitchRecent => {
                         if ensure_list(client, &mut pty_list).await {
-                            if let Some(target) = recent_pty(&pty_list, &previous_pty_id, current_pty_id).await.cloned() {
-                                if target.pty_id != current_pty_id {
-                                    switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
-                                }
+                            match mru.pick(&pty_list, current_pty_id).cloned() {
+                                Some(target) => switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target),
+                                None => show_info("No other PTYs").await,
                             }
                         }
                     }
@@ -1069,7 +1066,7 @@ pub async fn run(
                         }
                         if let Some(target) = pty_list.get(n as usize).cloned() {
                             if target.pty_id != current_pty_id {
-                                switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
+                                switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
                             }
                         }
                     }
@@ -1078,7 +1075,7 @@ pub async fn run(
                         match show_list(client, &mut pty_list, current_pty_id, &mut stdin).await? {
                             Some(new_id) if new_id != current_pty_id => {
                                 if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-                                    switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut previous_pty_id, target);
+                                    switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
                                     pty_list.clear();
                                 }
                             }
