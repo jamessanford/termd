@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Write;
 
 use anyhow::Result;
@@ -353,12 +354,13 @@ fn is_pty_gone(err: &anyhow::Error) -> bool {
         .is_some_and(|s| s.code() == tonic::Code::NotFound)
 }
 
-/// True if the server answered but can't serve this PTY: it's gone (NotFound)
-/// or broken (Internal — e.g. an older server whose reader died when the command
-/// exited). Either way the transport is fine, so reconnecting would just loop.
-fn is_pty_unusable(err: &anyhow::Error) -> bool {
+/// True if the server answered but failed to serve this PTY (Internal — e.g. an
+/// older server whose reader died when the command exited). The transport is
+/// fine, so reconnecting would just loop; but the PTY may be perfectly alive
+/// behind a server bug, so it must not be destroyed either.
+fn is_pty_broken(err: &anyhow::Error) -> bool {
     err.downcast_ref::<tonic::Status>()
-        .is_some_and(|s| matches!(s.code(), tonic::Code::NotFound | tonic::Code::Internal))
+        .is_some_and(|s| s.code() == tonic::Code::Internal)
 }
 
 async fn destroy_and_drain(
@@ -438,21 +440,33 @@ fn draw_list(items: &[PtyItem], selected: usize) {
     let _ = std::io::stdout().flush();
 }
 
-/// The current PTY `gone_id` is dead (exited or destroyed): pick where to go.
-/// The most recently viewed surviving PTY wins; the picker is the last resort
-/// (nothing else in the MRU or on the server). None = nowhere to go (empty
-/// session or picker cancelled); the caller idles.
+/// The most recently viewed PTY other than `current`, skipping `broken` ones.
+fn pick_recent(
+    mru: &mut mru::Mru, list: &[PtyItem], current: u64, broken: &HashSet<u64>,
+) -> Option<PtyItem> {
+    let candidates: Vec<PtyItem> =
+        list.iter().filter(|p| !broken.contains(&p.pty_id)).cloned().collect();
+    mru.pick(&candidates, current).cloned()
+}
+
+/// We can't stay on `gone_id` (exited, destroyed, or broken): pick where to go.
+/// The most recently viewed usable PTY wins, never one in `broken` — so a
+/// server failing every PTY can't bounce us around forever. The picker is the
+/// last resort; it lists broken PTYs too, and choosing one retries it (one try
+/// per keypress). None = nowhere to go (empty session or picker cancelled);
+/// the caller idles.
 async fn next_after_gone(
     client:   &mut AuthedClient,
     pty_list: &mut Vec<PtyItem>,
     mru:      &mut mru::Mru,
+    broken:   &HashSet<u64>,
     gone_id:  u64,
     stdin:    &mut tokio::io::Stdin,
 ) -> anyhow::Result<Option<PtyItem>> {
     mru.remove(gone_id);
     if ensure_list(client, pty_list).await {
-        if let Some(target) = mru.pick(pty_list, gone_id) {
-            return Ok(Some(target.clone()));
+        if let Some(target) = pick_recent(mru, pty_list, gone_id, broken) {
+            return Ok(Some(target));
         }
     }
     Ok(match show_list(client, pty_list, gone_id, stdin).await? {
@@ -675,6 +689,9 @@ pub async fn run(
     let mut mru = mru::Mru::default();
     // C-a o's new keep_on_exit for the current PTY, sent on the next subscribe.
     let mut pending_keep: Option<bool> = None;
+    // PTYs the server failed to serve (Internal) this session: automatic picks
+    // skip them. Cleared per PTY once one displays again.
+    let mut broken: HashSet<u64> = HashSet::new();
     mru.touch(current_pty_id);
     // The single active Subscribe stream for the current PTY (None = idle/unsubscribed).
     let mut sub: Option<Subscription> = None;
@@ -742,8 +759,13 @@ pub async fn run(
         let refresh_result = if let Some(s) = sub.as_mut() {
             match request_refresh(client, s, current_pty_id).await {
                 Ok(r) => r,
-                // Not a transport problem: route to the gone branch below.
-                Err(e) if is_pty_unusable(&e) => None,
+                // Not a transport problem: skip this PTY (without destroying
+                // it) via the gone branch below.
+                Err(e) if is_pty_broken(&e) => {
+                    show_error(&format!("can't display PTY {current_pty_id:016x}: {e}")).await;
+                    broken.insert(current_pty_id);
+                    None
+                }
                 Err(_) => do_reconnect!('session),
             }
         } else {
@@ -755,15 +777,19 @@ pub async fn run(
             // An exited PTY without keep_on_exit is being reaped (C-a o just
             // cleared the flag); treat it as gone rather than show it.
             Some((cols, rows, bytes, exited)) if !exited || current_item.keep_on_exit => {
+                broken.remove(&current_pty_id);
                 (cols, rows, bytes)
             }
             _ => {
                 // The PTY is gone (stream ended, or subscribe found it already
-                // gone) or is being reaped. Tear it down and move on.
+                // gone), being reaped, or broken. Move on; destroy it unless
+                // broken (it may be a live shell behind a server bug).
                 close_subscription_bg(&mut sub);
                 pty_list.clear();
-                let _ = destroy_and_drain(client, current_pty_id).await;
-                match next_after_gone(client, &mut pty_list, &mut mru, current_pty_id, &mut stdin).await? {
+                if !broken.contains(&current_pty_id) {
+                    let _ = destroy_and_drain(client, current_pty_id).await;
+                }
+                match next_after_gone(client, &mut pty_list, &mut mru, &broken, current_pty_id, &mut stdin).await? {
                     Some(target) => {
                         switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
                         pty_list.clear();
@@ -1005,7 +1031,7 @@ pub async fn run(
                 sub = None;
                 pty_list.clear();
                 let _ = destroy_and_drain(client, current_pty_id).await;
-                match next_after_gone(client, &mut pty_list, &mut mru, current_pty_id, &mut stdin).await? {
+                match next_after_gone(client, &mut pty_list, &mut mru, &broken, current_pty_id, &mut stdin).await? {
                     Some(target) => {
                         switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
                         pty_list.clear();
@@ -1026,7 +1052,7 @@ pub async fn run(
                         }
                         sub = None;
                         pty_list.clear();
-                        match next_after_gone(client, &mut pty_list, &mut mru, current_pty_id, &mut stdin).await? {
+                        match next_after_gone(client, &mut pty_list, &mut mru, &broken, current_pty_id, &mut stdin).await? {
                             Some(target) => {
                                 switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
                                 pty_list.clear();
@@ -1087,7 +1113,7 @@ pub async fn run(
 
                     InputAction::SwitchRecent => {
                         if ensure_list(client, &mut pty_list).await {
-                            match mru.pick(&pty_list, current_pty_id).cloned() {
+                            match pick_recent(&mut mru, &pty_list, current_pty_id, &broken) {
                                 Some(target) => switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target),
                                 None => show_info("No other PTYs").await,
                             }
