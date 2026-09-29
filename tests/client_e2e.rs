@@ -309,3 +309,50 @@ fn attach_bare_esc_passes_through_without_next_key() {
     client.write(&[0x1b]);
     client.drain_until(b"^[");
 }
+
+// The picker takes C-a bindings (create, detach) and ESC-back; with no PTYs
+// left it's also the idle screen, where C-a c still creates one.
+#[test]
+fn attach_picker_accepts_ctrl_a_bindings() {
+    let daemon = Daemon::start();
+    let pty = daemon.create_pty();
+    daemon.send(&pty, "printf '\\033]0;PICK-A\\007'\r");
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut client = AttachClient::spawn(&daemon, &pty, 80, 24);
+    client.drain_until(b"\x1b]0;PICK-A");
+
+    // Picker, then a bare ESC: back to A (it repaints; its title restores).
+    client.write(b"\x01\"");
+    client.drain_until(b"C-a c create");
+    client.write(&[0x1b]);
+    client.drain_until(b"\x1b]0;PICK-A");
+
+    // Picker, then C-a c: a new PTY is created and shown.
+    client.write(b"\x01\"");
+    client.drain_until(b"C-a c create");
+    client.write(b"\x01c");
+    client.drain_until(b"\x1b[!p");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(daemon.run(&["list"]).lines().count(), 3, "C-a c in the picker didn't create");
+
+    // The only PTY's exit drops into the (empty-ish) picker; ESC can't leave
+    // it (nothing to go back to), but C-a c creates and C-a d detaches.
+    let listed = daemon.run(&["list"]);
+    for id in listed.lines().skip(1).filter_map(|l| l.split_whitespace().nth(1)) {
+        daemon.send(id, "exit\r");
+    }
+    client.drain_until(b"No PTYs in this session");
+    client.write(&[0x1b]);
+    std::thread::sleep(Duration::from_millis(200));
+    // C-a c from here creates a PTY and actually shows it (its refresh arrives).
+    client.write(b"\x01c");
+    client.drain_until(b"\x1b[!p");
+    client.write(b"\x01d");
+    client.drain_until(b"\x1b[23;0t"); // title pop: session over
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while client.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "C-a d in the picker didn't detach");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}

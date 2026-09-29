@@ -86,6 +86,8 @@ enum RunOutcome {
     /// still healthy. Reopens + repaints quietly, with no reconnect banner.
     Resubscribe,
     Action(InputAction),
+    /// Chosen in the picker.
+    Select(u64),
 }
 
 use termd::proto::{
@@ -416,10 +418,13 @@ fn clear_screen() {
     let _ = std::io::stdout().flush();
 }
 
-fn draw_list(items: &[PtyItem], selected: usize) {
+fn draw_list(items: &[PtyItem], selected: usize, can_cancel: bool) {
     use std::io::Write;
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[2J\x1b[H");
+    if items.is_empty() {
+        out.extend_from_slice(b" No PTYs in this session.\r\n");
+    }
     for (i, item) in items.iter().enumerate() {
         if i == selected { out.extend_from_slice(b"\x1b[7m"); }
         let title = if item.title.is_empty() { &item.pts_name } else { &item.title };
@@ -441,6 +446,14 @@ fn draw_list(items: &[PtyItem], selected: usize) {
         out.extend_from_slice(line.as_bytes());
         if i == selected { out.extend_from_slice(b"\x1b[0m"); }
     }
+    out.extend_from_slice(b"\r\n ");
+    if !items.is_empty() {
+        out.extend_from_slice("\u{2191}\u{2193}/jk select  Enter switch  ".as_bytes());
+    }
+    if can_cancel {
+        out.extend_from_slice(b"Esc/q back  ");
+    }
+    out.extend_from_slice(b"C-a c create  C-a d detach  C-a ? help\r\n");
     let _ = std::io::stdout().write_all(&out);
     let _ = std::io::stdout().flush();
 }
@@ -456,49 +469,88 @@ fn pick_recent(
 
 /// We can't stay on `gone_id` (exited, destroyed, or broken): pick where to go.
 /// The most recently viewed usable PTY wins, never one in `broken` — so a
-/// server failing every PTY can't bounce us around forever. The picker is the
-/// last resort; it lists broken PTYs too, and choosing one retries it (one try
-/// per keypress). None = nowhere to go (empty session or picker cancelled);
-/// the caller idles.
+/// server failing every PTY can't bounce us around forever. None = nothing
+/// usable: the caller drops to the picker, which lists broken PTYs too, where
+/// choosing one retries it (one try per keypress).
 async fn next_after_gone(
     client:   &mut AuthedClient,
     pty_list: &mut Vec<PtyItem>,
     mru:      &mut mru::Mru,
     broken:   &HashSet<u64>,
     gone_id:  u64,
-    stdin:    &mut tokio::io::Stdin,
-) -> anyhow::Result<Option<PtyItem>> {
+) -> Option<PtyItem> {
     mru.remove(gone_id);
-    if ensure_list(client, pty_list).await {
-        if let Some(target) = pick_recent(mru, pty_list, gone_id, broken) {
-            return Ok(Some(target));
-        }
-    }
-    Ok(match show_list(client, pty_list, gone_id, stdin).await? {
-        Some(id) => pty_list.iter().find(|p| p.pty_id == id).cloned(),
-        None => None,
-    })
+    if !ensure_list(client, pty_list).await { return None; }
+    pick_recent(mru, pty_list, gone_id, broken)
 }
 
-async fn show_list(
-    client:          &mut AuthedClient,
-    pty_list:        &mut Vec<PtyItem>,
-    current_pty_id:  u64,
-    stdin:           &mut tokio::io::Stdin,
-) -> anyhow::Result<Option<u64>> {
-    // Returns Some(new_pty_id) on selection, None on cancel.
+/// A key the picker understands, decoded from InputProcessor's pass-through bytes.
+#[derive(Debug, PartialEq, Eq)]
+enum PickerKey { Up, Down, Enter, Cancel }
+
+/// Decode picker keys from bytes InputProcessor passed through (C-a bindings
+/// never get here). A lone ESC is only ever a whole-buffer `[0x1b]` — the
+/// processor holds it until more arrives or the caller's timeout flushes it.
+fn picker_keys(b: &[u8]) -> Vec<PickerKey> {
+    use PickerKey::*;
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match &b[i..] {
+            [b'\r' | b'\n', ..] => { keys.push(Enter); i += 1; }
+            [b'k', ..] => { keys.push(Up); i += 1; }
+            [b'j', ..] => { keys.push(Down); i += 1; }
+            [b'q', ..] => { keys.push(Cancel); i += 1; }
+            [0x1b, b'[' | b'O', b'A', ..] => { keys.push(Up); i += 3; }
+            [0x1b, b'[' | b'O', b'B', ..] => { keys.push(Down); i += 3; }
+            [0x1b, b'[', rest @ ..] => {
+                // Some other CSI: skip to its final byte. CSI-u ESC / Enter
+                // (`27u` / `13u`, optionally with a no-modifier `;1`) count as
+                // Cancel / Enter.
+                let Some(end) = rest.iter().position(|c| (0x40..=0x7e).contains(c)) else { break };
+                let body = &rest[..end];
+                if rest[end] == b'u' {
+                    if body == b"27" || body == b"27;1" {
+                        keys.push(Cancel);
+                    } else if body == b"13" || body == b"13;1" {
+                        keys.push(Enter);
+                    }
+                }
+                i += 2 + end + 1;
+            }
+            [0x1b] => { keys.push(Cancel); i += 1; }
+            [0x1b, _, ..] => i += 2, // Alt-<key>: ignore
+            _ => i += 1,
+        }
+    }
+    keys
+}
+
+enum PickerOutcome {
+    Select(u64),
+    /// Back to the PTY we came from (only offered when there is one).
+    Cancel,
+    /// A C-a binding pressed in the picker, for the shared dispatch.
+    Action(InputAction),
+}
+
+/// The PTY picker, also the "not viewing any PTY" screen (`current` None: no
+/// Cancel, and an empty list is fine). Input runs through the same
+/// InputProcessor as the render loop, so C-a bindings (create, detach, help,
+/// …) work here and come back as `Action` for the shared dispatch.
+async fn run_picker(
+    client:   &mut AuthedClient,
+    pty_list: &mut Vec<PtyItem>,
+    current:  Option<u64>,
+    stdin:    &mut tokio::io::Stdin,
+    input:    &mut input::InputProcessor,
+) -> anyhow::Result<PickerOutcome> {
     if let Err(e) = fetch_list(client, pty_list).await {
         show_error(&e.to_string()).await;
-        return Ok(None);
+        if current.is_some() { return Ok(PickerOutcome::Cancel); }
     }
-    if pty_list.is_empty() {
-        show_info("No PTYs in this session").await;
-        return Ok(None);
-    }
-
-    let mut selected = pty_list
-        .iter()
-        .position(|p| p.pty_id == current_pty_id)
+    let mut selected = current
+        .and_then(|id| pty_list.iter().position(|p| p.pty_id == id))
         .unwrap_or_else(|| {
             pty_list
                 .iter()
@@ -510,104 +562,56 @@ async fn show_list(
                 .map(|(i, _)| i)
                 .unwrap_or(0)
         });
+    let can_cancel = current.is_some();
+    draw_list(pty_list, selected, can_cancel);
 
-    draw_list(pty_list, selected);
-
-    let mut buf = [0u8; 8];
-
-    loop {
-        let n = match stdin.read(&mut buf).await {
-            Ok(0) | Err(_) => return Ok(None),
-            Ok(n) => n,
-        };
-
-        match &buf[..n] {
-            // Enter — select
-            [b'\r'] | [b'\n'] => {
-                clear_screen();
-                return Ok(Some(pty_list[selected].pty_id));
-            }
-            // Arrow keys arrive as 3-byte ESC sequences; match the whole read
-            [0x1b, b'[', b'A', ..] => {
-                selected = selected.saturating_sub(1);
-                draw_list(pty_list, selected);
-            }
-            [0x1b, b'[', b'B', ..] => {
-                if selected + 1 < pty_list.len() { selected += 1; }
-                draw_list(pty_list, selected);
-            }
-            // Bare ESC: try to read 2 more bytes within 50 ms to rule out
-            // a split arrow-key sequence. Timeout means it really was bare ESC.
-            [0x1b] => {
-                let mut rest = [0u8; 2];
-                let is_arrow = tokio::time::timeout(
-                    std::time::Duration::from_millis(50),
-                    stdin.read(&mut rest),
-                ).await
-                .ok()
-                .and_then(|r| r.ok())
-                .map(|n2| &rest[..n2] == b"[A" || &rest[..n2] == b"[B")
-                .unwrap_or(false);
-
-                if is_arrow {
-                    if rest[1] == b'A' {
-                        selected = selected.saturating_sub(1);
-                    } else {
-                        if selected + 1 < pty_list.len() { selected += 1; }
-                    }
-                    draw_list(pty_list, selected);
-                } else {
-                    // Bare escape — cancel
-                    clear_screen();
-                    return Ok(None);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn draw_idle() {
-    use std::io::Write;
-    let mut out = Vec::new();
-    out.extend_from_slice(b"\x1b[2J\x1b[H");
-    out.extend_from_slice(b"Not attached to a PTY.\r\n\r\n");
-    out.extend_from_slice(b"  C-a \"      show list of PTYs\r\n");
-    out.extend_from_slice(b"  C-a c      create new PTY\r\n");
-    out.extend_from_slice(b"  C-a ?      show keybindings\r\n");
-    out.extend_from_slice(b"  C-a d      detach from termd\r\n");
-    let _ = std::io::stdout().write_all(&out);
-    let _ = std::io::stdout().flush();
-}
-
-// Wait state: no PTY is attached. Draw an idle screen and wait for the user to
-// act. Input runs through the same InputProcessor as the render loop, so C-a
-// bindings (create, list, switch, detach, …) work here too — unlike the modal
-// screens (show_list/help/scrollback), which read stdin raw and can't trigger
-// them. Returns a RunOutcome for the shared dispatch in `run`.
-async fn run_idle(
-    stdin:   &mut tokio::io::Stdin,
-    input:   &mut input::InputProcessor,
-) -> anyhow::Result<RunOutcome> {
-    draw_idle();
+    input.reset();
     let mut sigwinch = signal(SignalKind::window_change())?;
-    let mut input_buf = [0u8; 256];
+    let mut buf = [0u8; 256];
+    let mut esc_flush = Box::pin(tokio::time::sleep(std::time::Duration::from_secs(86400)));
+    let mut esc_armed = false;
     loop {
-        tokio::select! {
-            result = stdin.read(&mut input_buf) => {
-                let n = match result {
-                    Ok(0) | Err(_) => return Ok(RunOutcome::Action(InputAction::Detach)),
+        let bytes = tokio::select! {
+            r = stdin.read(&mut buf) => {
+                let n = match r {
+                    Ok(0) | Err(_) => return Ok(PickerOutcome::Action(InputAction::Detach)),
                     Ok(n) => n,
                 };
-                // Drop r.write: with no PTY there's nowhere to send keystrokes.
-                if let Some(a) = input.process(&input_buf[..n]).action {
-                    return Ok(RunOutcome::Action(a));
+                let r = input.process(&buf[..n]);
+                if let Some(a) = r.action {
+                    clear_screen();
+                    return Ok(PickerOutcome::Action(a));
                 }
+                esc_armed = input.has_pending_escape();
+                if esc_armed {
+                    esc_flush.as_mut().reset(tokio::time::Instant::now() + ESC_TIMEOUT);
+                }
+                r.write
+            }
+            _ = &mut esc_flush, if esc_armed => {
+                esc_armed = false;
+                input.flush_pending_escape()
             }
             _ = sigwinch.recv() => {
-                draw_idle();
+                draw_list(pty_list, selected, can_cancel);
+                continue;
+            }
+        };
+        for key in picker_keys(&bytes) {
+            match key {
+                PickerKey::Up => selected = selected.saturating_sub(1),
+                PickerKey::Down => if selected + 1 < pty_list.len() { selected += 1 },
+                PickerKey::Enter => if let Some(p) = pty_list.get(selected) {
+                    clear_screen();
+                    return Ok(PickerOutcome::Select(p.pty_id));
+                },
+                PickerKey::Cancel => if can_cancel {
+                    clear_screen();
+                    return Ok(PickerOutcome::Cancel);
+                },
             }
         }
+        draw_list(pty_list, selected, can_cancel);
     }
 }
 
@@ -711,6 +715,9 @@ pub async fn run(
     let mut input = input::InputProcessor::new();
     let mut out = Vec::new();
     let mut skip_subscribe = false;
+    // C-a " while viewing a PTY: show the picker (keeping the subscription)
+    // instead of rendering, on the next pass.
+    let mut picker_open = false;
 
     // On a transport failure, confirm the link is back (retrying with backoff) and
     // restart the session loop so we re-subscribe and repaint the current PTY. If
@@ -744,6 +751,9 @@ pub async fn run(
         if skip_subscribe {
             skip_subscribe = false;
             sub = None;
+            break 'refresh (0, 0, vec![]);
+        }
+        if picker_open {
             break 'refresh (0, 0, vec![]);
         }
 
@@ -794,22 +804,33 @@ pub async fn run(
                 if !broken.contains(&current_pty_id) {
                     let _ = destroy_and_drain(client, current_pty_id).await;
                 }
-                match next_after_gone(client, &mut pty_list, &mut mru, &broken, current_pty_id, &mut stdin).await? {
+                match next_after_gone(client, &mut pty_list, &mut mru, &broken, current_pty_id).await {
                     Some(target) => {
                         switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
                         pty_list.clear();
                         continue 'session;
                     }
-                    None => { skip_subscribe = true; (0, 0, vec![]) }
+                    // Nothing usable: `sub` is None, so this pass shows the
+                    // picker. (Not skip_subscribe — that would also throw away
+                    // whatever the picker then switches to.)
+                    None => (0, 0, vec![]),
                 }
             }
         }
         };
-        // Without a live subscription there's no PTY to render: show the idle
-        // screen and wait for the user to act. run_idle routes input through the
-        // same InputProcessor/InputAction path as the render loop, so the shared
-        // dispatch below handles either outcome identically.
-        let outcome: RunOutcome = if let Some(sub) = sub.as_mut() {
+        // Without a live subscription there's no PTY to render, so show the
+        // picker (nothing to go back to); likewise when C-a " asked for it. It
+        // routes C-a bindings through the same InputProcessor/InputAction path
+        // as the render loop, so the shared dispatch below handles both alike.
+        let outcome: RunOutcome = if picker_open || sub.is_none() {
+            picker_open = false;
+            let back_to = sub.is_some().then_some(current_pty_id);
+            match run_picker(client, &mut pty_list, back_to, &mut stdin, &mut input).await? {
+                PickerOutcome::Select(id) => RunOutcome::Select(id),
+                PickerOutcome::Action(a) => RunOutcome::Action(a),
+                PickerOutcome::Cancel => continue 'session,
+            }
+        } else if let Some(sub) = sub.as_mut() {
             // `sub` here is the live `&mut Subscription` for the render loop; its
             // fields are borrowed directly. The idle branch below runs when there
             // is no subscription.
@@ -1023,7 +1044,7 @@ pub async fn run(
                 }
             }
         } else {
-            run_idle(&mut stdin, &mut input).await?
+            unreachable!("no subscription is handled by the picker branch")
         };
 
         match outcome {
@@ -1055,7 +1076,7 @@ pub async fn run(
                 sub = None;
                 pty_list.clear();
                 let _ = destroy_and_drain(client, current_pty_id).await;
-                match next_after_gone(client, &mut pty_list, &mut mru, &broken, current_pty_id, &mut stdin).await? {
+                match next_after_gone(client, &mut pty_list, &mut mru, &broken, current_pty_id).await {
                     Some(target) => {
                         switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
                         pty_list.clear();
@@ -1063,6 +1084,15 @@ pub async fn run(
                     None => { skip_subscribe = true; }
                 }
                 continue 'session;
+            }
+            RunOutcome::Select(id) => {
+                // Re-choosing the PTY we're already on just returns to it.
+                if id != current_pty_id || sub.is_none() {
+                    if let Some(target) = pty_list.iter().find(|p| p.pty_id == id).cloned() {
+                        switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
+                    }
+                }
+                pty_list.clear();
             }
             RunOutcome::Action(action) => {
                 reset_terminal_modes();
@@ -1076,7 +1106,7 @@ pub async fn run(
                         }
                         sub = None;
                         pty_list.clear();
-                        match next_after_gone(client, &mut pty_list, &mut mru, &broken, current_pty_id, &mut stdin).await? {
+                        match next_after_gone(client, &mut pty_list, &mut mru, &broken, current_pty_id).await {
                             Some(target) => {
                                 switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
                                 pty_list.clear();
@@ -1155,17 +1185,7 @@ pub async fn run(
                         }
                     }
 
-                    InputAction::ShowList => {
-                        match show_list(client, &mut pty_list, current_pty_id, &mut stdin).await? {
-                            Some(new_id) if new_id != current_pty_id => {
-                                if let Some(target) = pty_list.iter().find(|p| p.pty_id == new_id).cloned() {
-                                    switch_pty(&mut sub, &mut current_pty_id, &mut current_item, &mut mru, target);
-                                    pty_list.clear();
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                    InputAction::ShowList => picker_open = true,
 
                     InputAction::ShowInfo => {
                         let (client_cols, client_rows) = get_terminal_size();
@@ -1287,6 +1307,26 @@ async fn run_debug(client: &mut AuthedClient, pty_id: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picker_keys_decodes_navigation() {
+        use PickerKey::*;
+        assert_eq!(picker_keys(b"\x1b[A\x1b[B\x1bOA\x1bOBkj"), vec![Up, Down, Up, Down, Up, Down]);
+        assert_eq!(picker_keys(b"\r"), vec![Enter]);
+        assert_eq!(picker_keys(b"\x1b[13u"), vec![Enter]);
+        assert_eq!(picker_keys(b"q"), vec![Cancel]);
+        assert_eq!(picker_keys(b"\x1b"), vec![Cancel]);
+        assert_eq!(picker_keys(b"\x1b[27u"), vec![Cancel]);
+        assert_eq!(picker_keys(b"\x1b[27;1u"), vec![Cancel]);
+    }
+
+    #[test]
+    fn picker_keys_ignores_everything_else() {
+        // Other CSI (incl. modified CSI-u ESC), Alt-keys, stray letters.
+        assert!(picker_keys(b"\x1b[27;5u\x1b[1;5C\x1bxz").is_empty());
+        // A truncated CSI doesn't panic or loop.
+        assert!(picker_keys(b"\x1b[1;").is_empty());
+    }
 
     #[test]
     fn reset_clears_both_csi_u_keyboard_protocols() {
