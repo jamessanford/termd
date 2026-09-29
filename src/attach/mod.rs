@@ -694,6 +694,7 @@ pub async fn run(
 
     let mut current_pty_id = item.pty_id;
     let mut current_item = item;
+    let mut detached_msg: Option<String> = None;
     let mut pty_list: Vec<PtyItem> = Vec::new();
     let mut mru = mru::Mru::default();
     // C-a o's new keep_on_exit for the current PTY, sent on the next subscribe.
@@ -1097,7 +1098,11 @@ pub async fn run(
             RunOutcome::Action(action) => {
                 reset_terminal_modes();
                 match action {
-                    InputAction::Detach => break 'session,
+                    InputAction::Detach => {
+                        let title = if current_item.title.is_empty() { &current_item.pts_name } else { &current_item.title };
+                        detached_msg = Some(format!("[Detached from {title} ({:016x})]\r\n", current_pty_id));
+                        break 'session;
+                    }
 
                     InputAction::Destroy => {
                         if let Err(e) = destroy_and_drain(client, current_pty_id).await {
@@ -1266,6 +1271,11 @@ pub async fn run(
         let _ = std::io::stdout().flush();
     }
     move_terminal_end();
+    if let Some(msg) = detached_msg {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(msg.as_bytes());
+        let _ = std::io::stdout().flush();
+    }
     drop(_guard);
     Ok(())
 }
