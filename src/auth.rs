@@ -131,9 +131,13 @@ pub fn load_or_create_cert(dir: &Path) -> Result<ServerCert> {
             .ok()
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "termd".into());
-        let ck = rcgen::generate_simple_self_signed(vec![host, "localhost".into()])
-            .context("generating self-signed certificate")?;
-        let (c, k) = (ck.cert.pem(), ck.signing_key.serialize_pem());
+        let mut params = rcgen::CertificateParams::new(vec![host.clone(), "localhost".into()])
+            .context("building certificate params")?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params.distinguished_name.push(rcgen::DnType::CommonName, format!("termd@{host}"));
+        let key = rcgen::KeyPair::generate().context("generating key pair")?;
+        let cert = params.self_signed(&key).context("self-signing certificate")?;
+        let (c, k) = (cert.pem(), key.serialize_pem());
         write_private(&key_path, k.as_bytes())?;
         write_private(&cert_path, c.as_bytes())?;
         (c, k)
