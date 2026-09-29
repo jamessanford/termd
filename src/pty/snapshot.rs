@@ -144,6 +144,7 @@ pub(crate) fn do_refresh(
         cols,
         rows,
         degraded: false,
+        exited: false,
     })
 }
 

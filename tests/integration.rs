@@ -507,7 +507,7 @@ async fn test_closed_broadcasts_metadata() {
         loop {
             match rx.recv().await {
                 Ok(meta) => {
-                    if matches!(meta.reason, MetadataReason::Closed) {
+                    if matches!(meta.reason, MetadataReason::Exited) {
                         return true;
                     }
                 }
@@ -1000,4 +1000,62 @@ async fn test_send_pattern_survives_connection_teardown() {
         }
         _ => None,
     }).await;
+}
+
+// An exited PTY lingers until destroyed: the subscribe stream stays open after
+// Exited, List marks it exited, a (late) subscriber can still Refresh its final
+// screen (flagged exited) and open scrollback, and Destroy then ends the stream.
+#[tokio::test]
+async fn test_exited_pty_lingers_until_destroyed() {
+    let (_dir, _socket, mut client) = test_server().await;
+
+    let item = client.create(CreateRequest {
+        size: Some(Size { cols: 80, rows: 24 }), command: None,
+    }).await.unwrap().into_inner();
+    let pty_id = item.pty_id;
+
+    let mut sub = subscribe(&mut client, pty_id, 80, 24).await;
+    sub.frame_tx.send(SubscribeFrame {
+        frame: Some(subscribe_frame::Frame::Write(WriteData {
+            data: b"echo LINGER-MARK; exit 3\n".to_vec(),
+        })),
+    }).await.unwrap();
+    let code = read_until(&mut sub, 5, |ev| match ev {
+        subscribe_event::Event::Metadata(m) => match m.event {
+            Some(stream_metadata::Event::Exited(e)) => Some(e.exit_code),
+            _ => None,
+        },
+        _ => None,
+    }).await;
+    assert_eq!(code, 3);
+
+    let listed = client.list(ListRequest {}).await.unwrap().into_inner().items;
+    let listed = listed.iter().find(|p| p.pty_id == pty_id).expect("exited PTY vanished from List");
+    assert_eq!(listed.exited.as_ref().map(|e| e.exit_code), Some(3));
+
+    // A fresh subscriber on the dead PTY gets its final screen.
+    let mut late = subscribe(&mut client, pty_id, 80, 24).await;
+    client.refresh(RefreshRequest {
+        pty_id, subscriber_id: late.subscriber_id.clone(),
+    }).await.expect("refresh on exited PTY");
+    let (exited, data) = read_until(&mut late, 5, |ev| match ev {
+        subscribe_event::Event::Refresh(rf) => Some((rf.exited, rf.data)),
+        _ => None,
+    }).await;
+    assert!(exited, "refresh of an exited PTY must be flagged exited");
+    assert!(data.windows(11).any(|w| w == b"LINGER-MARK"), "final screen lost");
+
+    let sr = client.scrollback(ScrollbackRequest {
+        pty_id,
+        subscriber_id: late.subscriber_id.clone(),
+        kind: ScrollbackOpKind::ScrollbackOpen as i32,
+        amount: 0,
+        row_count: 24,
+    }).await.expect("scrollback on exited PTY").into_inner();
+    assert!(sr.total_scrollback_rows >= 24);
+
+    client.destroy(DestroyRequest { pty_id }).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Ok(Some(_)) = sub.events.message().await {}
+    }).await.expect("subscribe stream didn't end after Destroy");
 }

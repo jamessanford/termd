@@ -44,6 +44,9 @@ message PtyItem {
   repeated SubscriberInfo   subscribers        = 7;
   optional google.protobuf.Timestamp last_subscribed_at = 8;
   uint32                    sort_order         = 9;
+  // Present once the PTY's command has exited. The PTY lingers (its final
+  // screen and scrollback stay viewable) until someone Destroys it.
+  optional Exited           exited             = 10;
 }
 
 message SubscriberInfo {
@@ -125,6 +128,8 @@ message RefreshData {
   // stall timeout (the app went idle inside an escape sequence). Best-effort;
   // the client may request a clean refresh later. See docs/REFRESH.md.
   bool  degraded = 3;
+  // True when the PTY's command has exited: this is its final screen.
+  bool  exited   = 4;
 }
 
 // StreamMetadata is an out-of-band subscription state change, ordered

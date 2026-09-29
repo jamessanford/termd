@@ -49,6 +49,10 @@ pub(crate) enum ReaderRequest {
         row_count: u32,
         reply: oneshot::Sender<Result<ScrollbackData>>,
     },
+    /// destroy(): stop now. Needed because in-flight subscribe streams hold
+    /// PtyHandle clones, so the wakeup-pipe HUP alone can lag indefinitely —
+    /// forever for an exited, lingering PTY with a subscriber attached.
+    Shutdown,
 }
 
 /// Milliseconds to wait when a refresh is deferred but the parser is stuck
@@ -277,6 +281,7 @@ impl PtyInfo {
             last_subscribed_at: None,
             subscribers: None,
             sort_order: 0,
+            exited: None,
         }
     }
 }
@@ -308,6 +313,8 @@ pub(super) struct Reader {
     prev_screen: Screen,
     // Set by cleanup() on a normal exit; Drop reports it (None after a panic).
     exit_code: Option<i32>,
+    // A Shutdown request arrived: leave the run / linger loop.
+    shutdown: bool,
 }
 
 impl Reader {
@@ -355,6 +362,7 @@ impl Reader {
             prev_title,
             prev_screen: Screen::Primary,
             exit_code: None,
+            shutdown: false,
         })
     }
 
@@ -363,6 +371,9 @@ impl Reader {
         let master_fd = self.master.as_raw_fd();
         let wakeup_fd = self.wakeup_read.as_raw_fd();
         let mut buf = [0u8; 4096];
+        // True when we're leaving because the handle was dropped (destroy), as
+        // opposed to the child exiting — only the latter lingers.
+        let mut destroyed = false;
 
         'main: loop {
             // Drain the wakeup pipe, then queued requests, before waiting for PTY data.
@@ -370,6 +381,10 @@ impl Reader {
             unsafe { libc::read(wakeup_fd, wake_byte.as_mut_ptr() as *mut libc::c_void, wake_byte.len()) };
             while let Ok(req) = self.req_rx.try_recv() {
                 self.handle_request(req);
+            }
+            if self.shutdown {
+                destroyed = true;
+                break;
             }
             self.flush_refreshes_if_at_boundary();
             if !self.pending_out.is_empty() {
@@ -407,6 +422,7 @@ impl Reader {
             // (PtyHandle dropped / destroy() called).  Exit the reader loop.
             if pfds[1].revents & libc::POLLHUP != 0 {
                 tracing::debug!("PTY reader: wakeup pipe closed, exiting");
+                destroyed = true;
                 break;
             }
 
@@ -489,7 +505,82 @@ impl Reader {
         }
 
         self.cleanup();
+        if !destroyed {
+            // The child exited but nobody destroyed the PTY: announce the exit,
+            // then keep the final terminal around (refresh / scrollback) until
+            // Destroy drops the handle. Subscribe streams stay open meanwhile —
+            // they end when `tx` drops with us.
+            let _ = self.meta_tx.send(Arc::new(PtyMetadata {
+                reason:     MetadataReason::Exited,
+                exit_code:  self.exit_code,
+                generation: self.shared.generation.load(Ordering::Relaxed),
+                info:       self.shared.info(),
+            }));
+            self.linger();
+        }
         // `self` drops here: Drop emits the Closed metadata.
+    }
+
+    /// Post-exit service loop: answer requests against the final terminal state
+    /// until the wakeup pipe HUPs (the PtyHandle dropped — destroy()).
+    fn linger(&mut self) {
+        let wakeup_fd = self.wakeup_read.as_raw_fd();
+        loop {
+            let mut wake_byte = [0u8; 64];
+            unsafe { libc::read(wakeup_fd, wake_byte.as_mut_ptr() as *mut libc::c_void, wake_byte.len()) };
+            while let Ok(req) = self.req_rx.try_recv() {
+                self.serve_final(req);
+            }
+            if self.shutdown {
+                tracing::debug!("PTY reader: destroyed after exit");
+                break;
+            }
+            let mut pfd = libc::pollfd { fd: wakeup_fd, events: libc::POLLIN, revents: 0 };
+            let ret = unsafe { libc::poll(&mut pfd, 1, -1) };
+            if ret < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if pfd.revents & libc::POLLHUP != 0 {
+                tracing::debug!("PTY reader: destroyed after exit");
+                break;
+            }
+        }
+    }
+
+    /// Serve one request once the child is gone: the terminal is final, so
+    /// refreshes render immediately (no boundary wait) and are marked exited.
+    fn serve_final(&mut self, req: ReaderRequest) {
+        let gen = self.shared.generation.load(Ordering::Relaxed);
+        match req {
+            ReaderRequest::Refresh { subscriber_id, reply } => {
+                let result = self.final_refresh(gen);
+                if let (Some(sid), Ok(data)) = (subscriber_id, &result) {
+                    let _ = self.tx.send(PtyEvent::RefreshFor {
+                        subscriber_id: sid, data: Arc::new(data.clone()),
+                    });
+                }
+                let _ = reply.send(result);
+            }
+            ReaderRequest::Scrollback { subscriber_id, op, amount, row_count, reply } => {
+                let cols = self.shared.cols.load(Ordering::Relaxed);
+                let _ = reply.send(do_scrollback(
+                    &mut self.terminal, &mut self.pins, &subscriber_id,
+                    op, amount, row_count, gen, cols,
+                ));
+            }
+            ReaderRequest::Resize { reply, .. } => {
+                let _ = reply.send(Err(anyhow!("PTY closed")));
+            }
+            ReaderRequest::Write(_) => {} // child is gone; input has nowhere to go
+            ReaderRequest::Shutdown => self.shutdown = true,
+        }
+    }
+
+    fn final_refresh(&self, gen: u64) -> Result<RefreshData> {
+        do_refresh(&self.terminal, gen).map(|mut r| { r.exited = true; r })
     }
 
     /// If the parser is at a ground boundary, service deferred refreshes now;
@@ -525,6 +616,7 @@ impl Reader {
                     op, amount, row_count, gen, cols,
                 ));
             }
+            ReaderRequest::Shutdown => self.shutdown = true,
         }
     }
 
@@ -581,51 +673,23 @@ impl Reader {
             data: Bytes::from(exit_msg.into_bytes()),
         }));
         self.exit_code = status.as_ref().and_then(|s| s.code());
+        *self.shared.exited.lock().unwrap() = Some(self.exit_code);
 
-        // Refreshes deferred at exit: the terminal is final, render directly
-        // without waiting for a boundary. Emit inline for addressed requests too
-        // (a still-reading owner can render it; harmless otherwise), then reply.
-        for req in self.pending_replies.drain(..) {
-            let gen = self.shared.generation.load(Ordering::Relaxed);
-            let result = do_refresh(&self.terminal, gen);
-            if let (Some(sid), Ok(data)) = (req.subscriber_id, &result) {
-                let _ = self.tx.send(PtyEvent::RefreshFor {
-                    subscriber_id: sid, data: Arc::new(data.clone()),
-                });
-            }
-            let _ = req.reply.send(result);
+        // Refreshes deferred at exit, then everything still queued: the terminal
+        // is final, so serve them directly without waiting for a boundary.
+        for req in std::mem::take(&mut self.pending_replies) {
+            self.serve_final(ReaderRequest::Refresh {
+                subscriber_id: req.subscriber_id, reply: req.reply,
+            });
         }
-        // One drain for everything still queued — replaces the per-channel loops.
         while let Ok(req) = self.req_rx.try_recv() {
-            let gen = self.shared.generation.load(Ordering::Relaxed);
-            match req {
-                ReaderRequest::Refresh { subscriber_id, reply } => {
-                    let result = do_refresh(&self.terminal, gen);
-                    if let (Some(sid), Ok(data)) = (subscriber_id, &result) {
-                        let _ = self.tx.send(PtyEvent::RefreshFor {
-                            subscriber_id: sid, data: Arc::new(data.clone()),
-                        });
-                    }
-                    let _ = reply.send(result);
-                }
-                ReaderRequest::Scrollback { subscriber_id, op, amount, row_count, reply } => {
-                    let cols = self.shared.cols.load(Ordering::Relaxed);
-                    let _ = reply.send(do_scrollback(
-                        &mut self.terminal, &mut self.pins, &subscriber_id,
-                        op, amount, row_count, gen, cols,
-                    ));
-                }
-                ReaderRequest::Resize { reply, .. } => {
-                    let _ = reply.send(Err(anyhow!("PTY closed")));
-                }
-                ReaderRequest::Write(_) => {} // child is gone; input has nowhere to go
-            }
+            self.serve_final(req);
         }
     }
 }
 
-/// Sole emitter of the Closed metadata — fires on a clean return from run()
-/// (after cleanup() set exit_code) and on an unwind (exit_code None), so a
+/// Sole emitter of the Closed metadata (reader gone) — fires on a clean return
+/// from run() and on an unwind (exit_code None), so a
 /// panicking reader still tells attached clients the PTY is gone (they key off
 /// StreamMetadataReason::Closed to detach) instead of leaving them hung.
 /// Replaces the old ClosedNotifier mirror struct. Deliberately touches neither

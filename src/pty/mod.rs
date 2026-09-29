@@ -44,6 +44,8 @@ pub struct PtyInfo {
     pub last_subscribed_at: Option<SystemTime>,
     pub subscribers:       Option<Vec<(String, SubscriberInfo)>>,
     pub sort_order:        u32,
+    /// Some once the child has exited (inner None: killed / no status).
+    pub exited:            Option<Option<i32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,11 @@ pub struct PtyChunk {
 #[derive(Clone, Debug)]
 pub enum MetadataReason {
     Resize,
+    /// The child exited; the PTY lingers (final screen still served) until
+    /// destroyed. Subscribe streams stay open.
+    Exited,
+    /// The reader is gone (destroyed, or it failed/panicked). Subscribe streams
+    /// forward it and end.
     Closed,
     TitleChanged,
     SubscribersChanged,
@@ -92,6 +99,8 @@ pub struct RefreshData {
     /// and is not pinned at a clean VT escape sequence boundary.
     /// See docs/REFRESH.md.
     pub degraded: bool,
+    /// True when the child has exited: this is the PTY's final screen.
+    pub exited: bool,
 }
 
 // pty_id is not included — callers supply it directly from the request (see RefreshData).
@@ -126,6 +135,9 @@ pub(crate) struct PtyShared {
     // Assigned once at registration (next available slot, 0-based) for stable
     // list ordering; never changes for the life of the handle.
     pub(crate) sort_order:         AtomicU32,
+    // Set by the reader when the child exits; the PTY then lingers, serving its
+    // final screen, until destroyed. Some(None) = killed / no exit status.
+    pub(crate) exited:             Mutex<Option<Option<i32>>>,
 }
 
 impl PtyShared {
@@ -148,6 +160,7 @@ impl PtyShared {
             last_subscribed_at: *self.last_subscribed_at.lock().unwrap(),
             subscribers:        Some(subscribers),
             sort_order:         self.sort_order.load(Ordering::Relaxed),
+            exited:             *self.exited.lock().unwrap(),
         }
     }
 }
@@ -418,6 +431,7 @@ impl PtyRegistry {
             subscribers: RwLock::new(HashMap::new()),
             last_subscribed_at: Mutex::new(None),
             sort_order: AtomicU32::new(0), // real value assigned under the registry lock below
+            exited: Mutex::new(None),
         });
 
         let handle = Arc::new(PtyHandle {
@@ -473,9 +487,11 @@ impl PtyRegistry {
         let handle = self.ptys.write().unwrap().remove(&id)
             .ok_or_else(|| anyhow!("PTY {:016x} not found", id))?;
         let _ = kill(handle.child_pid, Signal::SIGHUP);
-        // handle drops at end of scope: wakeup_write closes → reader sees POLLHUP and exits.
-        // If callers hold Arc<PtyHandle> clones (e.g. an in-flight refresh), wakeup_write
-        // stays open until the last clone drops — POLLHUP fires then, not immediately on return.
+        // Tell the reader to stop explicitly: callers (subscribe streams, in-flight
+        // refreshes) may hold Arc<PtyHandle> clones that keep wakeup_write open, so
+        // the POLLHUP when the last one drops is only a backstop.
+        let _ = handle.req_tx.send(ReaderRequest::Shutdown);
+        handle.wake();
         Ok(())
     }
 

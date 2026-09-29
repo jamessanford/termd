@@ -116,6 +116,7 @@ fn refresh_to_proto(rd: &crate::pty::RefreshData) -> proto::RefreshData {
         data:     rd.data.to_vec(),
         size:     Some(proto::Size { cols: rd.cols, rows: rd.rows }),
         degraded: rd.degraded,
+        exited:   rd.exited,
     }
 }
 
@@ -136,7 +137,7 @@ fn event_to_subscribe(event: PtyEvent) -> proto::SubscribeEvent {
                 MetadataReason::TitleChanged => MetaEvent::TitleChanged(proto::TitleChanged {
                     title: meta.info.title.clone(),
                 }),
-                MetadataReason::Closed => MetaEvent::Exited(proto::Exited {
+                MetadataReason::Exited | MetadataReason::Closed => MetaEvent::Exited(proto::Exited {
                     exit_code: meta.exit_code.unwrap_or_default(),
                 }),
                 MetadataReason::SubscribersChanged => MetaEvent::SubscribersChanged(
@@ -319,8 +320,13 @@ impl TerminalService for TerminalServiceImpl {
                     item = meta_stream.next(), if !meta_done => {
                         match item {
                             Some(Ok(meta)) => {
+                                // Closed = the reader is gone (destroyed): nothing
+                                // more will come, so end the stream after it. (The
+                                // PtyHandle we hold keeps data_rx open, so its
+                                // RecvError::Closed can't be relied on.)
+                                let closed = matches!(meta.reason, MetadataReason::Closed);
                                 let ev = event_to_subscribe(PtyEvent::Metadata(meta));
-                                if resp_tx.send(Ok(ev)).await.is_err() { break; }
+                                if resp_tx.send(Ok(ev)).await.is_err() || closed { break; }
                             }
                             Some(Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n))) => {
                                 tracing::debug!(subscriber_id = %subscriber_id, lagged = n, "meta stream lagged");
