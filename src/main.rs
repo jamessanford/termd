@@ -232,7 +232,12 @@ async fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-            let listen: SocketAddr = resp.listen.parse()?;
+            anyhow::ensure!(
+                !resp.listen.is_empty(),
+                "daemon didn't report its listen address; it predates this client, restart it"
+            );
+            let listen: SocketAddr = resp.listen.parse()
+                .with_context(|| format!("daemon reported bad listen address {:?}", resp.listen))?;
             let (scheme, fragment) = match resp.fingerprint.as_str() {
                 "" => ("http", String::new()),
                 fp => ("https", format!("#{fp}")),
