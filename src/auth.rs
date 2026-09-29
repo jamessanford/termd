@@ -28,7 +28,24 @@ fn ensure_dir(dir: &Path) -> Result<()> {
         .recursive(true)
         .mode(0o700)
         .create(dir)
-        .with_context(|| format!("creating {}", dir.display()))
+        .with_context(|| format!("creating {}", dir.display()))?;
+    // The dir may predate us (e.g. the /tmp/termd fallback, made by another
+    // user), and mode only applies on creation, so check what we got.
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(dir)?;
+    anyhow::ensure!(meta.is_dir(), "{} is not a directory", dir.display());
+    anyhow::ensure!(
+        meta.uid() == unsafe { libc::geteuid() },
+        "{} is not owned by the current user",
+        dir.display()
+    );
+    anyhow::ensure!(
+        meta.mode() & 0o077 == 0,
+        "{} is accessible by other users (mode {:o}); chmod 700 it",
+        dir.display(),
+        meta.mode() & 0o777
+    );
+    Ok(())
 }
 
 /// Write `contents` to `path` with mode 0600, atomically via rename.
@@ -274,6 +291,16 @@ mod tests {
         assert_eq!(TokenStore::load_or_create(dir.path()).unwrap().get(), t2);
         let mode = fs::metadata(dir.path().join("token")).unwrap().permissions();
         assert_eq!(std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777, 0o600);
+    }
+
+    #[test]
+    fn rejects_loose_state_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("termd");
+        fs::create_dir(&sub).unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(TokenStore::load_or_create(&sub).is_err());
     }
 
     #[test]
