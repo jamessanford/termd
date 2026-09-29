@@ -47,16 +47,16 @@ fn default_socket() -> PathBuf {
 struct ConnectionArgs {
     #[arg(long, default_value_os_t = default_socket(), conflicts_with = "endpoint")]
     socket: PathBuf,
-    /// Endpoint URI to connect to (e.g. https://192.0.2.7:7777, or
-    /// http://127.0.0.1:7777 for a --tls=off daemon)
+    /// Endpoint URI to connect to (e.g. https://192.0.2.7:7777#sha256:<hex>,
+    /// or http://127.0.0.1:7777 for a --tls=off daemon)
     #[arg(long, env = "TERMD_ENDPOINT", conflicts_with = "socket")]
     endpoint: Option<String>,
     /// Auth token for TCP connections (see `termd token`)
     #[arg(long, env = "TERMD_TOKEN", hide_env_values = true)]
     token: Option<String>,
     /// Pin the server's self-signed certificate by fingerprint (sha256:<hex>,
-    /// see `termd token`). Without it, https endpoints are verified against
-    /// the system roots.
+    /// see `termd token`); may also be given as the endpoint's #fragment.
+    /// Without it, https endpoints are verified against the system roots.
     #[arg(long, env = "TERMD_FINGERPRINT")]
     fingerprint: Option<String>,
 }
@@ -90,7 +90,8 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = TlsMode::On)]
         tls: TlsMode,
     },
-    /// Print the TCP auth token and certificate fingerprint (via the socket only)
+    /// Print ready-to-run `termd attach` command lines carrying the TCP auth
+    /// token and certificate fingerprint (via the socket only)
     Token {
         #[arg(long, default_value_os_t = default_socket())]
         socket: PathBuf,
@@ -221,9 +222,18 @@ async fn main() -> Result<()> {
                 .token(TokenRequest { refresh })
                 .await?
                 .into_inner();
-            println!("TERMD_TOKEN={}", resp.token);
-            if !resp.fingerprint.is_empty() {
-                println!("TERMD_FINGERPRINT={}", resp.fingerprint);
+            let listen: SocketAddr = resp.listen.parse()?;
+            let (scheme, fragment) = match resp.fingerprint.as_str() {
+                "" => ("http", String::new()),
+                fp => ("https", format!("#{fp}")),
+            };
+            // Single-quoted: zsh's extendedglob treats `#` as a glob operator.
+            for host in advertised_hosts(listen) {
+                println!(
+                    "TERMD_TOKEN={} termd attach --endpoint '{scheme}://{}{fragment}'",
+                    resp.token,
+                    SocketAddr::new(host, listen.port()),
+                );
             }
         }
 
@@ -416,6 +426,39 @@ async fn auto_select_or_create(client: &mut AuthedClient) -> Result<PtyItem> {
     Ok(item)
 }
 
+/// Addresses to suggest for reaching a listener: the bound IP itself, or for
+/// a wildcard bind, every non-loopback, non-link-local interface address.
+fn advertised_hosts(listen: SocketAddr) -> Vec<std::net::IpAddr> {
+    use std::net::IpAddr;
+    if !listen.ip().is_unspecified() {
+        return vec![listen.ip()];
+    }
+    let want_v6 = listen.is_ipv6();
+    let mut hosts: Vec<IpAddr> = nix::ifaddrs::getifaddrs()
+        .into_iter()
+        .flatten()
+        .filter_map(|ifa| {
+            let addr = ifa.address?;
+            if let Some(v4) = addr.as_sockaddr_in() {
+                Some(IpAddr::V4(v4.ip()))
+            } else {
+                addr.as_sockaddr_in6().map(|v6| IpAddr::V6(v6.ip()))
+            }
+        })
+        .filter(|ip| !ip.is_loopback())
+        .filter(|ip| match ip {
+            // A [::] bind is dual-stack on Linux; a 0.0.0.0 bind is v4 only.
+            IpAddr::V4(v4) => !v4.is_link_local(),
+            IpAddr::V6(v6) => want_v6 && !v6.is_unicast_link_local(),
+        })
+        .collect();
+    hosts.dedup();
+    if hosts.is_empty() {
+        hosts.push(if want_v6 { std::net::Ipv6Addr::LOCALHOST.into() } else { std::net::Ipv4Addr::LOCALHOST.into() });
+    }
+    hosts
+}
+
 async fn socket_channel(path: PathBuf) -> Result<tonic::transport::Channel> {
     use hyper_util::rt::TokioIo;
     use tonic::transport::Endpoint;
@@ -435,6 +478,19 @@ async fn tcp_channel(uri: &str, fingerprint: Option<&str>) -> Result<tonic::tran
     use tonic::transport::{Endpoint, Uri};
     use tower::service_fn;
 
+    // `https://host:port#sha256:<hex>` carries the pin in the fragment.
+    let (uri, fingerprint) = match uri.split_once('#') {
+        Some((base, frag)) => {
+            if let Some(fp) = fingerprint {
+                anyhow::ensure!(
+                    auth::normalize_fingerprint(fp)? == auth::normalize_fingerprint(frag)?,
+                    "--fingerprint conflicts with the endpoint's #fingerprint"
+                );
+            }
+            (base, Some(frag))
+        }
+        None => (uri, fingerprint),
+    };
     let parsed: Uri = uri.parse()?;
     match parsed.scheme_str() {
         Some("https") => {}

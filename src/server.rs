@@ -27,6 +27,7 @@ pub struct AdminServiceImpl {
     pub tokens: TokenStore,
     /// Empty when the TCP listener runs with --tls=off.
     pub fingerprint: String,
+    pub listen: std::net::SocketAddr,
 }
 
 #[tonic::async_trait]
@@ -42,7 +43,11 @@ impl AdminService for AdminServiceImpl {
         } else {
             self.tokens.get()
         };
-        Ok(Response::new(proto::TokenResponse { token, fingerprint: self.fingerprint.clone() }))
+        Ok(Response::new(proto::TokenResponse {
+            token,
+            fingerprint: self.fingerprint.clone(),
+            listen: self.listen.to_string(),
+        }))
     }
 }
 
@@ -419,6 +424,7 @@ pub async fn serve(
     let svc_admin = AdminServiceServer::new(AdminServiceImpl {
         tokens: tokens.clone(),
         fingerprint: tls.as_ref().map(|c| c.fingerprint.clone()).unwrap_or_default(),
+        listen: tcp_listener.local_addr()?,
     });
     let svc_tcp  = make_service(registry, log_grpc, tokens);
 

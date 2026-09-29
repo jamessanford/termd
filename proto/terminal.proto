@@ -164,4 +164,6 @@ message TokenResponse {
   string token = 1;
   // "sha256:<hex>" of the TCP listener's certificate; empty with --tls=off.
   string fingerprint = 2;
+  // The TCP listener's bound address, e.g. "0.0.0.0:7777".
+  string listen = 3;
 }
