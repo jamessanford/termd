@@ -98,6 +98,9 @@ enum Cmd {
         /// Replace the token with a new one; the old one stops working
         #[arg(long)]
         refresh: bool,
+        /// Print TERMD_TOKEN= / TERMD_FINGERPRINT= lines instead of commands
+        #[arg(long)]
+        raw: bool,
     },
     /// Attach to a PTY and act as multiplexer
     Attach {
@@ -215,13 +218,20 @@ async fn main() -> Result<()> {
             server::serve(registry, &socket, listen, tokens, cert, log_grpc).await?;
         }
 
-        Cmd::Token { socket, refresh } => {
+        Cmd::Token { socket, refresh, raw } => {
             use termd::proto::{admin_service_client::AdminServiceClient, TokenRequest};
             let channel = socket_channel(socket).await?;
             let resp = AdminServiceClient::new(channel)
                 .token(TokenRequest { refresh })
                 .await?
                 .into_inner();
+            if raw {
+                println!("TERMD_TOKEN={}", resp.token);
+                if !resp.fingerprint.is_empty() {
+                    println!("TERMD_FINGERPRINT={}", resp.fingerprint);
+                }
+                return Ok(());
+            }
             let listen: SocketAddr = resp.listen.parse()?;
             let (scheme, fragment) = match resp.fingerprint.as_str() {
                 "" => ("http", String::new()),
