@@ -353,6 +353,14 @@ fn is_pty_gone(err: &anyhow::Error) -> bool {
         .is_some_and(|s| s.code() == tonic::Code::NotFound)
 }
 
+/// True if the server answered but can't serve this PTY: it's gone (NotFound)
+/// or broken (Internal — e.g. an older server whose reader died when the command
+/// exited). Either way the transport is fine, so reconnecting would just loop.
+fn is_pty_unusable(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<tonic::Status>()
+        .is_some_and(|s| matches!(s.code(), tonic::Code::NotFound | tonic::Code::Internal))
+}
+
 async fn destroy_and_drain(
     client: &mut AuthedClient,
     pty_id: u64,
@@ -732,7 +740,12 @@ pub async fn run(
         }
 
         let refresh_result = if let Some(s) = sub.as_mut() {
-            reconnect_or_break!('session, request_refresh(client, s, current_pty_id).await)
+            match request_refresh(client, s, current_pty_id).await {
+                Ok(r) => r,
+                // Not a transport problem: route to the gone branch below.
+                Err(e) if is_pty_unusable(&e) => None,
+                Err(_) => do_reconnect!('session),
+            }
         } else {
             // subscribe() reported the PTY is gone; fall into the gone branch.
             None
@@ -1133,17 +1146,35 @@ pub async fn run(
                     }
 
                     InputAction::ToggleKeep => {
-                        // The flag rides the next SubscribeStart: resubscribe. If the
-                        // PTY is already dead and we just cleared it, the server
+                        // The flag rides SubscribeStart: resubscribe with it now. If
+                        // the PTY is already dead and we just cleared it, the server
                         // reaps it and the next pass moves on to the recent PTY.
                         let keep = !current_item.keep_on_exit;
-                        current_item.keep_on_exit = keep;
-                        pending_keep = Some(keep);
                         close_subscription_bg(&mut sub);
-                        show_info(if keep {
-                            "This PTY will be kept after it exits (C-a k to destroy)"
-                        } else {
-                            "This PTY will be removed when it exits"
+                        match subscribe(client, current_pty_id, Some(keep)).await {
+                            Ok(s) => sub = Some(s),
+                            // Let the next pass's subscribe sort it out (gone /
+                            // reconnect), still carrying the flag.
+                            Err(_) => {
+                                current_item.keep_on_exit = keep;
+                                pending_keep = Some(keep);
+                                continue 'session;
+                            }
+                        }
+                        // Believe the server, not ourselves: older servers ignore the
+                        // flag, and treating such a PTY as kept means not destroying
+                        // it on exit, leaving a dead entry they can't serve.
+                        let applied = ensure_list(client, &mut pty_list).await
+                            && pty_list.iter().find(|p| p.pty_id == current_pty_id)
+                                .is_some_and(|p| p.keep_on_exit == keep);
+                        pty_list.clear();
+                        if applied || !keep {
+                            current_item.keep_on_exit = keep;
+                        }
+                        show_info(match (applied, keep) {
+                            (true, true) => "This PTY will be kept after it exits (C-a k to destroy)",
+                            (true, false) => "This PTY will be removed when it exits",
+                            (false, _) => "This server doesn't support keeping exited PTYs",
                         }).await;
                     }
                 }
