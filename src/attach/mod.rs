@@ -26,7 +26,6 @@ pub(super) enum InputAction {
     ToggleKeep,
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum RenderMode {
     /// Cell-by-cell render state for all dirty states

@@ -58,8 +58,9 @@ pub struct PtyChunk {
 #[derive(Clone, Debug)]
 pub enum MetadataReason {
     Resize,
-    /// The child exited; the PTY lingers (final screen still served) until
-    /// destroyed. Subscribe streams stay open.
+    /// The child exited. With keep_on_exit the PTY lingers (final screen still
+    /// served, subscribe streams open) until destroyed; otherwise it's reaped
+    /// and a Closed follows.
     Exited,
     /// The reader is gone (destroyed, or it failed/panicked). Subscribe streams
     /// forward it and end.
@@ -505,7 +506,10 @@ impl PtyRegistry {
     pub fn destroy(&self, id: u64) -> Result<()> {
         let handle = self.ptys.write().unwrap().remove(&id)
             .ok_or_else(|| anyhow!("PTY {:016x} not found", id))?;
-        let _ = kill(handle.child_pid, Signal::SIGHUP);
+        // Once the child is reaped its pid may be reused: don't signal a stranger.
+        if handle.shared.exited.lock().unwrap().is_none() {
+            let _ = kill(handle.child_pid, Signal::SIGHUP);
+        }
         // Tell the reader to stop explicitly: callers (subscribe streams, in-flight
         // refreshes) may hold Arc<PtyHandle> clones that keep wakeup_write open, so
         // the POLLHUP when the last one drops is only a backstop.
