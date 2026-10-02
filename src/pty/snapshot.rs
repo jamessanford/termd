@@ -86,13 +86,13 @@ pub(crate) fn do_refresh(
         },
     };
 
-    let mut fmt = Formatter::new(terminal, FormatterOptions {
-        format: Format::Vt,
-        trim: false,
-        unwrap: false,
-        selection: Some(selection),
-        extra,
-    })?;
+    let mut fmt = Formatter::new(
+        terminal,
+        FormatterOptions::new()
+            .with_format(Format::Vt)
+            .with_selection(&selection)
+            .with_extra(extra),
+    )?;
 
     let mut out: Vec<u8> = Vec::new();
     // Soft reset (DECSTR) + explicit mouse-mode disables + keyboard-mode clears + clear screen
@@ -198,31 +198,6 @@ pub(crate) fn do_scrollback(
         None    => { let p = terminal.track_grid_ref(pin_point)?; pins.insert(subscriber_id.to_owned(), p); }
     }
 
-    // Helper closure: FormatterTerminalExtra with all flags false.
-    // Both FormatterTerminalExtra and FormatterScreenExtra use the sized-struct ABI —
-    // the `size` field must be set explicitly; Default::default() would leave size=0.
-    let make_extra = || ffi::FormatterTerminalExtra {
-        size: std::mem::size_of::<ffi::FormatterTerminalExtra>(),
-        scrolling_region: false,
-        modes: false,
-        palette: false,
-        tabstops: false,
-        pwd: false,
-        keyboard: false,
-        title: false,
-        colors: false,
-        screen: ffi::FormatterScreenExtra {
-            size: std::mem::size_of::<ffi::FormatterScreenExtra>(),
-            cursor: false,
-            style: false,
-            hyperlink: false,
-            protection: false,
-            kitty_keyboard: false,
-            charsets: false,
-            saved_cursor: false,
-        },
-    };
-
     // NOTE: grid_ref(Point::Screen(...)) traverses the internal scrollback page list to
     // locate the target row, which is O(scrollback_depth). If scrollback requests become a
     // latency concern (do_scrollback runs on the reader thread, blocking live PTY I/O),
@@ -237,13 +212,13 @@ pub(crate) fn do_scrollback(
     }))?;
     let selection = Selection::new(top_left, bot_right, false);
 
-    let mut fmt = Formatter::new(terminal, FormatterOptions {
-        format: Format::Vt,
-        trim: false,
-        unwrap: false,
-        selection: Some(selection),
-        extra: make_extra(),
-    })?;
+    // FormatterOptions::new() leaves every extra flag off: scrollback is content only.
+    let mut fmt = Formatter::new(
+        terminal,
+        FormatterOptions::new()
+            .with_format(Format::Vt)
+            .with_selection(&selection),
+    )?;
     let vt = fmt.format_alloc(None)?;
 
     let row_offset = total - 1 - end_y;
@@ -258,10 +233,9 @@ pub(crate) fn do_scrollback(
 #[cfg(test)]
 mod scrollback_tests {
     use super::*;
-    use libghostty_vt::TerminalOptions;
 
     fn make_terminal(cols: u16, rows: u16, scrollback: usize) -> Terminal<'static, 'static> {
-        Terminal::new(TerminalOptions { cols, rows, max_scrollback: scrollback }).unwrap()
+        crate::new_terminal(cols, rows, scrollback).unwrap()
     }
 
     fn write_lines(t: &mut Terminal<'static, 'static>, n: usize) {

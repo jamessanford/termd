@@ -1,7 +1,7 @@
 use std::io::Write as IoWrite;
 
 use anyhow::Result;
-use libghostty_vt::{Terminal, TerminalOptions, RenderState};
+use libghostty_vt::{Terminal, RenderState};
 use libghostty_vt::render::{Dirty, RowIterator, CellIterator};
 use libghostty_vt::style::Underline;
 
@@ -15,11 +15,7 @@ struct LocalTerminal {
 impl LocalTerminal {
     fn new(cols: u32, rows: u32) -> Result<Self> {
         Ok(Self {
-            terminal: Terminal::new(TerminalOptions {
-                cols: cols as u16,
-                rows: rows as u16,
-                max_scrollback: 0,
-            })?,
+            terminal: termd::new_terminal(cols as u16, rows as u16, 0)?,
             render_state: RenderState::new()?,
             row_iter: RowIterator::new()?,
             cell_iter: CellIterator::new()?,

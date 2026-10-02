@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
-use libghostty_vt::{Terminal, TerminalOptions};
+use libghostty_vt::Terminal;
 use libghostty_vt::screen::Screen;
 use libghostty_vt::screen::TrackedGridRef;
 use tokio::sync::{broadcast, oneshot};
@@ -332,16 +332,16 @@ impl Reader {
         child: std::process::Child,
         registry: std::sync::Weak<super::PtyMap>,
     ) -> Result<Self> {
-        let mut terminal = Terminal::new(TerminalOptions {
-            cols: shared.cols.load(Ordering::Relaxed) as u16,
-            rows: shared.rows.load(Ordering::Relaxed) as u16,
-            // Byte budget for scrollback page memory, NOT a line count. libghostty
-            // allocates whole ~0.5 MB pages (a page is sized for a 215x215 grid; each
-            // Cell is 8 bytes), and every row costs cols*8 bytes regardless of how few
-            // glyphs it holds. Rough rule at 80 cols: ~2 KB/line, so 16 MB ≈ ~8k lines
-            // (proportionally fewer on wider terminals).
-            max_scrollback: 16_000_000,
-        })?;
+        // Byte budget for scrollback page memory, NOT a line count. libghostty
+        // allocates whole ~0.5 MB pages (a page is sized for a 215x215 grid; each
+        // Cell is 8 bytes), and every row costs cols*8 bytes regardless of how few
+        // glyphs it holds. Rough rule at 80 cols: ~2 KB/line, so 16 MB ≈ ~8k lines
+        // (proportionally fewer on wider terminals).
+        let mut terminal = crate::new_terminal(
+            shared.cols.load(Ordering::Relaxed) as u16,
+            shared.rows.load(Ordering::Relaxed) as u16,
+            16_000_000,
+        )?;
         let shared_cb = shared.clone();
         terminal.on_title_changed(move |term| {
             if let Ok(t) = term.title() {
@@ -728,7 +728,7 @@ mod boundary_tests {
     use super::*;
 
     fn make_terminal() -> Terminal<'static, 'static> {
-        Terminal::new(TerminalOptions { cols: 80, rows: 24, max_scrollback: 1000 }).unwrap()
+        crate::new_terminal(80, 24, 1000).unwrap()
     }
 
     // The defer-refresh design rests on vt_at_boundary() reporting false exactly
@@ -786,7 +786,7 @@ mod process_read_tests {
     use super::*;
 
     fn make_terminal() -> Terminal<'static, 'static> {
-        Terminal::new(TerminalOptions { cols: 80, rows: 24, max_scrollback: 1000 }).unwrap()
+        crate::new_terminal(80, 24, 1000).unwrap()
     }
 
     // Non-blocking drain of every event the broadcast currently holds.

@@ -1,7 +1,7 @@
 use std::io::Write as _;
 
 use anyhow::Result;
-use libghostty_vt::{Terminal, TerminalOptions};
+use libghostty_vt::Terminal;
 
 /// Control units are held only this long (enough for any CSI we rewrite);
 /// longer control strings (OSC/DCS/APC payloads) stream out eagerly.
@@ -33,11 +33,7 @@ pub(super) struct WrapInjector {
 impl WrapInjector {
     pub(super) fn new(server_cols: u32, server_rows: u32) -> Result<Self> {
         Ok(Self {
-            term: Terminal::new(TerminalOptions {
-                cols: server_cols as u16,
-                rows: server_rows as u16,
-                max_scrollback: 0,
-            })?,
+            term: termd::new_terminal(server_cols as u16, server_rows as u16, 0)?,
             unit: Vec::new(),
             kind: None,
             prev_x: 0,
@@ -68,11 +64,7 @@ impl WrapInjector {
     }
 
     pub(super) fn reset(&mut self, server_cols: u32, server_rows: u32) -> Result<()> {
-        self.term = Terminal::new(TerminalOptions {
-            cols: server_cols as u16,
-            rows: server_rows as u16,
-            max_scrollback: 0,
-        })?;
+        self.term = termd::new_terminal(server_cols as u16, server_rows as u16, 0)?;
         self.unit.clear();
         self.kind = None;
         self.prev_x = 0;
@@ -671,7 +663,7 @@ mod client_view {
         let mut out = Vec::new();
         wi.emit_screen_setup(&mut out);
         wi.process(b"a\r\nb\r\nc\r\nd\r\ne", &mut out).unwrap();
-        let mut client = Terminal::new(TerminalOptions { cols: 10, rows: 6, max_scrollback: 0 }).unwrap();
+        let mut client = termd::new_terminal(10, 6, 0).unwrap();
         client.vt_write(&out);
         assert_eq!(screen_rows(&client, 10, 6), vec!["c", "d", "e", "", "", ""]);
         assert!(client.cursor_y().unwrap() <= 2);
@@ -687,7 +679,7 @@ mod client_view {
         let mut out = Vec::new();
         wi.emit_screen_setup(&mut out);
         wi.process(b"a\r\nb\r\nc", &mut out).unwrap();
-        let mut client = Terminal::new(TerminalOptions { cols: 10, rows: 6, max_scrollback: 0 }).unwrap();
+        let mut client = termd::new_terminal(10, 6, 0).unwrap();
         client.vt_write(&out);
 
         // The user makes the client window even taller: margins reset.
