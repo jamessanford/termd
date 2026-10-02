@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
+use ring::digest::{SHA256, digest};
 
 pub fn state_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
@@ -173,7 +173,7 @@ fn first_cert_der(pem: &str) -> Result<Vec<u8>> {
 
 /// `sha256:<hex>` over a certificate's DER encoding.
 pub fn fingerprint(der: &[u8]) -> String {
-    format!("sha256:{}", hex::encode(Sha256::digest(der)))
+    format!("sha256:{}", hex::encode(digest(&SHA256, der)))
 }
 
 /// Normalize a user-supplied fingerprint: optional `sha256:` prefix, colons
@@ -277,6 +277,19 @@ impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_is_sha256_hex() {
+        // FIPS 180-2 test vectors; pins the format users paste as `#sha256:<hex>`.
+        assert_eq!(
+            fingerprint(b""),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            fingerprint(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn token_persists_and_refreshes() {
